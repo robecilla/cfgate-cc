@@ -99,13 +99,15 @@ func TestCodexModelCatalogAllowsImagesForKnownVisionModels(t *testing.T) {
 }
 
 func TestAnthropicEndpointModels(t *testing.T) {
-	for _, model := range []string{"qwen3.7-max", "qwen3.6-plus", "qwen3.5-plus", "minimax-m2.7", "opencode-go/qwen3.7-max"} {
+	for _, model := range []string{"qwen3.7-max", "minimax-m2.7", "opencode-go/qwen3.7-max"} {
 		if !modelUsesAnthropicEndpoint(model) {
 			t.Fatalf("%s should use Anthropic-compatible upstream", model)
 		}
 	}
-	if modelUsesAnthropicEndpoint("kimi-k2.6") {
-		t.Fatal("kimi-k2.6 should use OpenAI-compatible upstream")
+	for _, model := range []string{"kimi-k2.6", "qwen3.6-plus", "qwen3.5-plus"} {
+		if modelUsesAnthropicEndpoint(model) {
+			t.Fatalf("%s should use OpenAI-compatible upstream", model)
+		}
 	}
 }
 

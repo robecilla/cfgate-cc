@@ -209,7 +209,7 @@ func modelID(model string) string {
 
 func modelUsesAnthropicEndpoint(model string) bool {
 	switch modelID(model) {
-	case "minimax-m2.7", "minimax-m2.5", "qwen3.7-max", "qwen3.6-plus", "qwen3.5-plus":
+	case "minimax-m2.7", "minimax-m2.5", "qwen3.7-max":
 		return true
 	default:
 		return false
