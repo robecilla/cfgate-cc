@@ -26,11 +26,12 @@ const (
 	defaultHost      = "127.0.0.1"
 	defaultPort      = 3456
 	openAIURL        = "https://opencode.ai/zen/go/v1/chat/completions"
-	anthropicURL     = "https://opencode.ai/zen/go/v1/messages"
 	codexProfileName = "ocgo-launch"
 )
 
 var version = "dev"
+
+var anthropicURL = "https://opencode.ai/zen/go/v1/messages"
 
 type Config struct {
 	APIKey string `json:"api_key"`
@@ -571,7 +572,7 @@ func copyHeaders(dst, src http.Header) {
 }
 
 func forwardAnthropic(ctx context.Context, cfg Config, ar AnthropicRequest) (*http.Response, error) {
-	ensureAnthropicRequestDefaults(&ar)
+	normalizeAnthropicRequestForUpstream(&ar)
 	body, err := json.Marshal(ar)
 	if err != nil {
 		return nil, err
@@ -584,6 +585,127 @@ func forwardAnthropic(ctx context.Context, cfg Config, ar AnthropicRequest) (*ht
 	req.Header.Set("Anthropic-Version", "2023-06-01")
 	req.Header.Set("Content-Type", "application/json")
 	return (&http.Client{Timeout: 10 * time.Minute}).Do(req)
+}
+
+func normalizeAnthropicRequestForUpstream(ar *AnthropicRequest) {
+	ensureAnthropicRequestDefaults(ar)
+	// OpenCode Go's Anthropic-compatible endpoint is stricter than Anthropic's
+	// Claude endpoint for some model families (notably qwen3.7-max). Claude Code
+	// can send Anthropic-specific prompt-caching and extended-thinking fields that
+	// make those upstreams return "Request body format invalid". Keep the core
+	// Messages API shape and strip the extensions before forwarding.
+	ar.Thinking = nil
+	ar.Reasoning = nil
+	ar.ReasoningEffort = nil
+	ar.Effort = nil
+	ar.Level = nil
+	ar.Depth = nil
+	ar.OutputConfig = nil
+	ar.System = normalizeAnthropicSystem(ar.System)
+	for i := range ar.Messages {
+		ar.Messages[i].Content = normalizeAnthropicContent(ar.Messages[i].Content)
+	}
+}
+
+func normalizeAnthropicSystem(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return raw
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return raw
+	}
+	text := systemText(raw)
+	if text == "" {
+		return nil
+	}
+	return marshalJSON(text)
+}
+
+func normalizeAnthropicContent(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 {
+		return raw
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return raw
+	}
+	var blocks []map[string]json.RawMessage
+	if json.Unmarshal(raw, &blocks) != nil {
+		return raw
+	}
+	out := make([]map[string]any, 0, len(blocks))
+	for _, b := range blocks {
+		var typ string
+		_ = json.Unmarshal(b["type"], &typ)
+		switch typ {
+		case "text":
+			var text string
+			_ = json.Unmarshal(b["text"], &text)
+			out = append(out, map[string]any{"type": "text", "text": text})
+		case "image":
+			block := map[string]any{"type": "image"}
+			if v, ok := rawJSONAny(b["source"]); ok {
+				block["source"] = v
+			}
+			out = append(out, block)
+		case "tool_use":
+			block := map[string]any{"type": "tool_use"}
+			copyRawJSONField(block, b, "id")
+			copyRawJSONField(block, b, "name")
+			copyRawJSONField(block, b, "input")
+			out = append(out, block)
+		case "tool_result":
+			block := map[string]any{"type": "tool_result"}
+			copyRawJSONField(block, b, "tool_use_id")
+			copyRawJSONField(block, b, "content")
+			copyRawJSONField(block, b, "is_error")
+			out = append(out, block)
+		}
+	}
+	if len(out) == 0 {
+		return marshalJSON("")
+	}
+	return marshalJSON(out)
+}
+
+func copyRawJSONField(dst map[string]any, src map[string]json.RawMessage, key string) {
+	if v, ok := rawJSONAny(src[key]); ok {
+		dst[key] = v
+	}
+}
+
+func rawJSONAny(raw json.RawMessage) (any, bool) {
+	if len(raw) == 0 {
+		return nil, false
+	}
+	var v any
+	if json.Unmarshal(raw, &v) != nil {
+		return nil, false
+	}
+	return stripCacheControl(v), true
+}
+
+func stripCacheControl(v any) any {
+	switch x := v.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(x))
+		for k, val := range x {
+			if k == "cache_control" {
+				continue
+			}
+			out[k] = stripCacheControl(val)
+		}
+		return out
+	case []any:
+		out := make([]any, 0, len(x))
+		for _, val := range x {
+			out = append(out, stripCacheControl(val))
+		}
+		return out
+	default:
+		return v
+	}
 }
 
 func ensureAnthropicRequestDefaults(ar *AnthropicRequest) {

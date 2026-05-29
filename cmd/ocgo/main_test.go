@@ -1,7 +1,10 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
+	"io"
+	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -129,6 +132,164 @@ func TestChatToAnthropicForCodexModel(t *testing.T) {
 	}
 	if len(ar.Tools) != 1 || ar.Tools[0].Name != "shell" {
 		t.Fatalf("bad anthropic tools: %+v", ar.Tools)
+	}
+}
+
+func TestNormalizeAnthropicRequestForStrictUpstream(t *testing.T) {
+	ar := AnthropicRequest{
+		Model:        "opencode-go/qwen3.7-max",
+		Thinking:     []byte(`{"type":"enabled","budget_tokens":1024}`),
+		Reasoning:    []byte(`{"effort":"high"}`),
+		OutputConfig: []byte(`{"reasoning":{"depth":2}}`),
+		System:       []byte(`[{"type":"text","text":"rules","cache_control":{"type":"ephemeral"}}]`),
+		Messages: []AMessage{{Role: "user", Content: []byte(`[
+			{"type":"text","text":"hello","cache_control":{"type":"ephemeral"}},
+			{"type":"thinking","thinking":"private","signature":"abc"},
+			{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"ok","cache_control":{"type":"ephemeral"}}]}
+		]`)}},
+	}
+	normalizeAnthropicRequestForUpstream(&ar)
+	body, err := json.Marshal(ar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(body)
+	for _, gone := range []string{"opencode-go/", "thinking", "reasoning", "output_config", "cache_control", "signature"} {
+		if strings.Contains(out, gone) {
+			t.Fatalf("strict upstream request still contains %q: %s", gone, out)
+		}
+	}
+	for _, want := range []string{`"model":"qwen3.7-max"`, `"system":"rules"`, `"type":"text"`, `"text":"hello"`, `"tool_use_id":"toolu_1"`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in normalized request: %s", want, out)
+		}
+	}
+}
+
+func TestNormalizeQwenAnthropicRequestThinkingVariants(t *testing.T) {
+	zero := 0.0
+	topP := 0.8
+	for _, tc := range []struct {
+		name string
+		req  AnthropicRequest
+	}{
+		{
+			name: "thinking enabled with budget",
+			req: AnthropicRequest{
+				Thinking: []byte(`{"type":"enabled","budget_tokens":2048}`),
+			},
+		},
+		{
+			name: "thinking disabled with zero temperature",
+			req: AnthropicRequest{
+				Thinking:    []byte(`{"type":"disabled"}`),
+				Temperature: &zero,
+			},
+		},
+		{
+			name: "reasoning effort high",
+			req: AnthropicRequest{
+				ReasoningEffort: []byte(`"high"`),
+				TopP:            &topP,
+			},
+		},
+		{
+			name: "nested output config reasoning",
+			req: AnthropicRequest{
+				OutputConfig: []byte(`{"reasoning":{"effort":"medium"}}`),
+			},
+		},
+		{
+			name: "legacy effort level depth fields",
+			req: AnthropicRequest{
+				Effort: []byte(`"low"`),
+				Level:  []byte(`2`),
+				Depth:  []byte(`{"level":"high"}`),
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ar := tc.req
+			ar.Model = "opencode-go/qwen3.7-max"
+			ar.Stream = true
+			ar.MaxTokens = 1234
+			ar.System = []byte(`plain rules`)
+			ar.Tools = []ATool{{Name: "Bash", Description: "run command", InputSchema: []byte(`{"type":"object","properties":{"command":{"type":"string"}}}`)}}
+			ar.Messages = []AMessage{{Role: "user", Content: []byte(`[
+				{"type":"text","text":"hello qwen","cache_control":{"type":"ephemeral"}},
+				{"type":"thinking","thinking":"hidden chain of thought","signature":"sig_123"},
+				{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"pwd","cache_control":{"type":"ephemeral"}}}
+			]`)}}
+
+			normalizeAnthropicRequestForUpstream(&ar)
+			body, err := json.Marshal(ar)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out := string(body)
+			for _, gone := range []string{"opencode-go/", "thinking", "reasoning", "reasoning_effort", "output_config", "effort", "level", "depth", "cache_control", "signature", "hidden chain of thought"} {
+				if strings.Contains(out, gone) {
+					t.Fatalf("normalized qwen request still contains %q: %s", gone, out)
+				}
+			}
+			for _, want := range []string{`"model":"qwen3.7-max"`, `"stream":true`, `"max_tokens":1234`, `"system":"plain rules"`, `"name":"Bash"`, `"id":"toolu_1"`, `"command":"pwd"`, `"text":"hello qwen"`} {
+				if !strings.Contains(out, want) {
+					t.Fatalf("missing %q in normalized qwen request: %s", want, out)
+				}
+			}
+			if tc.req.Temperature != nil && !strings.Contains(out, `"temperature":0`) {
+				t.Fatalf("temperature option was not preserved: %s", out)
+			}
+			if tc.req.TopP != nil && !strings.Contains(out, `"top_p":0.8`) {
+				t.Fatalf("top_p option was not preserved: %s", out)
+			}
+		})
+	}
+}
+
+func TestForwardAnthropicSendsNormalizedBody(t *testing.T) {
+	var forwarded string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-API-Key") != "test-key" {
+			t.Fatalf("missing API key header: %q", r.Header.Get("X-API-Key"))
+		}
+		b, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		forwarded = string(b)
+		for _, gone := range []string{"opencode-go/", "thinking", "reasoning", "cache_control", "signature"} {
+			if strings.Contains(forwarded, gone) {
+				t.Fatalf("forwarded body still contains %q: %s", gone, forwarded)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}]}`))
+	}))
+	defer srv.Close()
+
+	oldURL := anthropicURL
+	anthropicURL = srv.URL
+	defer func() { anthropicURL = oldURL }()
+
+	resp, err := forwardAnthropic(context.Background(), Config{APIKey: "test-key"}, AnthropicRequest{
+		Model:     "opencode-go/qwen3.7-max",
+		Thinking:  []byte(`{"type":"enabled"}`),
+		System:    []byte(`[{"type":"text","text":"rules","cache_control":{"type":"ephemeral"}}]`),
+		Messages:  []AMessage{{Role: "user", Content: []byte(`[{"type":"text","text":"hello","cache_control":{"type":"ephemeral"}},{"type":"thinking","thinking":"private","signature":"abc"}]`)}},
+		MaxTokens: 1000,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	for _, want := range []string{`"model":"qwen3.7-max"`, `"system":"rules"`, `"messages"`, `"text":"hello"`} {
+		if !strings.Contains(forwarded, want) {
+			t.Fatalf("missing %q in forwarded body: %s", want, forwarded)
+		}
 	}
 }
 
