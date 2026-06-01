@@ -23,11 +23,12 @@ import (
 )
 
 const (
-	appName          = "ocgo"
-	defaultHost      = "127.0.0.1"
-	defaultPort      = 3456
-	openAIURL        = "https://opencode.ai/zen/go/v1/chat/completions"
-	codexProfileName = "ocgo-launch"
+	appName                            = "ocgo"
+	defaultHost                        = "127.0.0.1"
+	defaultPort                        = 3456
+	openAIURL                          = "https://opencode.ai/zen/go/v1/chat/completions"
+	codexProfileName                   = "ocgo-launch"
+	maxAnthropicToolResultContentChars = 120000
 )
 
 var version = "dev"
@@ -958,7 +959,7 @@ func normalizeAnthropicContent(raw json.RawMessage) json.RawMessage {
 		case "tool_result":
 			block := map[string]any{"type": "tool_result"}
 			copyRawJSONField(block, b, "tool_use_id")
-			copyRawJSONField(block, b, "content")
+			copyAnthropicToolResultContent(block, b)
 			copyRawJSONField(block, b, "is_error")
 			out = append(out, block)
 		}
@@ -967,6 +968,52 @@ func normalizeAnthropicContent(raw json.RawMessage) json.RawMessage {
 		return marshalJSON("")
 	}
 	return marshalJSON(out)
+}
+
+func copyAnthropicToolResultContent(dst map[string]any, src map[string]json.RawMessage) {
+	if v, ok := rawJSONAny(src["content"]); ok {
+		dst["content"] = truncateToolResultContent(v)
+	}
+}
+
+func truncateToolResultContent(v any) any {
+	remaining := maxAnthropicToolResultContentChars
+	return truncateToolResultContentValue(v, &remaining)
+}
+
+func truncateToolResultContentValue(v any, remaining *int) any {
+	switch x := v.(type) {
+	case string:
+		return truncateStringToBudget(x, remaining)
+	case []any:
+		out := make([]any, 0, len(x))
+		for _, val := range x {
+			out = append(out, truncateToolResultContentValue(val, remaining))
+		}
+		return out
+	case map[string]any:
+		out := make(map[string]any, len(x))
+		for k, val := range x {
+			out[k] = truncateToolResultContentValue(val, remaining)
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+func truncateStringToBudget(s string, remaining *int) string {
+	if *remaining <= 0 || s == "" {
+		return ""
+	}
+	runes := []rune(s)
+	if len(runes) <= *remaining {
+		*remaining -= len(runes)
+		return s
+	}
+	kept := *remaining
+	*remaining = 0
+	return string(runes[:kept]) + fmt.Sprintf("\n\n[ocgo truncated tool_result content: omitted %d characters]", len(runes)-kept)
 }
 
 func copyRawJSONField(dst map[string]any, src map[string]json.RawMessage, key string) {

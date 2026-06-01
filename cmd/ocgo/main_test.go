@@ -370,6 +370,33 @@ func TestNormalizeAnthropicRequestForStrictUpstream(t *testing.T) {
 	}
 }
 
+func TestNormalizeAnthropicToolResultTruncatesLargeFetchContent(t *testing.T) {
+	large := strings.Repeat("a", maxAnthropicToolResultContentChars+50) + "tail-should-be-omitted"
+	ar := AnthropicRequest{
+		Model: "qwen3.7-max",
+		Messages: []AMessage{{Role: "user", Content: marshalJSON([]map[string]any{{
+			"type":        "tool_result",
+			"tool_use_id": "toolu_fetch",
+			"content":     []map[string]any{{"type": "text", "text": large}},
+		}})}},
+	}
+
+	normalizeAnthropicRequestForUpstream(&ar)
+	body, err := json.Marshal(ar)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := string(body)
+	if strings.Contains(out, "tail-should-be-omitted") {
+		t.Fatalf("large fetched content was not truncated: %s", out[len(out)-200:])
+	}
+	for _, want := range []string{`"tool_use_id":"toolu_fetch"`, "ocgo truncated tool_result content"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in normalized request: %s", want, out)
+		}
+	}
+}
+
 func TestNormalizeQwenAnthropicRequestThinkingVariants(t *testing.T) {
 	zero := 0.0
 	topP := 0.8
