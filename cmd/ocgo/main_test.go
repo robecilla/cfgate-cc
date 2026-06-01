@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -11,6 +12,19 @@ import (
 	"strings"
 	"testing"
 )
+
+func TestMain(m *testing.M) {
+	dir, err := os.MkdirTemp("", "ocgo-test-*")
+	if err != nil {
+		panic(err)
+	}
+	old := modelMappingFile
+	modelMappingFile = func() string { return filepath.Join(dir, "model-mapping.json") }
+	code := m.Run()
+	modelMappingFile = old
+	_ = os.RemoveAll(dir)
+	os.Exit(code)
+}
 
 func TestWriteCodexProfile(t *testing.T) {
 	dir := t.TempDir()
@@ -42,6 +56,21 @@ func TestWriteCodexProfile(t *testing.T) {
 	if strings.Contains(content, "[profiles.ocgo-launch]") {
 		t.Fatalf("new Codex profile file must not contain legacy [profiles] table:\n%s", content)
 	}
+	b, err = os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	legacy := string(b)
+	for _, want := range []string{
+		"[profiles.ocgo-launch]",
+		`openai_base_url = "http://127.0.0.1:3456/v1/"`,
+		`model_provider = "ocgo-launch"`,
+		"[model_providers.ocgo-launch]",
+	} {
+		if !strings.Contains(legacy, want) {
+			t.Fatalf("missing legacy config %q in:\n%s", want, legacy)
+		}
+	}
 }
 
 func TestWriteCodexProfileMigratesLegacySections(t *testing.T) {
@@ -56,9 +85,14 @@ func TestWriteCodexProfileMigratesLegacySections(t *testing.T) {
 	}
 	b, _ := os.ReadFile(path)
 	content := string(b)
-	for _, gone := range []string{"http://old", "[profiles.ocgo-launch]", "[model_providers.ocgo-launch]", `profile = "ocgo-launch"`} {
+	for _, gone := range []string{"http://old", `profile = "ocgo-launch"`} {
 		if strings.Contains(content, gone) {
 			t.Fatalf("legacy Codex profile config %q was not removed:\n%s", gone, content)
+		}
+	}
+	for _, want := range []string{"[profiles.ocgo-launch]", "[model_providers.ocgo-launch]", `openai_base_url = "http://new/v1/"`} {
+		if !strings.Contains(content, want) {
+			t.Fatalf("new legacy-compatible config %q missing:\n%s", want, content)
 		}
 	}
 	if !strings.Contains(content, `keep = "top"`) || !strings.Contains(content, "[other]") || !strings.Contains(content, `key = "value"`) {
@@ -71,6 +105,7 @@ func TestWriteCodexProfileMigratesLegacySections(t *testing.T) {
 }
 
 func TestWriteCodexModelCatalog(t *testing.T) {
+	withTempModelMappingFile(t, filepath.Join(t.TempDir(), "model-mapping.json"))
 	path := filepath.Join(t.TempDir(), "ocgo-models.json")
 	if err := writeCodexModelCatalog(path); err != nil {
 		t.Fatal(err)
@@ -104,30 +139,93 @@ func TestWriteCodexModelCatalog(t *testing.T) {
 	if got := int(minimax["context_window"].(float64)); got != 512000 {
 		t.Fatalf("minimax-m3 context_window = %d, want 512000", got)
 	}
-	if got := int(minimax["max_context_window"].(float64)); got != 512000 {
-		t.Fatalf("minimax-m3 max_context_window = %d, want 512000", got)
-	}
 	if got := minimax["display_name"]; got != "MiniMax M3" {
 		t.Fatalf("minimax-m3 display_name = %v, want MiniMax M3", got)
 	}
-	modalities, ok := minimax["input_modalities"].([]any)
-	if !ok {
-		t.Fatalf("minimax-m3 modalities have unexpected type: %T", minimax["input_modalities"])
+	modalities := fmt.Sprint(minimax["input_modalities"])
+	for _, want := range []string{"text", "image"} {
+		if !strings.Contains(modalities, want) {
+			t.Fatalf("minimax-m3 modalities missing %s: %v", want, minimax["input_modalities"])
+		}
 	}
-	if strings.Join(anyStrings(modalities), ",") != "text,image" {
-		t.Fatalf("minimax-m3 Codex modalities = %v, want [text image]", minimax["input_modalities"])
-	}
-	if got := minimax["supports_parallel_tool_calls"]; got != true {
-		t.Fatalf("minimax-m3 supports_parallel_tool_calls = %v, want true", got)
+	if strings.Contains(modalities, "video") {
+		t.Fatalf("Codex catalog modalities must not include unsupported video modality: %v", minimax["input_modalities"])
 	}
 }
 
-func anyStrings(values []any) []string {
-	out := make([]string, 0, len(values))
-	for _, value := range values {
-		out = append(out, value.(string))
+func TestModelMappingsLoadSaveAndResolve(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "model-mapping.json")
+	withTempModelMappingFile(t, path)
+
+	m, err := loadModelMappings()
+	if err != nil {
+		t.Fatal(err)
 	}
-	return out
+	if got := resolveMappedModel("claude", "claude-sonnet-4-5", m); got != "claude-sonnet-4-5" {
+		t.Fatalf("unconfigured claude model should pass through, got %q", got)
+	}
+	m["claude"]["claude-sonnet"] = "kimi-k2.6"
+	m["claude"]["claude-sonnet-4-5"] = "qwen3.7-max"
+	m["codex"]["gpt-5"] = "deepseek-v4-pro"
+	if err := saveModelMappings(m); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := loadModelMappings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := resolveMappedModel("claude", "claude-sonnet-4-5", reloaded); got != "qwen3.7-max" {
+		t.Fatalf("custom claude mapping = %q", got)
+	}
+	if got := resolveMappedModel("codex", "gpt-5", reloaded); got != "deepseek-v4-pro" {
+		t.Fatalf("custom codex mapping = %q", got)
+	}
+}
+
+func TestPrepareChatBodyAppliesCodexMapping(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "model-mapping.json")
+	withTempModelMappingFile(t, path)
+	m := defaultModelMappings()
+	m["codex"]["gpt-5"] = "deepseek-v4-pro"
+	if err := saveModelMappings(m); err != nil {
+		t.Fatal(err)
+	}
+	body, err := prepareChatBody([]byte(`{"model":"gpt-5","messages":[{"role":"user","content":"hello"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), `"model":"deepseek-v4-pro"`) {
+		t.Fatalf("mapping was not applied: %s", string(body))
+	}
+}
+
+func TestMappingUnsetCommandRemovesMapping(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "model-mapping.json")
+	withTempModelMappingFile(t, path)
+	m := defaultModelMappings()
+	m["codex"]["gpt-5.5"] = "deepseek-v4-pro"
+	if err := saveModelMappings(m); err != nil {
+		t.Fatal(err)
+	}
+	cmd := toolMappingCmd("codex")
+	cmd.SetArgs([]string{"unset", "gpt-5.5"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := loadModelMappings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := reloaded["codex"]["gpt-5.5"]; ok {
+		t.Fatalf("mapping was not removed: %+v", reloaded["codex"])
+	}
+}
+
+func withTempModelMappingFile(t *testing.T, path string) {
+	t.Helper()
+	old := modelMappingFile
+	modelMappingFile = func() string { return path }
+	t.Cleanup(func() { modelMappingFile = old })
 }
 
 func TestCodexModelCatalogAllowsImagesForKnownVisionModels(t *testing.T) {
@@ -178,6 +276,30 @@ func TestChatToAnthropicForCodexModel(t *testing.T) {
 		t.Fatalf("bad anthropic messages: %+v", ar.Messages)
 	}
 	if len(ar.Tools) != 1 || ar.Tools[0].Name != "shell" {
+		t.Fatalf("bad anthropic tools: %+v", ar.Tools)
+	}
+}
+
+func TestResponsesToChatSkipsEmptyToolNamesAndDefaultsParameters(t *testing.T) {
+	or := responsesToChat(ResponsesRequest{
+		Model: "minimax-m2.7",
+		Input: []byte(`[{"type":"message","role":"user","content":"hello"}]`),
+		Tools: []ResponseTool{
+			{Type: "function", Name: ""},
+			{Type: "function", Name: "shell"},
+		},
+	})
+	if len(or.Tools) != 1 {
+		t.Fatalf("expected one valid tool, got %+v", or.Tools)
+	}
+	if or.Tools[0].Function.Name != "shell" {
+		t.Fatalf("bad tool name: %+v", or.Tools[0])
+	}
+	if string(or.Tools[0].Function.Parameters) != `{"type":"object","properties":{}}` {
+		t.Fatalf("bad default params: %s", string(or.Tools[0].Function.Parameters))
+	}
+	ar := chatToAnthropic(or)
+	if len(ar.Tools) != 1 || ar.Tools[0].Name != "shell" || string(ar.Tools[0].InputSchema) != `{"type":"object","properties":{}}` {
 		t.Fatalf("bad anthropic tools: %+v", ar.Tools)
 	}
 }

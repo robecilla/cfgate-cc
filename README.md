@@ -19,6 +19,7 @@ Use your OpenCode Go subscription from Claude Code or Codex CLI in one command â
 - List known OpenCode Go model IDs.
 - Run Claude Code through OpenCode Go with one command.
 - Run Codex CLI through OpenCode Go with one command.
+- Map Claude Code or Codex model names to OpenCode Go models when you want transparent model routing.
 - Start, stop, and inspect a local proxy server.
 - Exposes Anthropic-compatible and OpenAI-compatible local API layers.
 - Supports streaming text responses and basic tool-call translation.
@@ -95,6 +96,72 @@ ocgo ls
 ocgo models
 ```
 
+### Map tool models to OpenCode Go models
+
+`ocgo` can route model names used by Claude Code or Codex to OpenCode Go models. Mappings are empty by default; add only the routes you want. The mapping is stored in:
+
+```text
+~/.config/ocgo/model-mapping.json
+```
+
+Show the current mapping for a tool:
+
+```bash
+ocgo mapping claude show
+ocgo mapping codex show
+```
+
+Get, set, or remove one mapping:
+
+```bash
+ocgo mapping claude get claude-sonnet-4-5
+ocgo mapping claude set claude-sonnet-4-5 kimi-k2.6
+ocgo mapping claude unset claude-sonnet-4-5
+ocgo mapping codex set gpt-5 deepseek-v4-pro
+ocgo mapping codex rm gpt-5
+```
+
+Open the mapping file in `$EDITOR`:
+
+```bash
+ocgo mapping claude open
+ocgo mapping codex open
+```
+
+Exact mappings take precedence. For Claude, family mappings such as `claude-sonnet` can also match versioned names such as `claude-sonnet-4-5` when no exact entry exists.
+
+#### Claude mapping
+
+Claude Code primarily shows Claude/Anthropic models in its `/model` picker. It can show a single custom model in some launch modes, but `ocgo` cannot reliably inject the full OpenCode Go model catalog into Claude Code's picker.
+
+For Claude Code, mappings are useful to make Claude's usual aliases or model names resolve to the OpenCode Go models you prefer, without switching models every session:
+
+```bash
+ocgo mapping claude set claude-sonnet kimi-k2.6
+ocgo mapping claude set claude-opus deepseek-v4-pro
+ocgo mapping claude show
+```
+
+With the `claude-sonnet` family mapping above, requests for versioned Sonnet names also route to the same target unless an exact mapping exists:
+
+```text
+claude-sonnet-4-5 -> kimi-k2.6
+```
+
+When launching Claude, `ocgo` prints the active mapping and exports Claude's default model environment variables only for configured routes.
+
+#### Codex mapping
+
+Codex is different: `ocgo` can already provide a model catalog to Codex through `~/.codex/ocgo-models.json`, so OpenCode Go models can appear directly in Codex's model selection UI.
+
+For Codex, mappings are mostly useful for compatibility with prompts, scripts, tools, or existing config that still request original Codex/OpenAI model names. For example:
+
+```bash
+ocgo mapping codex set gpt-5.5 deepseek-v4-pro
+```
+
+Then a request for `gpt-5.5` is routed to `deepseek-v4-pro`. Mapped aliases are also included in the generated Codex model catalog so they can appear alongside OpenCode Go model IDs.
+
 ### Launch Claude Code
 
 Start Claude Code through the local proxy:
@@ -135,7 +202,7 @@ ANTHROPIC_MODEL=<model>
 ANTHROPIC_SMALL_FAST_MODEL=<model>
 ```
 
-If Claude Code requests a Claude model name or does not provide a model, `ocgo` defaults the upstream OpenCode Go model to `kimi-k2.6`.
+If Claude Code requests a Claude model name, `ocgo` routes the request through `ocgo mapping claude`. Unmapped model names pass through unchanged. `ocgo launch claude` prints the active mapping before starting Claude Code.
 
 ### Launch Codex CLI
 
@@ -163,7 +230,7 @@ Configure Codex without launching it:
 ocgo launch codex --config
 ```
 
-When `ocgo launch codex` runs, it writes or updates this profile in `~/.codex/config.toml`:
+When `ocgo launch codex` runs, it writes or updates the `ocgo-launch` Codex profile. For newer Codex versions it writes `~/.codex/ocgo-launch.config.toml`; for compatibility with older Codex versions it also writes legacy profile sections in `~/.codex/config.toml`:
 
 ```toml
 [profiles.ocgo-launch]
@@ -185,6 +252,8 @@ codex --profile ocgo-launch -m <model>
 ```
 
 The Codex process receives `OPENAI_API_KEY=ocgo`; the local proxy injects your real OpenCode Go API key upstream. `ocgo` also writes `~/.codex/ocgo-models.json` so Codex has metadata for OpenCode Go model IDs such as `deepseek-v4-pro`.
+
+Codex model names can be routed through `ocgo mapping codex`. Mapped Codex aliases are included in the generated `~/.codex/ocgo-models.json` catalog so they can appear alongside OpenCode Go models.
 
 ## Proxy commands
 

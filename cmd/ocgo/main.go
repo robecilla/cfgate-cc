@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -157,7 +158,7 @@ var reasoningContentCache = struct {
 
 func main() {
 	root := &cobra.Command{Use: appName, Short: "Run Claude Code with OpenCode Go", Version: version}
-	root.AddCommand(setupCmd(), listCmd(), launchCmd(), serveCmd(), stopCmd(), statusCmd())
+	root.AddCommand(setupCmd(), listCmd(), mappingCmd(), launchCmd(), serveCmd(), stopCmd(), statusCmd())
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
 	}
@@ -252,6 +253,212 @@ func modelMetadata(model string) openCodeModelMetadata {
 	return meta
 }
 
+func defaultModelMappings() map[string]map[string]string {
+	return map[string]map[string]string{
+		"claude": {},
+		"codex":  {},
+	}
+}
+
+func mappingCmd() *cobra.Command {
+	cmd := &cobra.Command{Use: "mapping", Short: "Manage tool model mappings to OpenCode Go models"}
+	cmd.AddCommand(toolMappingCmd("claude"), toolMappingCmd("codex"))
+	return cmd
+}
+
+func toolMappingCmd(tool string) *cobra.Command {
+	cmd := &cobra.Command{Use: tool, Short: fmt.Sprintf("Manage %s model mappings", tool)}
+	cmd.AddCommand(&cobra.Command{Use: "show", Short: "Show current mapping", RunE: func(cmd *cobra.Command, args []string) error {
+		m, err := loadModelMappings()
+		if err != nil {
+			return err
+		}
+		printToolMapping(tool, m[tool])
+		return nil
+	}})
+	cmd.AddCommand(&cobra.Command{Use: "get <source-model>", Short: "Get one mapped OpenCode Go model", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		m, err := loadModelMappings()
+		if err != nil {
+			return err
+		}
+		source := strings.TrimSpace(args[0])
+		normalized := modelID(source)
+		if target := resolveMappedModel(tool, source, m); target != normalized {
+			fmt.Printf("%s -> %s\n", source, target)
+			return nil
+		}
+		return fmt.Errorf("no mapping for %q in %s", source, tool)
+	}})
+	cmd.AddCommand(&cobra.Command{Use: "set <source-model> <opencode-model>", Short: "Set one model mapping", Args: cobra.ExactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
+		source := strings.TrimSpace(args[0])
+		target := strings.TrimSpace(args[1])
+		if source == "" || target == "" {
+			return errors.New("source and target models cannot be empty")
+		}
+		if !knownOpenCodeModel(target) {
+			return fmt.Errorf("unknown OpenCode Go model %q; run `ocgo models`", target)
+		}
+		m, err := loadModelMappings()
+		if err != nil {
+			return err
+		}
+		if m[tool] == nil {
+			m[tool] = map[string]string{}
+		}
+		m[tool][source] = modelID(target)
+		if err := saveModelMappings(m); err != nil {
+			return err
+		}
+		fmt.Printf("%s %s -> %s\n", tool, source, modelID(target))
+		return nil
+	}})
+	cmd.AddCommand(&cobra.Command{Use: "unset <source-model>", Aliases: []string{"rm", "remove", "delete"}, Short: "Remove one model mapping", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		source := strings.TrimSpace(args[0])
+		if source == "" {
+			return errors.New("source model cannot be empty")
+		}
+		m, err := loadModelMappings()
+		if err != nil {
+			return err
+		}
+		if m[tool] == nil {
+			m[tool] = map[string]string{}
+		}
+		if _, ok := m[tool][source]; !ok {
+			return fmt.Errorf("no mapping for %q in %s", source, tool)
+		}
+		delete(m[tool], source)
+		if err := saveModelMappings(m); err != nil {
+			return err
+		}
+		fmt.Printf("removed %s mapping for %s\n", tool, source)
+		return nil
+	}})
+	cmd.AddCommand(&cobra.Command{Use: "open", Short: "Open mapping file in $EDITOR", RunE: func(cmd *cobra.Command, args []string) error {
+		m, err := loadModelMappings()
+		if err != nil {
+			return err
+		}
+		if _, err := os.Stat(modelMappingFile()); errors.Is(err, os.ErrNotExist) {
+			if err := saveModelMappings(m); err != nil {
+				return err
+			}
+		}
+		editor := os.Getenv("EDITOR")
+		if editor == "" {
+			editor = "vi"
+		}
+		c := exec.Command(editor, modelMappingFile())
+		c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
+		return c.Run()
+	}})
+	return cmd
+}
+
+func printToolMapping(tool string, mapping map[string]string) {
+	fmt.Printf("%s -> OpenCode Go mapping (%s):\n", displayToolName(tool), modelMappingFile())
+	if len(mapping) == 0 {
+		fmt.Println("  (empty)")
+		return
+	}
+	keys := make([]string, 0, len(mapping))
+	for k := range mapping {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Printf("  %-24s -> %s\n", k, mapping[k])
+	}
+}
+
+func displayToolName(tool string) string {
+	if tool == "" {
+		return tool
+	}
+	return strings.ToUpper(tool[:1]) + tool[1:]
+}
+
+func printLaunchMapping(tool string, mapping map[string]string) {
+	if len(mapping) == 0 {
+		fmt.Fprintf(os.Stderr, "No OCGO model mappings configured for %s (%s)\n", tool, modelMappingFile())
+		return
+	}
+	fmt.Fprintf(os.Stderr, "OCGO model mapping enabled for %s (%s)\n", tool, modelMappingFile())
+	keys := make([]string, 0, len(mapping))
+	for k := range mapping {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		fmt.Fprintf(os.Stderr, "  %s -> %s\n", k, mapping[k])
+	}
+}
+
+func knownOpenCodeModel(model string) bool {
+	model = modelID(model)
+	for _, id := range knownModelIDs() {
+		if id == model {
+			return true
+		}
+	}
+	return false
+}
+
+func loadModelMappings() (map[string]map[string]string, error) {
+	mappings := defaultModelMappings()
+	b, err := os.ReadFile(modelMappingFile())
+	if errors.Is(err, os.ErrNotExist) {
+		return mappings, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var custom map[string]map[string]string
+	if err := json.Unmarshal(b, &custom); err != nil {
+		return mappings, nil
+	}
+	for tool, entries := range custom {
+		if mappings[tool] == nil {
+			mappings[tool] = map[string]string{}
+		}
+		for source, target := range entries {
+			if strings.TrimSpace(source) != "" && strings.TrimSpace(target) != "" {
+				mappings[tool][strings.TrimSpace(source)] = modelID(target)
+			}
+		}
+	}
+	return mappings, nil
+}
+
+func saveModelMappings(mappings map[string]map[string]string) error {
+	if err := os.MkdirAll(filepath.Dir(modelMappingFile()), 0755); err != nil {
+		return err
+	}
+	b, err := json.MarshalIndent(mappings, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(modelMappingFile(), append(b, '\n'), 0644)
+}
+
+func resolveMappedModel(tool, source string, mappings map[string]map[string]string) string {
+	source = strings.TrimSpace(modelID(source))
+	entries := mappings[tool]
+	if target := entries[source]; target != "" {
+		return target
+	}
+	if tool == "claude" {
+		for _, family := range []string{"opus", "sonnet", "haiku"} {
+			if source == family || strings.Contains(source, "claude-"+family) {
+				if target := entries["claude-"+family]; target != "" {
+					return target
+				}
+			}
+		}
+	}
+	return source
+}
+
 func modelID(model string) string {
 	return strings.TrimPrefix(strings.TrimSpace(model), "opencode-go/")
 }
@@ -303,9 +510,46 @@ func launchCmd() *cobra.Command {
 		c := exec.Command(bin, claudeArgs...)
 		c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
 		c.Env = append(os.Environ(), "ANTHROPIC_BASE_URL="+base, "ANTHROPIC_AUTH_TOKEN=unused")
-		if model != "" {
-			c.Env = append(c.Env, "ANTHROPIC_MODEL="+model, "ANTHROPIC_SMALL_FAST_MODEL="+model)
+		mappings, err := loadModelMappings()
+		if err != nil {
+			return err
 		}
+		if model != "" {
+			c.Env = append(c.Env,
+				"ANTHROPIC_MODEL="+model,
+				"ANTHROPIC_SMALL_FAST_MODEL="+model,
+				"ANTHROPIC_CUSTOM_MODEL_OPTION="+model,
+				"ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="+model+" via OCGO",
+				"ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION=OpenCode Go model routed through OCGO",
+			)
+		} else {
+			opus := resolveMappedModel("claude", "claude-opus", mappings)
+			sonnet := resolveMappedModel("claude", "claude-sonnet", mappings)
+			haiku := resolveMappedModel("claude", "claude-haiku", mappings)
+			if opus != "claude-opus" {
+				c.Env = append(c.Env,
+					"ANTHROPIC_DEFAULT_OPUS_MODEL="+opus,
+					"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME="+opus+" via OCGO",
+					"ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION=OpenCode Go model routed through OCGO",
+				)
+			}
+			if sonnet != "claude-sonnet" {
+				c.Env = append(c.Env,
+					"ANTHROPIC_DEFAULT_SONNET_MODEL="+sonnet,
+					"ANTHROPIC_DEFAULT_SONNET_MODEL_NAME="+sonnet+" via OCGO",
+					"ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION=OpenCode Go model routed through OCGO",
+				)
+			}
+			if haiku != "claude-haiku" {
+				c.Env = append(c.Env,
+					"ANTHROPIC_DEFAULT_HAIKU_MODEL="+haiku,
+					"ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME="+haiku+" via OCGO",
+					"ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION=OpenCode Go model routed through OCGO",
+					"ANTHROPIC_SMALL_FAST_MODEL="+haiku,
+				)
+			}
+		}
+		printLaunchMapping("claude", mappings["claude"])
 		return c.Run()
 	}}
 	claude.Flags().StringVar(&model, "model", "", "OpenCode Go model ID")
@@ -345,6 +589,9 @@ func launchCmd() *cobra.Command {
 		c := exec.Command(bin, codexArgs...)
 		c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
 		c.Env = append(os.Environ(), "OPENAI_API_KEY=ocgo")
+		if mappings, err := loadModelMappings(); err == nil {
+			printLaunchMapping("codex", mappings["codex"])
+		}
 		return c.Run()
 	}}
 	codex.Flags().StringVar(&model, "model", "", "OpenCode Go model ID")
@@ -750,13 +997,18 @@ func stripCacheControl(v any) any {
 }
 
 func ensureAnthropicRequestDefaults(ar *AnthropicRequest) {
-	ar.Model = modelID(ar.Model)
-	if ar.Model == "" || strings.HasPrefix(ar.Model, "claude-") {
-		ar.Model = "kimi-k2.6"
-	}
+	ar.Model = resolveToolModel("claude", ar.Model)
 	if ar.MaxTokens == 0 {
 		ar.MaxTokens = 4096
 	}
+}
+
+func resolveToolModel(tool, source string) string {
+	mappings, err := loadModelMappings()
+	if err != nil {
+		mappings = defaultModelMappings()
+	}
+	return resolveMappedModel(tool, source, mappings)
 }
 
 func prepareChatBody(body []byte) ([]byte, error) {
@@ -769,6 +1021,11 @@ func prepareChatBody(body []byte) ([]byte, error) {
 		changed = true
 	}
 	model, _ := req["model"].(string)
+	if mapped := resolveToolModel("codex", model); mapped != model {
+		req["model"] = mapped
+		model = mapped
+		changed = true
+	}
 	if rawChatBodyHasImages(req) {
 		if !modelSupportsImages(model) {
 			return nil, unsupportedImageModelError(model)
@@ -956,10 +1213,7 @@ func stripRawChatImageDetails(req map[string]any) bool {
 }
 
 func convertRequest(ar AnthropicRequest) OAIRequest {
-	model := ar.Model
-	if model == "" || strings.HasPrefix(model, "claude-") {
-		model = "kimi-k2.6"
-	}
+	model := resolveToolModel("claude", ar.Model)
 	out := OAIRequest{Model: model, Stream: ar.Stream, StreamOptions: streamUsageOptions(ar.Stream), MaxTokens: ar.MaxTokens, Temperature: ar.Temperature, TopP: ar.TopP, ReasoningEffort: downstreamReasoningEffort(ar.Reasoning, ar.Thinking, ar.OutputConfig, ar.ReasoningEffort, ar.Effort, ar.Level, ar.Depth)}
 	if sys := systemText(ar.System); sys != "" {
 		out.Messages = append(out.Messages, OAIMessage{Role: "system", Content: sys})
@@ -968,34 +1222,37 @@ func convertRequest(ar AnthropicRequest) OAIRequest {
 		out.Messages = append(out.Messages, contentToOpenAI(m)...)
 	}
 	for _, t := range ar.Tools {
-		out.Tools = append(out.Tools, OAITool{Type: "function", Function: OAIFunction{Name: t.Name, Description: t.Description, Parameters: t.InputSchema}})
+		if strings.TrimSpace(t.Name) != "" {
+			out.Tools = append(out.Tools, OAITool{Type: "function", Function: OAIFunction{Name: t.Name, Description: t.Description, Parameters: toolParametersOrDefault(t.InputSchema)}})
+		}
 	}
 	return out
 }
 
 func responsesToChat(rr ResponsesRequest) OAIRequest {
-	model := rr.Model
-	if model == "" {
-		model = "kimi-k2.6"
-	}
+	model := resolveToolModel("codex", rr.Model)
 	out := OAIRequest{Model: model, Stream: rr.Stream, StreamOptions: streamUsageOptions(rr.Stream), MaxTokens: rr.MaxTokens, Temperature: rr.Temperature, TopP: rr.TopP, ReasoningEffort: downstreamReasoningEffort(rr.Reasoning, rr.Thinking, rr.OutputConfig, rr.ReasoningEffort, rr.Effort, rr.Level, rr.Depth)}
 	if rr.Instructions != "" {
 		out.Messages = append(out.Messages, OAIMessage{Role: "system", Content: rr.Instructions})
 	}
 	out.Messages = append(out.Messages, responsesInputToMessages(rr.Input)...)
 	for _, t := range rr.Tools {
-		if t.Type == "function" || t.Name != "" {
-			out.Tools = append(out.Tools, OAITool{Type: "function", Function: OAIFunction{Name: t.Name, Description: t.Description, Parameters: t.Parameters}})
+		if strings.TrimSpace(t.Name) != "" && (t.Type == "" || t.Type == "function") {
+			out.Tools = append(out.Tools, OAITool{Type: "function", Function: OAIFunction{Name: t.Name, Description: t.Description, Parameters: toolParametersOrDefault(t.Parameters)}})
 		}
 	}
 	return out
 }
 
-func chatToAnthropic(or OAIRequest) AnthropicRequest {
-	model := modelID(or.Model)
-	if model == "" {
-		model = "kimi-k2.6"
+func toolParametersOrDefault(raw json.RawMessage) json.RawMessage {
+	if len(bytes.TrimSpace(raw)) == 0 || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return json.RawMessage(`{"type":"object","properties":{}}`)
 	}
+	return raw
+}
+
+func chatToAnthropic(or OAIRequest) AnthropicRequest {
+	model := resolveToolModel("codex", or.Model)
 	out := AnthropicRequest{Model: model, MaxTokens: or.MaxTokens, Stream: or.Stream, Temperature: or.Temperature, TopP: or.TopP}
 	if out.MaxTokens == 0 {
 		out.MaxTokens = 4096
@@ -1026,8 +1283,8 @@ func chatToAnthropic(or OAIRequest) AnthropicRequest {
 		out.System = marshalJSON(strings.Join(system, "\n\n"))
 	}
 	for _, t := range or.Tools {
-		if t.Type == "function" || t.Function.Name != "" {
-			out.Tools = append(out.Tools, ATool{Name: t.Function.Name, Description: t.Function.Description, InputSchema: t.Function.Parameters})
+		if strings.TrimSpace(t.Function.Name) != "" && (t.Type == "" || t.Type == "function") {
+			out.Tools = append(out.Tools, ATool{Name: t.Function.Name, Description: t.Function.Description, InputSchema: toolParametersOrDefault(t.Function.Parameters)})
 		}
 	}
 	return out
@@ -2340,6 +2597,8 @@ func configDir() string  { home, _ := os.UserHomeDir(); return filepath.Join(hom
 func configFile() string { return filepath.Join(configDir(), "config.json") }
 func pidFile() string    { return filepath.Join(configDir(), "ocgo.pid") }
 
+var modelMappingFile = func() string { return filepath.Join(configDir(), "model-mapping.json") }
+
 func codexConfigFile() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".codex", "config.toml")
@@ -2394,10 +2653,30 @@ func writeCodexProfile(path, baseURL string) error {
 		return err
 	}
 	cleaned := stripLegacyCodexProfile(text)
-	if cleaned == "" && errors.Is(err, os.ErrNotExist) {
-		return nil
+	return os.WriteFile(path, []byte(appendLegacyCodexProfile(cleaned, baseURL, catalogPath)), 0644)
+}
+
+func appendLegacyCodexProfile(text, baseURL, catalogPath string) string {
+	text = strings.TrimSpace(text)
+	legacy := strings.Join([]string{
+		fmt.Sprintf("[profiles.%s]", codexProfileName),
+		fmt.Sprintf("openai_base_url = %q", baseURL),
+		`forced_login_method = "api"`,
+		fmt.Sprintf("model_provider = %q", codexProfileName),
+		fmt.Sprintf("model_catalog_json = %q", catalogPath),
+		`model_reasoning_effort = "minimal"`,
+		`model_reasoning_summary = "none"`,
+		"",
+		fmt.Sprintf("[model_providers.%s]", codexProfileName),
+		`name = "OpenCode Go"`,
+		fmt.Sprintf("base_url = %q", baseURL),
+		`wire_api = "responses"`,
+		"",
+	}, "\n")
+	if text == "" {
+		return legacy
 	}
-	return os.WriteFile(path, []byte(cleaned), 0644)
+	return text + "\n\n" + legacy
 }
 
 func stripLegacyCodexProfile(text string) string {
@@ -2428,13 +2707,26 @@ func stripLegacyCodexProfile(text string) string {
 }
 
 func writeCodexModelCatalog(path string) error {
-	models := make([]map[string]any, 0, len(knownModelIDs()))
-	for i, id := range knownModelIDs() {
-		meta := modelMetadata(id)
+	mappings, err := loadModelMappings()
+	if err != nil {
+		mappings = defaultModelMappings()
+	}
+	models := make([]map[string]any, 0, len(knownModelIDs())+len(mappings["codex"]))
+	seen := map[string]bool{}
+	addModel := func(id, target, description string, i int) {
+		if seen[id] {
+			return
+		}
+		seen[id] = true
+		meta := modelMetadata(target)
+		displayName := id
+		if id == target {
+			displayName = meta.DisplayName
+		}
 		models = append(models, map[string]any{
 			"slug":                             id,
-			"display_name":                     meta.DisplayName,
-			"description":                      meta.Description,
+			"display_name":                     displayName,
+			"description":                      description,
 			"default_reasoning_level":          meta.DefaultReasoningLevel,
 			"supported_reasoning_levels":       meta.SupportedReasoning,
 			"shell_type":                       "shell_command",
@@ -2461,6 +2753,18 @@ func writeCodexModelCatalog(path string) error {
 			"input_modalities":                 meta.CodexInputModalities,
 			"supports_search_tool":             false,
 		})
+	}
+	for i, id := range knownModelIDs() {
+		addModel(id, id, modelMetadata(id).Description, i)
+	}
+	keys := make([]string, 0, len(mappings["codex"]))
+	for source := range mappings["codex"] {
+		keys = append(keys, source)
+	}
+	sort.Strings(keys)
+	for i, source := range keys {
+		target := mappings["codex"][source]
+		addModel(source, target, "OCGO mapping to "+target, len(knownModelIDs())+i)
 	}
 	b, err := json.MarshalIndent(map[string]any{"models": models}, "", "  ")
 	if err != nil {
