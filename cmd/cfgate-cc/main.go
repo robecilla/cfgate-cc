@@ -14,6 +14,7 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -36,7 +37,7 @@ var version = "dev"
 // openAIURL builds the upstream openai-compatible chat/completions URL
 // from cfg.UpstreamBaseURL. Falls back to the opencode-go default when no
 // upstream is configured, preserving the original ocgo behavior.
-func openAIURL(cfg Config) string {
+func openAIURL(cfg ProviderConfig) string {
 	if cfg.UpstreamBaseURL != "" {
 		return strings.TrimRight(cfg.UpstreamBaseURL, "/") + "/chat/completions"
 	}
@@ -45,7 +46,7 @@ func openAIURL(cfg Config) string {
 
 // anthropicURL is the upstream anthropic-compatible /messages URL, used
 // only for models routed via endpoint_overrides with route=anthropic.
-func anthropicURL(cfg Config) string {
+func anthropicURL(cfg ProviderConfig) string {
 	if cfg.UpstreamBaseURL != "" {
 		return strings.TrimRight(cfg.UpstreamBaseURL, "/") + "/messages"
 	}
@@ -144,15 +145,32 @@ type ModelEndpointOverride struct {
 }
 
 type Config struct {
-	APIKey            string                  `json:"api_key"`            // local proxy auth, used by claude/codex clients
-	Host              string                  `json:"host"`               // local proxy bind
-	Port              int                     `json:"port"`               // local proxy port (default 3456)
-	UpstreamBaseURL   string                  `json:"upstream_base_url"`  // e.g. cloudflare /compat/v1 or opencode-go
+	APIKey string `json:"api_key"` // local proxy auth, used by claude/codex clients
+	Host   string `json:"host"`    // local proxy bind
+	Port   int    `json:"port"`    // local proxy port (default 3456)
+}
+
+// ProviderConfig is the per-provider upstream config. each named provider
+// (opencode-go, cloudflare, ...) lives in its own json file under configDir().
+// upstream-only fields moved out of Config so swapping providers doesn't
+// require rewriting local-proxy settings, and so two providers can coexist
+// (e.g. cloudflare for prod, opencode-go for the opencode.ai default).
+type ProviderConfig struct {
+	UpstreamBaseURL   string                  `json:"upstream_base_url"`  // e.g. cloudflare /ai/v1 or opencode-go
 	UpstreamAPIKey    string                  `json:"upstream_api_key"`   // bearer/x-api-key value sent upstream
 	UpstreamAuth      string                  `json:"upstream_auth"`      // "bearer" | "x-api-key" | "header"
 	UpstreamAuthHdr   string                  `json:"upstream_auth_hdr"`  // header name for "header" mode
 	UpstreamExtraHdr  map[string]string       `json:"upstream_extra_hdr"` // extra headers for upstream
 	EndpointOverrides []ModelEndpointOverride `json:"endpoint_overrides"` // per-model routing
+	Gateway           string                  `json:"gateway,omitempty"`  // cloudflare: cf-aig-gateway-id value
+}
+
+// knownProviders is the fixed enum. add a new provider = add a setup
+// subcommand + a row in the file. nothing else.
+var knownProviders = []string{"opencode-go", "cloudflare"}
+
+func isKnownProvider(name string) bool {
+	return slices.Contains(knownProviders, name)
 }
 
 type AnthropicRequest struct {
@@ -313,11 +331,12 @@ func setupOpencodeGoCmd() *cobra.Command {
 				}
 				key = line
 			}
-			cfg := Config{APIKey: strings.TrimSpace(key), Host: defaultHost, Port: defaultPort}
-			if cfg.APIKey == "" {
+			key = strings.TrimSpace(key)
+			if key == "" {
 				return errors.New("API key cannot be empty")
 			}
-			return saveConfig(cfg)
+			p := ProviderConfig{UpstreamAPIKey: key, UpstreamAuth: "both"}
+			return saveProviderConfig("opencode-go", p)
 		},
 	}
 	cmd.Flags().StringVar(&key, "api-key", "", "Upstream provider API key")
@@ -335,23 +354,27 @@ func setupCloudflareCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			cfg, err := loadConfig()
+			targetURL := buildCloudflareURL(values.account)
+			existing, err := loadProviderConfig("cloudflare")
 			if err != nil {
 				return err
 			}
-			if cfg.UpstreamBaseURL != "" && cfg.UpstreamBaseURL != buildCloudflareURL(values.account, values.gateway) && !force {
-				return fmt.Errorf("upstream_base_url is already set to %q; pass --force to overwrite", cfg.UpstreamBaseURL)
+			if existing.UpstreamBaseURL != "" && existing.UpstreamBaseURL != targetURL && !force {
+				return fmt.Errorf("cloudflare provider is already configured for %q; pass --force to overwrite", existing.UpstreamBaseURL)
 			}
-			cfg.UpstreamBaseURL = buildCloudflareURL(values.account, values.gateway)
-			cfg.UpstreamAPIKey = values.token
-			cfg.UpstreamAuth = "bearer"
-			return saveConfig(cfg)
+			p := ProviderConfig{
+				UpstreamBaseURL: targetURL,
+				UpstreamAPIKey:  values.token,
+				UpstreamAuth:    "bearer",
+				Gateway:         values.gateway,
+			}
+			return saveProviderConfig("cloudflare", p)
 		},
 	}
 	cmd.Flags().StringVar(&token, "token", "", "Cloudflare API token (falls back to $CLOUDFLARE_API_TOKEN)")
 	cmd.Flags().StringVar(&account, "account", "", "Cloudflare account ID (falls back to $CLOUDFLARE_ACCOUNT_ID)")
 	cmd.Flags().StringVar(&gateway, "gateway", "", "Cloudflare AI Gateway ID (falls back to $CLOUDFLARE_GATEWAY_ID)")
-	cmd.Flags().BoolVar(&force, "force", false, "Overwrite an existing upstream_base_url without prompting")
+	cmd.Flags().BoolVar(&force, "force", false, "Overwrite an existing cloudflare provider config without prompting")
 	return cmd
 }
 
@@ -402,10 +425,11 @@ func readCloudflareValues(r io.Reader, tokenFlag, accountFlag, gatewayFlag strin
 	return cloudflareValues{token: t, account: a, gateway: g}, nil
 }
 
-// buildCloudflareURL assembles the AI Gateway compat URL from account and gateway IDs.
+// buildCloudflareURL assembles the AI Gateway REST API URL from the account ID.
+// the gateway id rides on a header, not the path; see applyCloudflareGatewayHeader.
 // ponytail: if cloudflare ever changes the URL shape, only this function moves.
-func buildCloudflareURL(account, gateway string) string {
-	return fmt.Sprintf("https://gateway.ai.cloudflare.com/v1/%s/%s/compat/v1", account, gateway)
+func buildCloudflareURL(account string) string {
+	return fmt.Sprintf("https://api.cloudflare.com/client/v4/accounts/%s/ai/v1", account)
 }
 
 func listCmd() *cobra.Command {
@@ -815,7 +839,7 @@ func modelID(model string) string {
 	return strings.TrimPrefix(strings.TrimSpace(model), "opencode-go/")
 }
 
-func modelUsesAnthropicEndpoint(model string, cfg Config) bool {
+func modelUsesAnthropicEndpoint(model string, cfg ProviderConfig) bool {
 	id := modelID(model)
 	for _, ov := range cfg.EndpointOverrides {
 		if ov.Pattern == "" {
@@ -853,8 +877,12 @@ func launchCmd() *cobra.Command {
 		if err != nil {
 			return err
 		}
+		providerName, err := resolveProvider(cmd)
+		if err != nil {
+			return err
+		}
 		base := fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port)
-		serverCmd, err := startLaunchServer(base)
+		serverCmd, err := startLaunchServer(base, providerName)
 		if err != nil {
 			return err
 		}
@@ -916,8 +944,13 @@ func launchCmd() *cobra.Command {
 	}}
 	claude.Flags().StringVar(&model, "model", "", "Upstream model ID")
 	claude.Flags().BoolVar(&yes, "yes", false, "Allow Claude Code to skip permission prompts")
+	claude.Flags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $OCGO_PROVIDER or the single configured provider")
 	codex := &cobra.Command{Use: "codex [-- codex args...]", Short: "Launch Codex CLI through the configured upstream provider", Args: cobra.ArbitraryArgs, RunE: func(cmd *cobra.Command, args []string) error {
 		cfg, err := loadConfig()
+		if err != nil {
+			return err
+		}
+		providerName, err := resolveProvider(cmd)
 		if err != nil {
 			return err
 		}
@@ -932,7 +965,7 @@ func launchCmd() *cobra.Command {
 		if err := checkCodexVersion(); err != nil {
 			return err
 		}
-		serverCmd, err := startLaunchServer(base)
+		serverCmd, err := startLaunchServer(base, providerName)
 		if err != nil {
 			return err
 		}
@@ -958,6 +991,7 @@ func launchCmd() *cobra.Command {
 	}}
 	codex.Flags().StringVar(&model, "model", "", "Upstream model ID")
 	codex.Flags().BoolVar(&codexConfigOnly, "config", false, "Configure Codex profile without launching")
+	codex.Flags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $OCGO_PROVIDER or the single configured provider")
 	cmd.AddCommand(claude, codex)
 	return cmd
 }
@@ -965,16 +999,25 @@ func launchCmd() *cobra.Command {
 func serveCmd() *cobra.Command {
 	var background bool
 	cmd := &cobra.Command{Use: "serve", Short: "Start local Anthropic-compatible proxy", RunE: func(cmd *cobra.Command, args []string) error {
+		providerName, err := resolveProvider(cmd)
+		if err != nil {
+			return err
+		}
 		if background {
-			return startBackground()
+			return startBackground(providerName)
 		}
 		cfg, err := loadConfig()
 		if err != nil {
 			return err
 		}
-		return runServer(cfg)
+		p, err := loadActiveProvider(providerName)
+		if err != nil {
+			return err
+		}
+		return runServer(cfg, p)
 	}}
 	cmd.Flags().BoolVarP(&background, "background", "b", false, "Run proxy in the background")
+	cmd.Flags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $OCGO_PROVIDER or the single configured provider")
 	return cmd
 }
 
@@ -1011,19 +1054,23 @@ func statusCmd() *cobra.Command {
 			fmt.Println("Proxy is not running")
 			return
 		}
+		provider := "(unknown)"
+		if name, err := resolveProvider(cmd); err == nil {
+			provider = name
+		}
 		if pid, err := readPID(); err == nil {
-			fmt.Printf("Proxy is running on %s:%d (PID %d)\n", cfg.Host, cfg.Port, pid)
+			fmt.Printf("Proxy is running on %s:%d (provider %s, PID %d)\n", cfg.Host, cfg.Port, provider, pid)
 			return
 		}
 		if pid, err := findListenerPID(cfg.Port); err == nil {
-			fmt.Printf("Proxy is running on %s:%d (PID %d, discovered from listener)\n", cfg.Host, cfg.Port, pid)
+			fmt.Printf("Proxy is running on %s:%d (provider %s, PID %d, discovered from listener)\n", cfg.Host, cfg.Port, provider, pid)
 			return
 		}
-		fmt.Printf("Proxy is running on %s:%d (no cfgate-cc PID file)\n", cfg.Host, cfg.Port)
+		fmt.Printf("Proxy is running on %s:%d (provider %s, no cfgate-cc PID file)\n", cfg.Host, cfg.Port, provider)
 	}}
 }
 
-func runServer(cfg Config) error {
+func runServer(cfg Config, p ProviderConfig) error {
 	if err := os.MkdirAll(configDir(), 0755); err == nil {
 		_ = os.WriteFile(pidFile(), []byte(fmt.Sprint(os.Getpid())), 0644)
 		defer os.Remove(pidFile())
@@ -1031,15 +1078,15 @@ func runServer(cfg Config) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("ok\n")) })
 	mux.HandleFunc("/v1/messages/count_tokens", countTokens)
-	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) { proxyMessages(w, r, cfg) })
-	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) { proxyChatCompletions(w, r, cfg) })
-	mux.HandleFunc("/v1/responses", func(w http.ResponseWriter, r *http.Request) { proxyResponses(w, r, cfg) })
+	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) { proxyMessages(w, r, p) })
+	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) { proxyChatCompletions(w, r, p) })
+	mux.HandleFunc("/v1/responses", func(w http.ResponseWriter, r *http.Request) { proxyResponses(w, r, p) })
 	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
 	fmt.Printf("cfgate-cc proxy listening on http://%s\n", addr)
 	return http.ListenAndServe(addr, mux)
 }
 
-func proxyMessages(w http.ResponseWriter, r *http.Request, cfg Config) {
+func proxyMessages(w http.ResponseWriter, r *http.Request, cfg ProviderConfig) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -1069,12 +1116,14 @@ func proxyMessages(w http.ResponseWriter, r *http.Request, cfg Config) {
 		return
 	}
 	body, _ := json.Marshal(or)
+	body, wireModel := cloudflarePrepareBody(body, cfg)
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, openAIURL(cfg), bytes.NewReader(body))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	applyUpstreamAuth(req, cfg)
+	applyCloudflareGatewayHeader(req, cfg, wireModel)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := (&http.Client{Timeout: 10 * time.Minute}).Do(req)
 	if err != nil {
@@ -1094,7 +1143,7 @@ func proxyMessages(w http.ResponseWriter, r *http.Request, cfg Config) {
 	writeAnthropicResponse(w, resp.Body, or.Model)
 }
 
-func proxyChatCompletions(w http.ResponseWriter, r *http.Request, cfg Config) {
+func proxyChatCompletions(w http.ResponseWriter, r *http.Request, cfg ProviderConfig) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -1134,12 +1183,14 @@ func proxyChatCompletions(w http.ResponseWriter, r *http.Request, cfg Config) {
 		writeChatCompletionsResponseFromAnthropic(w, resp.Body, or.Model)
 		return
 	}
+	body, wireModel := cloudflarePrepareBody(body, cfg)
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, openAIURL(cfg), bytes.NewReader(body))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	applyUpstreamAuth(req, cfg)
+	applyCloudflareGatewayHeader(req, cfg, wireModel)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := (&http.Client{Timeout: 10 * time.Minute}).Do(req)
 	if err != nil {
@@ -1152,7 +1203,7 @@ func proxyChatCompletions(w http.ResponseWriter, r *http.Request, cfg Config) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
-func proxyResponses(w http.ResponseWriter, r *http.Request, cfg Config) {
+func proxyResponses(w http.ResponseWriter, r *http.Request, cfg ProviderConfig) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
@@ -1188,12 +1239,14 @@ func proxyResponses(w http.ResponseWriter, r *http.Request, cfg Config) {
 		return
 	}
 	body, _ := json.Marshal(or)
+	body, wireModel := cloudflarePrepareBody(body, cfg)
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, openAIURL(cfg), bytes.NewReader(body))
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	applyUpstreamAuth(req, cfg)
+	applyCloudflareGatewayHeader(req, cfg, wireModel)
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := (&http.Client{Timeout: 10 * time.Minute}).Do(req)
 	if err != nil {
@@ -1223,13 +1276,19 @@ func copyHeaders(dst, src http.Header) {
 
 // applyUpstreamAuth picks the upstream auth header from cfg.UpstreamAuth:
 // "bearer" (default) → Authorization: Bearer <key>; "x-api-key" → X-API-Key;
-// "header" → arbitrary <cfg.UpstreamAuthHdr>. Then merges cfg.UpstreamExtraHdr.
-// falls back to cfg.APIKey (the local proxy key) for ocgo compat when no
-// upstream key is configured.
-func applyUpstreamAuth(req *http.Request, cfg Config) {
+// "header" → arbitrary <cfg.UpstreamAuthHdr>; "both" → sends Bearer and
+// x-api-key. Then merges cfg.UpstreamExtraHdr.
+// ponytail: no fallback to a local key — the upstream key lives in
+// ProviderConfig.UpstreamAPIKey. opencode-go's setup writes it there directly.
+// if the upstream key is empty, no auth header is sent (better than a
+// half-baked `Authorization: Bearer ` going upstream).
+func applyUpstreamAuth(req *http.Request, cfg ProviderConfig) {
 	key := cfg.UpstreamAPIKey
 	if key == "" {
-		key = cfg.APIKey
+		for k, v := range cfg.UpstreamExtraHdr {
+			req.Header.Set(k, v)
+		}
+		return
 	}
 	switch cfg.UpstreamAuth {
 	case "x-api-key":
@@ -1238,6 +1297,12 @@ func applyUpstreamAuth(req *http.Request, cfg Config) {
 		if cfg.UpstreamAuthHdr != "" {
 			req.Header.Set(cfg.UpstreamAuthHdr, key)
 		}
+	case "both":
+		// opencode-go's two endpoints disagree on auth: /v1/chat/completions
+		// accepts Bearer, /v1/messages wants x-api-key. sending both works
+		// for both. setup opencode-go writes this by default.
+		req.Header.Set("Authorization", "Bearer "+key)
+		req.Header.Set("x-api-key", key)
 	default: // "bearer" or empty
 		req.Header.Set("Authorization", "Bearer "+key)
 	}
@@ -1246,7 +1311,58 @@ func applyUpstreamAuth(req *http.Request, cfg Config) {
 	}
 }
 
-func forwardAnthropic(ctx context.Context, cfg Config, ar AnthropicRequest) (*http.Response, error) {
+// cloudflareUpstreamPrefix marks the new cloudflare REST API URL. the
+// ai-gateway `/compat/v1` shape is gone; the gateway id rides on a
+// header now (cf-aig-gateway-id), required for @cf/... workers-ai models.
+const cloudflareUpstreamPrefix = "https://api.cloudflare.com/client/v4/accounts/"
+
+func isCloudflareUpstream(cfg ProviderConfig) bool {
+	return strings.HasPrefix(cfg.UpstreamBaseURL, cloudflareUpstreamPrefix)
+}
+
+// cloudflarePrepareBody strips the "workers-ai/" prefix from the JSON
+// `model` field for the cloudflare REST API. returns the new body and
+// the post-strip model id. the model id is what callers pass to
+// applyCloudflareGatewayHeader to decide whether to inject the header.
+func cloudflarePrepareBody(body []byte, cfg ProviderConfig) ([]byte, string) {
+	if !isCloudflareUpstream(cfg) {
+		return body, ""
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return body, ""
+	}
+	raw, ok := fields["model"]
+	if !ok {
+		return body, ""
+	}
+	var model string
+	if err := json.Unmarshal(raw, &model); err != nil {
+		return body, ""
+	}
+	wire := strings.TrimPrefix(model, "workers-ai/")
+	if wire == model {
+		return body, model
+	}
+	encoded, _ := json.Marshal(wire)
+	fields["model"] = encoded
+	out, err := json.Marshal(fields)
+	if err != nil {
+		return body, wire
+	}
+	return out, wire
+}
+
+// applyCloudflareGatewayHeader sets cf-aig-gateway-id for workers-ai
+// (@cf/...) models on the cloudflare REST API. third-party models go
+// through the default gateway and don't need the header.
+func applyCloudflareGatewayHeader(req *http.Request, cfg ProviderConfig, wireModel string) {
+	if cfg.Gateway != "" && strings.HasPrefix(wireModel, "@cf/") {
+		req.Header.Set("cf-aig-gateway-id", cfg.Gateway)
+	}
+}
+
+func forwardAnthropic(ctx context.Context, cfg ProviderConfig, ar AnthropicRequest) (*http.Response, error) {
 	normalizeAnthropicRequestForUpstream(&ar)
 	body, err := json.Marshal(ar)
 	if err != nil {
@@ -3140,11 +3256,11 @@ func countTokens(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewEncoder(w).Encode(map[string]int{"input_tokens": 0})
 }
 
-func ensureServer(base string) error {
+func ensureServer(base, providerName string) error {
 	if healthy(base) {
 		return nil
 	}
-	if err := startBackground(); err != nil {
+	if err := startBackground(providerName); err != nil {
 		return err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -3158,11 +3274,11 @@ func ensureServer(base string) error {
 	return errors.New("proxy did not start")
 }
 
-func startLaunchServer(base string) (*exec.Cmd, error) {
+func startLaunchServer(base, providerName string) (*exec.Cmd, error) {
 	if healthy(base) {
 		return nil, nil
 	}
-	cmd, err := startServerProcess(false)
+	cmd, err := startServerProcess(false, providerName)
 	if err != nil {
 		return nil, err
 	}
@@ -3197,12 +3313,12 @@ func healthy(base string) bool {
 	return resp.StatusCode == 200
 }
 
-func startBackground() error {
-	_, err := startServerProcess(true)
+func startBackground(providerName string) error {
+	_, err := startServerProcess(true, providerName)
 	return err
 }
 
-func startServerProcess(detached bool) (*exec.Cmd, error) {
+func startServerProcess(detached bool, providerName string) (*exec.Cmd, error) {
 	bin, err := os.Executable()
 	if err != nil {
 		return nil, err
@@ -3212,6 +3328,13 @@ func startServerProcess(detached bool) (*exec.Cmd, error) {
 	}
 	args := []string{"serve"}
 	cmd := exec.Command(bin, args...)
+	if providerName != "" {
+		// pass the resolved name to the subprocess so its resolveProvider
+		// sees the same value. env-wins over single-configured inside the
+		// subprocess, so this is the one place the user's --provider flag
+		// has to cross the process boundary.
+		cmd.Env = append(os.Environ(), "OCGO_PROVIDER="+providerName)
+	}
 	logf, err := os.OpenFile(filepath.Join(configDir(), "ocgo.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return nil, err
@@ -3463,30 +3586,15 @@ func versionParts(v string) [3]int {
 	return out
 }
 
-func saveConfig(cfg Config) error {
-	if err := os.MkdirAll(configDir(), 0755); err != nil {
-		return err
-	}
-	b, _ := json.MarshalIndent(cfg, "", "  ")
-	if err := os.WriteFile(configFile(), append(b, '\n'), 0600); err != nil {
-		return err
-	}
-	fmt.Printf("Saved config to %s\n", configFile())
-	return nil
-}
-
+// loadConfig returns the slimmed local-proxy config. upstream fields moved
+// to per-provider files; see loadActiveProvider.
 func loadConfig() (Config, error) {
+	migrateConfigIfNeeded()
+	migrateCloudflareURLIfNeeded()
 	cfg := Config{
-		Host:            defaultHost,
-		Port:            defaultPort,
-		APIKey:          os.Getenv("OCGO_API_KEY"),
-		UpstreamBaseURL: os.Getenv("OCGO_UPSTREAM_BASE_URL"),
-		UpstreamAPIKey:  os.Getenv("OCGO_UPSTREAM_API_KEY"),
-		UpstreamAuth:    os.Getenv("OCGO_UPSTREAM_AUTH"),
-		UpstreamAuthHdr: os.Getenv("OCGO_UPSTREAM_AUTH_HDR"),
-	}
-	if raw := os.Getenv("OCGO_UPSTREAM_EXTRA_HDR"); raw != "" {
-		_ = json.Unmarshal([]byte(raw), &cfg.UpstreamExtraHdr)
+		Host:   defaultHost,
+		Port:   defaultPort,
+		APIKey: os.Getenv("OCGO_API_KEY"),
 	}
 	b, err := os.ReadFile(configFile())
 	if err == nil {
@@ -3499,8 +3607,232 @@ func loadConfig() (Config, error) {
 		cfg.Port = defaultPort
 	}
 	// local proxy api_key is optional — serve only needs it if a client sends
-	// an Authorization header. upstream_* is also deferred to first request.
+	// an Authorization header.
 	return cfg, nil
+}
+
+// providerConfigFile returns the path to the per-provider config file.
+// ponytail: filename pattern fixed; do not derive from a user input.
+func providerConfigFile(name string) string {
+	return filepath.Join(configDir(), name+".json")
+}
+
+func loadProviderConfig(name string) (ProviderConfig, error) {
+	var p ProviderConfig
+	b, err := os.ReadFile(providerConfigFile(name))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return p, nil
+		}
+		return p, err
+	}
+	if err := json.Unmarshal(b, &p); err != nil {
+		return p, fmt.Errorf("parse %s: %w", providerConfigFile(name), err)
+	}
+	return p, nil
+}
+
+func saveProviderConfig(name string, p ProviderConfig) error {
+	if !isKnownProvider(name) {
+		return fmt.Errorf("unknown provider %q", name)
+	}
+	if err := os.MkdirAll(configDir(), 0755); err != nil {
+		return err
+	}
+	b, _ := json.MarshalIndent(p, "", "  ")
+	if err := os.WriteFile(providerConfigFile(name), append(b, '\n'), 0600); err != nil {
+		return err
+	}
+	fmt.Printf("Saved provider %q to %s\n", name, providerConfigFile(name))
+	return nil
+}
+
+// listConfiguredProviders returns provider names that have a config file
+// present. used by resolveProvider for the "single configured wins" rule.
+func listConfiguredProviders() ([]string, error) {
+	var out []string
+	for _, name := range knownProviders {
+		if _, err := os.Stat(providerConfigFile(name)); err == nil {
+			out = append(out, name)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// resolveProvider picks a provider name from the four precedence sources:
+// --provider flag > $OCGO_PROVIDER > single configured provider > error.
+// returns an error when none of the four yield a name.
+func resolveProvider(cmd *cobra.Command) (string, error) {
+	if cmd != nil {
+		if f := cmd.Flags().Lookup("provider"); f != nil {
+			if v := strings.TrimSpace(f.Value.String()); v != "" {
+				if !isKnownProvider(v) {
+					return "", fmt.Errorf("unknown --provider %q (known: %s)", v, strings.Join(knownProviders, ", "))
+				}
+				return v, nil
+			}
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("OCGO_PROVIDER")); v != "" {
+		if !isKnownProvider(v) {
+			return "", fmt.Errorf("unknown $OCGO_PROVIDER %q (known: %s)", v, strings.Join(knownProviders, ", "))
+		}
+		return v, nil
+	}
+	names, err := listConfiguredProviders()
+	if err != nil {
+		return "", err
+	}
+	switch len(names) {
+	case 0:
+		return "", errors.New("no provider configured; run `cfgate-cc setup opencode-go` or `cfgate-cc setup cloudflare`")
+	case 1:
+		return names[0], nil
+	default:
+		return "", fmt.Errorf("multiple providers configured (%s); pass --provider or set $OCGO_PROVIDER", strings.Join(names, ", "))
+	}
+}
+
+// loadActiveProvider returns the provider config for name, with
+// OCGO_UPSTREAM_* env vars applied on top so the fish-alias pattern
+// (env-overrides-file) still works for the active provider.
+func loadActiveProvider(name string) (ProviderConfig, error) {
+	p, err := loadProviderConfig(name)
+	if err != nil {
+		return p, err
+	}
+	if v := os.Getenv("OCGO_UPSTREAM_BASE_URL"); v != "" {
+		p.UpstreamBaseURL = v
+	}
+	if v := os.Getenv("OCGO_UPSTREAM_API_KEY"); v != "" {
+		p.UpstreamAPIKey = v
+	}
+	if v := os.Getenv("OCGO_UPSTREAM_AUTH"); v != "" {
+		p.UpstreamAuth = v
+	}
+	if v := os.Getenv("OCGO_UPSTREAM_AUTH_HDR"); v != "" {
+		p.UpstreamAuthHdr = v
+	}
+	if raw := os.Getenv("OCGO_UPSTREAM_EXTRA_HDR"); raw != "" {
+		var hdrs map[string]string
+		if err := json.Unmarshal([]byte(raw), &hdrs); err == nil {
+			p.UpstreamExtraHdr = hdrs
+		}
+	}
+	return p, nil
+}
+
+// migrateConfigIfNeeded is a one-shot upgrade helper. if config.json still
+// carries upstream_* fields from the pre-split era, move them into the
+// matching per-provider file and strip them from config.json. no-op when
+// config.json is already slim or when the target provider file already
+// exists (caller wins; no clobber).
+func migrateConfigIfNeeded() {
+	b, err := os.ReadFile(configFile())
+	if err != nil {
+		return
+	}
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return
+	}
+	// any upstream_* field counts as "old config". opencode-go users
+	// sometimes had upstream_api_key set with no upstream_base_url.
+	hasUpstream := false
+	for _, k := range []string{"upstream_base_url", "upstream_api_key", "upstream_auth", "upstream_auth_hdr", "upstream_extra_hdr", "endpoint_overrides"} {
+		if _, ok := raw[k]; ok {
+			hasUpstream = true
+			break
+		}
+	}
+	if !hasUpstream {
+		return
+	}
+	var url string
+	if v, ok := raw["upstream_base_url"]; ok {
+		_ = json.Unmarshal(v, &url)
+	}
+	name := providerForUpstreamURL(url)
+	if _, err := os.Stat(providerConfigFile(name)); err == nil {
+		// target file exists, leave config.json alone. the user has two
+		// configs to reconcile; we'd rather not silently overwrite.
+		return
+	}
+	p := ProviderConfig{}
+	if v, ok := raw["upstream_api_key"]; ok {
+		_ = json.Unmarshal(v, &p.UpstreamAPIKey)
+	}
+	if v, ok := raw["upstream_auth"]; ok {
+		_ = json.Unmarshal(v, &p.UpstreamAuth)
+	}
+	if v, ok := raw["upstream_auth_hdr"]; ok {
+		_ = json.Unmarshal(v, &p.UpstreamAuthHdr)
+	}
+	if v, ok := raw["upstream_extra_hdr"]; ok {
+		_ = json.Unmarshal(v, &p.UpstreamExtraHdr)
+	}
+	if v, ok := raw["endpoint_overrides"]; ok {
+		_ = json.Unmarshal(v, &p.EndpointOverrides)
+	}
+	p.UpstreamBaseURL = url
+	if err := os.MkdirAll(configDir(), 0755); err != nil {
+		return
+	}
+	if err := saveProviderConfig(name, p); err != nil {
+		return
+	}
+	delete(raw, "upstream_base_url")
+	delete(raw, "upstream_api_key")
+	delete(raw, "upstream_auth")
+	delete(raw, "upstream_auth_hdr")
+	delete(raw, "upstream_extra_hdr")
+	delete(raw, "endpoint_overrides")
+	out, err := json.MarshalIndent(raw, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(configFile(), append(out, '\n'), 0600)
+}
+
+// providerForUpstreamURL picks the provider name from a URL pattern.
+// cloudflare AI gateway urls are recognised by host prefix; anything else
+// (including empty) maps to opencode-go.
+func providerForUpstreamURL(url string) string {
+	if strings.HasPrefix(url, "https://api.cloudflare.com/client/v4/accounts/") {
+		return "cloudflare"
+	}
+	if strings.HasPrefix(url, "https://gateway.ai.cloudflare.com/v1/") {
+		return "cloudflare"
+	}
+	return "opencode-go"
+}
+
+// migrateCloudflareURLIfNeeded rewrites a cloudflare.json that still
+// points at the deprecated /compat/v1 URL into the new REST API URL,
+// pulling the gateway id out of the path and into ProviderConfig.Gateway
+// (the new shape uses a cf-aig-gateway-id header instead).
+// idempotent: a no-op once the URL is already on the REST API.
+func migrateCloudflareURLIfNeeded() {
+	const oldPrefix = "https://gateway.ai.cloudflare.com/v1/"
+	path := providerConfigFile("cloudflare")
+	p, err := loadProviderConfig("cloudflare")
+	if err != nil || !strings.HasPrefix(p.UpstreamBaseURL, oldPrefix) {
+		return
+	}
+	rest := strings.TrimPrefix(p.UpstreamBaseURL, oldPrefix)
+	parts := strings.SplitN(rest, "/", 3)
+	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+		return
+	}
+	p.UpstreamBaseURL = buildCloudflareURL(parts[0])
+	p.Gateway = parts[1]
+	b, err := json.MarshalIndent(p, "", "  ")
+	if err != nil {
+		return
+	}
+	_ = os.WriteFile(path, append(b, '\n'), 0600)
 }
 
 func readPID() (int, error) {
