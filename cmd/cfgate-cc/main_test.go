@@ -12,6 +12,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/spf13/cobra"
 )
 
 func TestMain(m *testing.M) {
@@ -328,7 +330,7 @@ func TestCodexModelCatalogAllowsImagesForKnownVisionModels(t *testing.T) {
 
 func TestAnthropicEndpointModels(t *testing.T) {
 	// empty cfg: no overrides, falls back to modelMetadata heuristic
-	cfg := Config{}
+	cfg := ProviderConfig{}
 	for _, model := range []string{"qwen3.7-max", "minimax-m3", "minimax-m2.7", "opencode-go/qwen3.7-max", "opencode-go/minimax-m3"} {
 		if !modelUsesAnthropicEndpoint(model, cfg) {
 			t.Fatalf("%s should use Anthropic-compatible upstream", model)
@@ -565,7 +567,7 @@ func TestForwardAnthropicSendsNormalizedBody(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := Config{UpstreamBaseURL: srv.URL, UpstreamAuth: "x-api-key", UpstreamAPIKey: "test-key"}
+	cfg := ProviderConfig{UpstreamBaseURL: srv.URL, UpstreamAuth: "x-api-key", UpstreamAPIKey: "test-key"}
 
 	resp, err := forwardAnthropic(context.Background(), cfg, AnthropicRequest{
 		Model:     "opencode-go/qwen3.7-max",
@@ -855,8 +857,8 @@ func contentString(v any) string {
 }
 
 func TestBuildCloudflareURL(t *testing.T) {
-	got := buildCloudflareURL("a9ffc25861cdda67e0b6c8e7475bc5e3", "webmobile-ai-gateway")
-	want := "https://gateway.ai.cloudflare.com/v1/a9ffc25861cdda67e0b6c8e7475bc5e3/webmobile-ai-gateway/compat/v1"
+	got := buildCloudflareURL("a9ffc25861cdda67e0b6c8e7475bc5e3")
+	want := "https://api.cloudflare.com/client/v4/accounts/a9ffc25861cdda67e0b6c8e7475bc5e3/ai/v1"
 	if got != want {
 		t.Fatalf("buildCloudflareURL = %q, want %q", got, want)
 	}
@@ -876,22 +878,25 @@ func TestSetupCloudflareWritesAssembledConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	b, err := os.ReadFile(filepath.Join(dir, "config.json"))
+	b, err := os.ReadFile(filepath.Join(dir, "cloudflare.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	var cfg Config
-	if err := json.Unmarshal(b, &cfg); err != nil {
+	var p ProviderConfig
+	if err := json.Unmarshal(b, &p); err != nil {
 		t.Fatal(err)
 	}
-	if cfg.UpstreamBaseURL != "https://gateway.ai.cloudflare.com/v1/acct-123/gw-456/compat/v1" {
-		t.Fatalf("upstream_base_url = %q", cfg.UpstreamBaseURL)
+	if p.UpstreamBaseURL != "https://api.cloudflare.com/client/v4/accounts/acct-123/ai/v1" {
+		t.Fatalf("upstream_base_url = %q", p.UpstreamBaseURL)
 	}
-	if cfg.UpstreamAPIKey != "tok-xyz" {
-		t.Fatalf("upstream_api_key = %q", cfg.UpstreamAPIKey)
+	if p.UpstreamAPIKey != "tok-xyz" {
+		t.Fatalf("upstream_api_key = %q", p.UpstreamAPIKey)
 	}
-	if cfg.UpstreamAuth != "bearer" {
-		t.Fatalf("upstream_auth = %q, want bearer", cfg.UpstreamAuth)
+	if p.UpstreamAuth != "bearer" {
+		t.Fatalf("upstream_auth = %q, want bearer", p.UpstreamAuth)
+	}
+	if p.Gateway != "gw-456" {
+		t.Fatalf("gateway = %q, want gw-456", p.Gateway)
 	}
 }
 
@@ -944,7 +949,7 @@ func TestSetupCloudflareRefusesToOverwriteExisting(t *testing.T) {
 		t.Fatal(err)
 	}
 	existing := `{"upstream_base_url":"https://example.com/v1/","upstream_api_key":"k","upstream_auth":"bearer"}`
-	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(existing), 0600); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "cloudflare.json"), []byte(existing), 0600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -959,8 +964,8 @@ func TestSetupCloudflareRefusesToOverwriteExisting(t *testing.T) {
 	if err := cmd.Execute(); err != nil {
 		t.Fatal(err)
 	}
-	b, _ := os.ReadFile(filepath.Join(dir, "config.json"))
-	if !strings.Contains(string(b), "https://gateway.ai.cloudflare.com/v1/a/g/compat/v1") {
+	b, _ := os.ReadFile(filepath.Join(dir, "cloudflare.json"))
+	if !strings.Contains(string(b), "https://api.cloudflare.com/client/v4/accounts/a/ai/v1") {
 		t.Fatalf("forced overwrite did not update URL:\n%s", string(b))
 	}
 }
@@ -1249,5 +1254,466 @@ func TestSanitizeRawChatToolMessagesDropsLateToolMessage(t *testing.T) {
 	}
 	if roles[2].Role != "assistant" || roles[2].Content != "done" {
 		t.Fatalf("expected assistant after placeholder, got %+v", roles[2])
+	}
+}
+
+func TestResolveProviderFlagWinsOverEnv(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
+	t.Setenv("OCGO_PROVIDER", "opencode-go")
+	if err := os.WriteFile(filepath.Join(dir, "opencode-go.json"), []byte(`{"upstream_api_key":"k"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cloudflare.json"), []byte(`{"upstream_api_key":"k"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := &cobra.Command{}
+	cmd.Flags().String("provider", "", "")
+	if err := cmd.Flags().Set("provider", "cloudflare"); err != nil {
+		t.Fatal(err)
+	}
+	got, err := resolveProvider(cmd)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "cloudflare" {
+		t.Fatalf("flag should win: got %q", got)
+	}
+}
+
+func TestResolveProviderEnvWinsOverSingle(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
+	t.Setenv("OCGO_PROVIDER", "opencode-go")
+	if err := os.WriteFile(filepath.Join(dir, "cloudflare.json"), []byte(`{"upstream_api_key":"k"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := resolveProvider(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "opencode-go" {
+		t.Fatalf("env should win over single-configured: got %q", got)
+	}
+}
+
+func TestResolveProviderSingleConfiguredWins(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
+	t.Setenv("OCGO_PROVIDER", "")
+	if err := os.WriteFile(filepath.Join(dir, "opencode-go.json"), []byte(`{"upstream_api_key":"k"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := resolveProvider(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "opencode-go" {
+		t.Fatalf("single configured should win: got %q", got)
+	}
+}
+
+func TestResolveProviderAmbiguous(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
+	t.Setenv("OCGO_PROVIDER", "")
+	if err := os.WriteFile(filepath.Join(dir, "opencode-go.json"), []byte(`{}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "cloudflare.json"), []byte(`{}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := resolveProvider(nil)
+	if err == nil {
+		t.Fatal("expected ambiguity error")
+	}
+	if !strings.Contains(err.Error(), "multiple providers") {
+		t.Fatalf("error should mention multiple providers: %v", err)
+	}
+}
+
+func TestResolveProviderUnknownValueRejected(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
+	t.Setenv("OCGO_PROVIDER", "bogus")
+
+	_, err := resolveProvider(nil)
+	if err == nil {
+		t.Fatal("expected unknown-provider error")
+	}
+	if !strings.Contains(err.Error(), "bogus") {
+		t.Fatalf("error should name the bad value: %v", err)
+	}
+}
+
+func TestResolveProviderNoConfig(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
+	t.Setenv("OCGO_PROVIDER", "")
+
+	_, err := resolveProvider(nil)
+	if err == nil {
+		t.Fatal("expected no-config error")
+	}
+	if !strings.Contains(err.Error(), "no provider configured") {
+		t.Fatalf("error should say no provider: %v", err)
+	}
+}
+
+func TestMigrateConfigMovesUpstreamToProviderFile(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	old := `{"host":"127.0.0.1","port":3456,"api_key":"local","upstream_base_url":"https://gateway.ai.cloudflare.com/v1/acct-123/gw-456/compat/v1","upstream_api_key":"tok-xyz","upstream_auth":"bearer","endpoint_overrides":[]}`
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.APIKey != "local" {
+		t.Fatalf("local api_key lost: %q", cfg.APIKey)
+	}
+
+	p, err := loadProviderConfig("cloudflare")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.UpstreamBaseURL != "https://api.cloudflare.com/client/v4/accounts/acct-123/ai/v1" {
+		t.Fatalf("cloudflare upstream_base_url = %q", p.UpstreamBaseURL)
+	}
+	if p.Gateway != "gw-456" {
+		t.Fatalf("cloudflare gateway = %q, want gw-456", p.Gateway)
+	}
+	if p.UpstreamAPIKey != "tok-xyz" {
+		t.Fatalf("cloudflare upstream_api_key = %q", p.UpstreamAPIKey)
+	}
+
+	// config.json should no longer carry upstream fields
+	b, _ := os.ReadFile(filepath.Join(dir, "config.json"))
+	if strings.Contains(string(b), "upstream_base_url") || strings.Contains(string(b), "tok-xyz") {
+		t.Fatalf("config.json still has upstream fields after migration:\n%s", string(b))
+	}
+}
+
+func TestMigrateConfigOpencodeGoFallback(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	old := `{"host":"127.0.0.1","port":3456,"upstream_api_key":"ocgo-key","upstream_auth":"bearer"}`
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := loadConfig(); err != nil {
+		t.Fatal(err)
+	}
+	p, err := loadProviderConfig("opencode-go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.UpstreamAPIKey != "ocgo-key" {
+		t.Fatalf("opencode-go upstream_api_key = %q", p.UpstreamAPIKey)
+	}
+}
+
+func TestMigrateCloudflareURLIfNeeded(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	old := `{"upstream_base_url":"https://gateway.ai.cloudflare.com/v1/acct-123/gw-456/compat/v1","upstream_api_key":"tok-xyz","upstream_auth":"bearer"}`
+	if err := os.WriteFile(filepath.Join(dir, "cloudflare.json"), []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	migrateCloudflareURLIfNeeded()
+
+	p, err := loadProviderConfig("cloudflare")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.UpstreamBaseURL != "https://api.cloudflare.com/client/v4/accounts/acct-123/ai/v1" {
+		t.Fatalf("upstream_base_url = %q", p.UpstreamBaseURL)
+	}
+	if p.Gateway != "gw-456" {
+		t.Fatalf("gateway = %q, want gw-456", p.Gateway)
+	}
+	if p.UpstreamAPIKey != "tok-xyz" {
+		t.Fatalf("upstream_api_key lost: %q", p.UpstreamAPIKey)
+	}
+
+	// idempotent: a second pass leaves the file alone.
+	migrateCloudflareURLIfNeeded()
+	p, _ = loadProviderConfig("cloudflare")
+	if p.UpstreamBaseURL != "https://api.cloudflare.com/client/v4/accounts/acct-123/ai/v1" {
+		t.Fatalf("second pass rewrote URL: %q", p.UpstreamBaseURL)
+	}
+}
+
+func TestStripWorkersAIPrefix(t *testing.T) {
+	cfg := ProviderConfig{UpstreamBaseURL: "https://api.cloudflare.com/client/v4/accounts/acct-123/ai/v1"}
+
+	t.Run("strips workers-ai prefix", func(t *testing.T) {
+		body := []byte(`{"model":"workers-ai/@cf/zai-org/glm-5.2","messages":[]}`)
+		out, wire := cloudflarePrepareBody(body, cfg)
+		if wire != "@cf/zai-org/glm-5.2" {
+			t.Fatalf("wire model = %q", wire)
+		}
+		if !strings.Contains(string(out), `"model":"@cf/zai-org/glm-5.2"`) {
+			t.Fatalf("body model not stripped: %s", out)
+		}
+		if strings.Contains(string(out), "workers-ai/") {
+			t.Fatalf("workers-ai/ still present: %s", out)
+		}
+	})
+
+	t.Run("leaves bare @cf/ alone", func(t *testing.T) {
+		body := []byte(`{"model":"@cf/zai-org/glm-5.2","messages":[]}`)
+		out, wire := cloudflarePrepareBody(body, cfg)
+		if wire != "@cf/zai-org/glm-5.2" {
+			t.Fatalf("wire model = %q", wire)
+		}
+		if string(out) != string(body) {
+			t.Fatalf("body should be unchanged: %s", out)
+		}
+	})
+
+	t.Run("leaves non-cf model alone", func(t *testing.T) {
+		body := []byte(`{"model":"anthropic/claude-sonnet-4","messages":[]}`)
+		out, wire := cloudflarePrepareBody(body, cfg)
+		if wire != "anthropic/claude-sonnet-4" {
+			t.Fatalf("wire model = %q", wire)
+		}
+		if string(out) != string(body) {
+			t.Fatalf("body should be unchanged: %s", out)
+		}
+	})
+
+	t.Run("no-op for non-cloudflare upstream", func(t *testing.T) {
+		other := ProviderConfig{UpstreamBaseURL: "https://example.com/v1"}
+		body := []byte(`{"model":"workers-ai/@cf/foo","messages":[]}`)
+		out, wire := cloudflarePrepareBody(body, other)
+		if wire != "" {
+			t.Fatalf("wire model = %q, want empty for non-cloudflare", wire)
+		}
+		if string(out) != string(body) {
+			t.Fatalf("body should be unchanged: %s", out)
+		}
+	})
+}
+
+func TestInjectsGatewayHeaderForCFModels(t *testing.T) {
+	cfg := ProviderConfig{
+		UpstreamBaseURL: "https://api.cloudflare.com/client/v4/accounts/acct-123/ai/v1",
+		Gateway:         "gw-456",
+	}
+
+	t.Run("cf model sets header", func(t *testing.T) {
+		req, _ := http.NewRequest(http.MethodPost, "https://upstream", nil)
+		applyCloudflareGatewayHeader(req, cfg, "@cf/zai-org/glm-5.2")
+		if got := req.Header.Get("cf-aig-gateway-id"); got != "gw-456" {
+			t.Fatalf("cf-aig-gateway-id = %q, want gw-456", got)
+		}
+	})
+
+	t.Run("non-cf model leaves header off", func(t *testing.T) {
+		req, _ := http.NewRequest(http.MethodPost, "https://upstream", nil)
+		applyCloudflareGatewayHeader(req, cfg, "anthropic/claude-sonnet-4")
+		if got := req.Header.Get("cf-aig-gateway-id"); got != "" {
+			t.Fatalf("cf-aig-gateway-id = %q, want empty", got)
+		}
+	})
+
+	t.Run("empty gateway leaves header off", func(t *testing.T) {
+		noGW := cfg
+		noGW.Gateway = ""
+		req, _ := http.NewRequest(http.MethodPost, "https://upstream", nil)
+		applyCloudflareGatewayHeader(req, noGW, "@cf/foo")
+		if got := req.Header.Get("cf-aig-gateway-id"); got != "" {
+			t.Fatalf("cf-aig-gateway-id = %q, want empty", got)
+		}
+	})
+}
+
+func TestMigrateConfigLeavesExistingProviderFileAlone(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// both files exist; migration should NOT clobber the existing provider file
+	if err := os.WriteFile(filepath.Join(dir, "opencode-go.json"), []byte(`{"upstream_api_key":"existing"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	old := `{"host":"127.0.0.1","upstream_api_key":"newer","upstream_auth":"bearer"}`
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := loadConfig(); err != nil {
+		t.Fatal(err)
+	}
+	p, err := loadProviderConfig("opencode-go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.UpstreamAPIKey != "existing" {
+		t.Fatalf("existing provider file was clobbered: got %q", p.UpstreamAPIKey)
+	}
+}
+
+func TestMigrateConfigIsIdempotent(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	old := `{"host":"127.0.0.1","upstream_api_key":"k","upstream_auth":"bearer"}`
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 0; i < 3; i++ {
+		if _, err := loadConfig(); err != nil {
+			t.Fatalf("call %d: %v", i, err)
+		}
+	}
+	p, err := loadProviderConfig("opencode-go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.UpstreamAPIKey != "k" {
+		t.Fatalf("upstream_api_key after repeated calls = %q", p.UpstreamAPIKey)
+	}
+}
+
+func TestSetupOpencodeGoWritesProviderFile(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
+	t.Setenv("OCGO_API_KEY", "")
+
+	cmd := setupOpencodeGoCmd()
+	cmd.SetArgs([]string{"--api-key", "test-ocgo-key"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := os.ReadFile(filepath.Join(dir, "opencode-go.json"))
+	if err != nil {
+		t.Fatalf("opencode-go.json not written: %v", err)
+	}
+	var p ProviderConfig
+	if err := json.Unmarshal(b, &p); err != nil {
+		t.Fatal(err)
+	}
+	if p.UpstreamAPIKey != "test-ocgo-key" {
+		t.Fatalf("upstream_api_key = %q, want test-ocgo-key", p.UpstreamAPIKey)
+	}
+	if p.UpstreamAuth != "both" {
+		t.Fatalf("upstream_auth = %q, want both (opencode-go sends Bearer + x-api-key)", p.UpstreamAuth)
+	}
+
+	// api_key must NOT land in config.json — that's the local proxy key,
+	// not the upstream key. this is the whole point of the split.
+	if _, err := os.Stat(filepath.Join(dir, "config.json")); err == nil {
+		b, _ := os.ReadFile(filepath.Join(dir, "config.json"))
+		if strings.Contains(string(b), "test-ocgo-key") {
+			t.Fatalf("upstream key leaked into config.json:\n%s", string(b))
+		}
+	}
+}
+
+func TestApplyUpstreamAuthNoLongerFallsBackToLocalKey(t *testing.T) {
+	// empty UpstreamAPIKey must NOT send any Authorization header. pre-refactor
+	// this fell through to cfg.APIKey (ocgo compat hack); post-refactor the
+	// local key is structurally unreachable from applyUpstreamAuth because
+	// the function only takes ProviderConfig.
+	p := ProviderConfig{UpstreamAuth: "bearer"}
+
+	req, _ := http.NewRequest(http.MethodPost, "http://example", nil)
+	applyUpstreamAuth(req, p)
+
+	if got := req.Header.Get("Authorization"); got != "" {
+		t.Fatalf("Authorization should be empty when upstream key is empty, got %q", got)
+	}
+
+	// sanity: with the upstream key set, the bearer header is correct
+	p.UpstreamAPIKey = "upstream-key"
+	req2, _ := http.NewRequest(http.MethodPost, "http://example", nil)
+	applyUpstreamAuth(req2, p)
+	if got := req2.Header.Get("Authorization"); got != "Bearer upstream-key" {
+		t.Fatalf("Authorization = %q, want Bearer upstream-key", got)
+	}
+}
+
+func TestApplyUpstreamAuthBothMode(t *testing.T) {
+	// opencode-go's /v1/chat/completions wants Bearer, /v1/messages wants
+	// x-api-key. the "both" mode sends both so either endpoint accepts it.
+	p := ProviderConfig{UpstreamAuth: "both", UpstreamAPIKey: "k"}
+	req, _ := http.NewRequest(http.MethodPost, "http://example", nil)
+	applyUpstreamAuth(req, p)
+	if got := req.Header.Get("Authorization"); got != "Bearer k" {
+		t.Fatalf("Authorization = %q, want Bearer k", got)
+	}
+	if got := req.Header.Get("x-api-key"); got != "k" {
+		t.Fatalf("x-api-key = %q, want k", got)
+	}
+}
+
+func TestLoadActiveProviderAppliesEnvOverrides(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "opencode-go.json"), []byte(`{"upstream_base_url":"https://file.example/v1","upstream_api_key":"file-key","upstream_auth":"bearer"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OCGO_UPSTREAM_BASE_URL", "https://env.example/v1")
+	t.Setenv("OCGO_UPSTREAM_API_KEY", "env-key")
+
+	p, err := loadActiveProvider("opencode-go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.UpstreamBaseURL != "https://env.example/v1" {
+		t.Fatalf("upstream_base_url = %q, want env override", p.UpstreamBaseURL)
+	}
+	if p.UpstreamAPIKey != "env-key" {
+		t.Fatalf("upstream_api_key = %q, want env override", p.UpstreamAPIKey)
+	}
+}
+
+func TestLoadActiveProviderOpencodeGoDefaultURL(t *testing.T) {
+	// an opencode-go provider file with no upstream_base_url should still
+	// resolve to a usable URL via the opencode-go default fallback.
+	dir := t.TempDir()
+	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "opencode-go.json"), []byte(`{"upstream_api_key":"k"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("OCGO_UPSTREAM_BASE_URL", "")
+
+	p, err := loadActiveProvider("opencode-go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := openAIURL(p); got != "https://opencode.ai/zen/go/v1/chat/completions" {
+		t.Fatalf("openAIURL = %q, want opencode-go default", got)
 	}
 }
