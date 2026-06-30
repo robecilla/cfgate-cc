@@ -1,4 +1,4 @@
-module ocgo
+module cfgate-cc
 
 go 1.22
 
