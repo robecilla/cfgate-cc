@@ -54,7 +54,7 @@ func TestWriteCodexProfile(t *testing.T) {
 		`model_reasoning_effort = "minimal"`,
 		`model_reasoning_summary = "none"`,
 		"[model_providers.cfgate-cc-launch]",
-		`name = "OpenCode Go"`,
+		`name = "Upstream"`,
 		`base_url = "http://127.0.0.1:3456/v1/"`,
 		`wire_api = "responses"`,
 	} {

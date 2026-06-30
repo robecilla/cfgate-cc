@@ -280,7 +280,7 @@ var reasoningContentCache = struct {
 }{byCallID: map[string]string{}}
 
 func main() {
-	root := &cobra.Command{Use: appName, Short: "Run Claude Code with OpenCode Go", Version: version}
+	root := &cobra.Command{Use: appName, Short: "Proxy for Claude Code and Codex CLI with a pluggable openai/anthropic-compatible upstream (cloudflare ai gateway, opencode-go/zen, etc.)", Version: version}
 	root.AddCommand(setupCmd(), listCmd(), mappingCmd(), launchCmd(), serveCmd(), stopCmd(), statusCmd())
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
@@ -291,13 +291,13 @@ func setupCmd() *cobra.Command {
 	var key string
 	cmd := &cobra.Command{
 		Use:   "setup",
-		Short: "Save your OpenCode Go API key",
+		Short: "Save your upstream provider API key",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if strings.TrimSpace(key) == "" {
 				key = os.Getenv("OCGO_API_KEY")
 			}
 			if strings.TrimSpace(key) == "" {
-				fmt.Print("OpenCode Go API key: ")
+				fmt.Print("Upstream provider API key: ")
 				line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 				if err != nil && line == "" {
 					return err
@@ -311,14 +311,14 @@ func setupCmd() *cobra.Command {
 			return saveConfig(cfg)
 		},
 	}
-	cmd.Flags().StringVar(&key, "api-key", "", "OpenCode Go API key")
+	cmd.Flags().StringVar(&key, "api-key", "", "Upstream provider API key")
 	return cmd
 }
 
 func listCmd() *cobra.Command {
-	return &cobra.Command{Use: "list", Aliases: []string{"ls", "models"}, Short: "List OpenCode Go models", Run: func(cmd *cobra.Command, args []string) {
+	return &cobra.Command{Use: "list", Aliases: []string{"ls", "models"}, Short: "List models exposed by the configured upstream", Run: func(cmd *cobra.Command, args []string) {
 		refreshAllModels()
-		fmt.Println("OpenCode Go models:")
+		fmt.Println("Upstream models:")
 		for _, m := range knownModelIDs() {
 			fmt.Printf("  %s\n", m)
 		}
@@ -367,7 +367,7 @@ func modelMetadata(model string) openCodeModelMetadata {
 	id := modelID(model)
 	meta := openCodeModelMetadata{
 		DisplayName:             id,
-		Description:             "OpenCode Go model",
+		Description:             "Upstream model",
 		InputModalities:         []string{"text"},
 		CodexInputModalities:    []string{"text"},
 		ContextWindow:           128000,
@@ -380,7 +380,7 @@ func modelMetadata(model string) openCodeModelMetadata {
 		if rm, ok := remote[id]; ok {
 			if strings.TrimSpace(rm.Name) != "" {
 				meta.DisplayName = rm.Name
-				meta.Description = rm.Name + " via OpenCode Go"
+				meta.Description = rm.Name + " via upstream"
 			}
 			if len(rm.Modalities.Input) > 0 {
 				meta.InputModalities = append([]string(nil), rm.Modalities.Input...)
@@ -396,7 +396,7 @@ func modelMetadata(model string) openCodeModelMetadata {
 	case "minimax-m3":
 		if meta.DisplayName == id {
 			meta.DisplayName = "MiniMax M3"
-			meta.Description = "MiniMax M3 via OpenCode Go"
+			meta.Description = "MiniMax M3 via upstream"
 		}
 		if meta.ContextWindow == 128000 {
 			meta.ContextWindow = 512000
@@ -520,7 +520,7 @@ func defaultModelMappings() map[string]map[string]string {
 }
 
 func mappingCmd() *cobra.Command {
-	cmd := &cobra.Command{Use: "mapping", Short: "Manage tool model mappings to OpenCode Go models"}
+	cmd := &cobra.Command{Use: "mapping", Short: "Manage tool model mappings to upstream models"}
 	cmd.AddCommand(toolMappingCmd("claude"), toolMappingCmd("codex"))
 	return cmd
 }
@@ -535,7 +535,7 @@ func toolMappingCmd(tool string) *cobra.Command {
 		printToolMapping(tool, m[tool])
 		return nil
 	}})
-	cmd.AddCommand(&cobra.Command{Use: "get <source-model>", Short: "Get one mapped OpenCode Go model", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+	cmd.AddCommand(&cobra.Command{Use: "get <source-model>", Short: "Get one mapped upstream model", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
 		m, err := loadModelMappings()
 		if err != nil {
 			return err
@@ -555,7 +555,7 @@ func toolMappingCmd(tool string) *cobra.Command {
 			return errors.New("source and target models cannot be empty")
 		}
 		if !knownOpenCodeModel(target) {
-			return fmt.Errorf("unknown OpenCode Go model %q; run `cfgate-cc models`", target)
+			return fmt.Errorf("unknown upstream model %q; run `cfgate-cc models`", target)
 		}
 		m, err := loadModelMappings()
 		if err != nil {
@@ -615,7 +615,7 @@ func toolMappingCmd(tool string) *cobra.Command {
 }
 
 func printToolMapping(tool string, mapping map[string]string) {
-	fmt.Printf("%s -> OpenCode Go mapping (%s):\n", displayToolName(tool), modelMappingFile())
+	fmt.Printf("%s -> upstream mapping (%s):\n", displayToolName(tool), modelMappingFile())
 	if len(mapping) == 0 {
 		fmt.Println("  (empty)")
 		return
@@ -639,10 +639,10 @@ func displayToolName(tool string) string {
 
 func printLaunchMapping(tool string, mapping map[string]string) {
 	if len(mapping) == 0 {
-		fmt.Fprintf(os.Stderr, "No OCGO model mappings configured for %s (%s)\n", tool, modelMappingFile())
+		fmt.Fprintf(os.Stderr, "No cfgate-cc model mappings configured for %s (%s)\n", tool, modelMappingFile())
 		return
 	}
-	fmt.Fprintf(os.Stderr, "OCGO model mapping enabled for %s (%s)\n", tool, modelMappingFile())
+	fmt.Fprintf(os.Stderr, "cfgate-cc model mapping enabled for %s (%s)\n", tool, modelMappingFile())
 	keys := make([]string, 0, len(mapping))
 	for k := range mapping {
 		keys = append(keys, k)
@@ -755,7 +755,7 @@ func launchCmd() *cobra.Command {
 	var yes bool
 	var codexConfigOnly bool
 	cmd := &cobra.Command{Use: "launch", Short: "Launch tools through cfgate-cc"}
-	claude := &cobra.Command{Use: "claude [-- claude args...]", Short: "Launch Claude Code through OpenCode Go", Args: cobra.ArbitraryArgs, RunE: func(cmd *cobra.Command, args []string) error {
+	claude := &cobra.Command{Use: "claude [-- claude args...]", Short: "Launch Claude Code through the configured upstream provider", Args: cobra.ArbitraryArgs, RunE: func(cmd *cobra.Command, args []string) error {
 		cfg, err := loadConfig()
 		if err != nil {
 			return err
@@ -788,8 +788,8 @@ func launchCmd() *cobra.Command {
 				"ANTHROPIC_MODEL="+model,
 				"ANTHROPIC_SMALL_FAST_MODEL="+model,
 				"ANTHROPIC_CUSTOM_MODEL_OPTION="+model,
-				"ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="+model+" via OCGO",
-				"ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION=OpenCode Go model routed through OCGO",
+				"ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="+model+" via cfgate-cc",
+				"ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION=Upstream model routed through cfgate-cc",
 			)
 		} else {
 			opus := resolveMappedModel("claude", "claude-opus", mappings)
@@ -798,22 +798,22 @@ func launchCmd() *cobra.Command {
 			if opus != "claude-opus" {
 				c.Env = append(c.Env,
 					"ANTHROPIC_DEFAULT_OPUS_MODEL="+opus,
-					"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME="+opus+" via OCGO",
-					"ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION=OpenCode Go model routed through OCGO",
+					"ANTHROPIC_DEFAULT_OPUS_MODEL_NAME="+opus+" via cfgate-cc",
+					"ANTHROPIC_DEFAULT_OPUS_MODEL_DESCRIPTION=Upstream model routed through cfgate-cc",
 				)
 			}
 			if sonnet != "claude-sonnet" {
 				c.Env = append(c.Env,
 					"ANTHROPIC_DEFAULT_SONNET_MODEL="+sonnet,
-					"ANTHROPIC_DEFAULT_SONNET_MODEL_NAME="+sonnet+" via OCGO",
-					"ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION=OpenCode Go model routed through OCGO",
+					"ANTHROPIC_DEFAULT_SONNET_MODEL_NAME="+sonnet+" via cfgate-cc",
+					"ANTHROPIC_DEFAULT_SONNET_MODEL_DESCRIPTION=Upstream model routed through cfgate-cc",
 				)
 			}
 			if haiku != "claude-haiku" {
 				c.Env = append(c.Env,
 					"ANTHROPIC_DEFAULT_HAIKU_MODEL="+haiku,
-					"ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME="+haiku+" via OCGO",
-					"ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION=OpenCode Go model routed through OCGO",
+					"ANTHROPIC_DEFAULT_HAIKU_MODEL_NAME="+haiku+" via cfgate-cc",
+					"ANTHROPIC_DEFAULT_HAIKU_MODEL_DESCRIPTION=Upstream model routed through cfgate-cc",
 					"ANTHROPIC_SMALL_FAST_MODEL="+haiku,
 				)
 			}
@@ -821,9 +821,9 @@ func launchCmd() *cobra.Command {
 		printLaunchMapping("claude", mappings["claude"])
 		return c.Run()
 	}}
-	claude.Flags().StringVar(&model, "model", "", "OpenCode Go model ID")
+	claude.Flags().StringVar(&model, "model", "", "Upstream model ID")
 	claude.Flags().BoolVar(&yes, "yes", false, "Allow Claude Code to skip permission prompts")
-	codex := &cobra.Command{Use: "codex [-- codex args...]", Short: "Launch Codex CLI through OpenCode Go", Args: cobra.ArbitraryArgs, RunE: func(cmd *cobra.Command, args []string) error {
+	codex := &cobra.Command{Use: "codex [-- codex args...]", Short: "Launch Codex CLI through the configured upstream provider", Args: cobra.ArbitraryArgs, RunE: func(cmd *cobra.Command, args []string) error {
 		cfg, err := loadConfig()
 		if err != nil {
 			return err
@@ -863,7 +863,7 @@ func launchCmd() *cobra.Command {
 		}
 		return c.Run()
 	}}
-	codex.Flags().StringVar(&model, "model", "", "OpenCode Go model ID")
+	codex.Flags().StringVar(&model, "model", "", "Upstream model ID")
 	codex.Flags().BoolVar(&codexConfigOnly, "config", false, "Configure Codex profile without launching")
 	cmd.AddCommand(claude, codex)
 	return cmd
@@ -2639,20 +2639,20 @@ func writeChatCompletionsResponseFromAnthropic(w http.ResponseWriter, body io.Re
 		finishReason = "tool_calls"
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"id": "chatcmpl_ocgo", "object": "chat.completion", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "message": msg, "finish_reason": finishReason}}, "usage": openAIUsage(parsed.Usage)})
+	_ = json.NewEncoder(w).Encode(map[string]any{"id": "chatcmpl_cfgate", "object": "chat.completion", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{{"index": 0, "message": msg, "finish_reason": finishReason}}, "usage": openAIUsage(parsed.Usage)})
 }
 
 func writeResponsesResponseFromAnthropic(w http.ResponseWriter, body io.Reader, model string) {
 	parsed := parseAnthropicResponse(body)
 	var output []any
 	if parsed.Text != "" || len(parsed.ToolCalls) == 0 {
-		output = append(output, map[string]any{"id": "msg_ocgo", "type": "message", "role": "assistant", "content": []map[string]string{{"type": "output_text", "text": parsed.Text}}})
+		output = append(output, map[string]any{"id": "msg_cfgate", "type": "message", "role": "assistant", "content": []map[string]string{{"type": "output_text", "text": parsed.Text}}})
 	}
 	for _, call := range parsed.ToolCalls {
 		output = append(output, map[string]any{"id": call.ID, "type": "function_call", "call_id": call.ID, "name": call.Function.Name, "arguments": call.Function.Arguments})
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"id": "resp_ocgo", "object": "response", "created_at": time.Now().Unix(), "model": model, "status": "completed", "output": output, "usage": responsesUsage(parsed.Usage)})
+	_ = json.NewEncoder(w).Encode(map[string]any{"id": "resp_cfgate", "object": "response", "created_at": time.Now().Unix(), "model": model, "status": "completed", "output": output, "usage": responsesUsage(parsed.Usage)})
 }
 
 func streamChatCompletionsFromAnthropic(w http.ResponseWriter, body io.Reader, model string) {
@@ -2716,14 +2716,14 @@ func writeChatCompletionChunk(w io.Writer, model string, delta map[string]any, f
 	if finishReason != nil {
 		choice["finish_reason"] = *finishReason
 	}
-	b, _ := json.Marshal(map[string]any{"id": "chatcmpl_ocgo", "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{choice}})
+	b, _ := json.Marshal(map[string]any{"id": "chatcmpl_cfgate", "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{choice}})
 	fmt.Fprintf(w, "data: %s\n\n", b)
 }
 
 func streamResponsesFromAnthropic(w http.ResponseWriter, body io.Reader, model string) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	flusher, _ := w.(http.Flusher)
-	id := "resp_ocgo"
+	id := "resp_cfgate"
 	writeResponseEvent(w, "response.created", map[string]any{"type": "response.created", "response": map[string]any{"id": id, "object": "response", "model": model, "status": "in_progress", "output": []any{}}})
 	if flusher != nil {
 		flusher.Flush()
@@ -2755,8 +2755,8 @@ func streamResponsesFromAnthropic(w http.ResponseWriter, body io.Reader, model s
 					messageStarted = true
 					messageOutputIndex = nextOutputIndex
 					nextOutputIndex++
-					writeResponseEvent(w, "response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": messageOutputIndex, "item": map[string]any{"id": "msg_ocgo", "type": "message", "role": "assistant", "content": []any{}}})
-					writeResponseEvent(w, "response.content_part.added", map[string]any{"type": "response.content_part.added", "item_id": "msg_ocgo", "output_index": messageOutputIndex, "content_index": 0, "part": map[string]any{"type": "output_text", "text": ""}})
+					writeResponseEvent(w, "response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": messageOutputIndex, "item": map[string]any{"id": "msg_cfgate", "type": "message", "role": "assistant", "content": []any{}}})
+					writeResponseEvent(w, "response.content_part.added", map[string]any{"type": "response.content_part.added", "item_id": "msg_cfgate", "output_index": messageOutputIndex, "content_index": 0, "part": map[string]any{"type": "output_text", "text": ""}})
 				}
 			case "tool_use":
 				callID, _ := block["id"].(string)
@@ -2781,11 +2781,11 @@ func streamResponsesFromAnthropic(w http.ResponseWriter, body io.Reader, model s
 						messageStarted = true
 						messageOutputIndex = nextOutputIndex
 						nextOutputIndex++
-						writeResponseEvent(w, "response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": messageOutputIndex, "item": map[string]any{"id": "msg_ocgo", "type": "message", "role": "assistant", "content": []any{}}})
-						writeResponseEvent(w, "response.content_part.added", map[string]any{"type": "response.content_part.added", "item_id": "msg_ocgo", "output_index": messageOutputIndex, "content_index": 0, "part": map[string]any{"type": "output_text", "text": ""}})
+						writeResponseEvent(w, "response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": messageOutputIndex, "item": map[string]any{"id": "msg_cfgate", "type": "message", "role": "assistant", "content": []any{}}})
+						writeResponseEvent(w, "response.content_part.added", map[string]any{"type": "response.content_part.added", "item_id": "msg_cfgate", "output_index": messageOutputIndex, "content_index": 0, "part": map[string]any{"type": "output_text", "text": ""}})
 					}
 					text.WriteString(part)
-					writeResponseEvent(w, "response.output_text.delta", map[string]any{"type": "response.output_text.delta", "item_id": "msg_ocgo", "output_index": messageOutputIndex, "content_index": 0, "delta": part})
+					writeResponseEvent(w, "response.output_text.delta", map[string]any{"type": "response.output_text.delta", "item_id": "msg_cfgate", "output_index": messageOutputIndex, "content_index": 0, "delta": part})
 				}
 			case "input_json_delta":
 				toolPos, ok := blockToTool[idx]
@@ -2807,9 +2807,9 @@ func streamResponsesFromAnthropic(w http.ResponseWriter, body io.Reader, model s
 	})
 	var output []any
 	if messageStarted {
-		writeResponseEvent(w, "response.output_text.done", map[string]any{"type": "response.output_text.done", "item_id": "msg_ocgo", "output_index": messageOutputIndex, "content_index": 0, "text": text.String()})
-		writeResponseEvent(w, "response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": messageOutputIndex, "item": map[string]any{"id": "msg_ocgo", "type": "message", "role": "assistant", "content": []map[string]string{{"type": "output_text", "text": text.String()}}}})
-		output = append(output, map[string]any{"id": "msg_ocgo", "type": "message", "role": "assistant", "content": []map[string]string{{"type": "output_text", "text": text.String()}}})
+		writeResponseEvent(w, "response.output_text.done", map[string]any{"type": "response.output_text.done", "item_id": "msg_cfgate", "output_index": messageOutputIndex, "content_index": 0, "text": text.String()})
+		writeResponseEvent(w, "response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": messageOutputIndex, "item": map[string]any{"id": "msg_cfgate", "type": "message", "role": "assistant", "content": []map[string]string{{"type": "output_text", "text": text.String()}}}})
+		output = append(output, map[string]any{"id": "msg_cfgate", "type": "message", "role": "assistant", "content": []map[string]string{{"type": "output_text", "text": text.String()}}})
 	}
 	for _, tool := range tools {
 		call := tool.Call
@@ -2859,7 +2859,7 @@ func readSSE(body io.Reader, handle func(event string, data []byte) bool) {
 func streamResponses(w http.ResponseWriter, body io.Reader, model string) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	flusher, _ := w.(http.Flusher)
-	id := "resp_ocgo"
+	id := "resp_cfgate"
 	writeResponseEvent(w, "response.created", map[string]any{"type": "response.created", "response": map[string]any{"id": id, "object": "response", "model": model, "status": "in_progress", "output": []any{}}})
 	if flusher != nil {
 		flusher.Flush()
@@ -2895,11 +2895,11 @@ func streamResponses(w http.ResponseWriter, body io.Reader, model string) {
 				messageStarted = true
 				messageOutputIndex = nextOutputIndex
 				nextOutputIndex++
-				writeResponseEvent(w, "response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": messageOutputIndex, "item": map[string]any{"id": "msg_ocgo", "type": "message", "role": "assistant", "content": []any{}}})
-				writeResponseEvent(w, "response.content_part.added", map[string]any{"type": "response.content_part.added", "item_id": "msg_ocgo", "output_index": messageOutputIndex, "content_index": 0, "part": map[string]any{"type": "output_text", "text": ""}})
+				writeResponseEvent(w, "response.output_item.added", map[string]any{"type": "response.output_item.added", "output_index": messageOutputIndex, "item": map[string]any{"id": "msg_cfgate", "type": "message", "role": "assistant", "content": []any{}}})
+				writeResponseEvent(w, "response.content_part.added", map[string]any{"type": "response.content_part.added", "item_id": "msg_cfgate", "output_index": messageOutputIndex, "content_index": 0, "part": map[string]any{"type": "output_text", "text": ""}})
 			}
 			text.WriteString(chunk.Content)
-			writeResponseEvent(w, "response.output_text.delta", map[string]any{"type": "response.output_text.delta", "item_id": "msg_ocgo", "output_index": messageOutputIndex, "content_index": 0, "delta": chunk.Content})
+			writeResponseEvent(w, "response.output_text.delta", map[string]any{"type": "response.output_text.delta", "item_id": "msg_cfgate", "output_index": messageOutputIndex, "content_index": 0, "delta": chunk.Content})
 			if flusher != nil {
 				flusher.Flush()
 			}
@@ -2940,12 +2940,12 @@ func streamResponses(w http.ResponseWriter, body io.Reader, model string) {
 	cacheReasoningContent(toolCalls, reasoning.String())
 	if messageStarted && !messageDone {
 		messageDone = true
-		writeResponseEvent(w, "response.output_text.done", map[string]any{"type": "response.output_text.done", "item_id": "msg_ocgo", "output_index": messageOutputIndex, "content_index": 0, "text": text.String()})
-		writeResponseEvent(w, "response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": messageOutputIndex, "item": map[string]any{"id": "msg_ocgo", "type": "message", "role": "assistant", "content": []map[string]string{{"type": "output_text", "text": text.String()}}}})
+		writeResponseEvent(w, "response.output_text.done", map[string]any{"type": "response.output_text.done", "item_id": "msg_cfgate", "output_index": messageOutputIndex, "content_index": 0, "text": text.String()})
+		writeResponseEvent(w, "response.output_item.done", map[string]any{"type": "response.output_item.done", "output_index": messageOutputIndex, "item": map[string]any{"id": "msg_cfgate", "type": "message", "role": "assistant", "content": []map[string]string{{"type": "output_text", "text": text.String()}}}})
 	}
 	var output []any
 	if messageStarted {
-		output = append(output, map[string]any{"id": "msg_ocgo", "type": "message", "role": "assistant", "content": []map[string]string{{"type": "output_text", "text": text.String()}}})
+		output = append(output, map[string]any{"id": "msg_cfgate", "type": "message", "role": "assistant", "content": []map[string]string{{"type": "output_text", "text": text.String()}}})
 	}
 	for _, tool := range tools {
 		call := tool.Call
@@ -3037,10 +3037,10 @@ func writeResponsesResponse(w http.ResponseWriter, body io.Reader, model string)
 		}
 	}
 	if len(output) == 0 {
-		output = append(output, map[string]any{"id": "msg_ocgo", "type": "message", "role": "assistant", "content": []map[string]string{{"type": "output_text", "text": text}}})
+		output = append(output, map[string]any{"id": "msg_cfgate", "type": "message", "role": "assistant", "content": []map[string]string{{"type": "output_text", "text": text}}})
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"id": "resp_ocgo", "object": "response", "created_at": time.Now().Unix(), "model": model, "status": "completed", "output": output, "usage": responsesUsage(usageFromJSON(v.Usage))})
+	_ = json.NewEncoder(w).Encode(map[string]any{"id": "resp_cfgate", "object": "response", "created_at": time.Now().Unix(), "model": model, "status": "completed", "output": output, "usage": responsesUsage(usageFromJSON(v.Usage))})
 }
 
 func countTokens(w http.ResponseWriter, r *http.Request) {
@@ -3188,7 +3188,7 @@ func writeCodexProfile(path, baseURL string) error {
 		`model_reasoning_summary = "none"`,
 		"",
 		fmt.Sprintf("[model_providers.%s]", codexProfileName),
-		`name = "OpenCode Go"`,
+		`name = "Upstream",`,
 		fmt.Sprintf("base_url = %q", baseURL),
 		`wire_api = "responses"`,
 		"",
@@ -3312,7 +3312,7 @@ func writeCodexModelCatalog(path string) error {
 	sort.Strings(keys)
 	for i, source := range keys {
 		target := mappings["codex"][source]
-		addModel(source, target, "OCGO mapping to "+target, len(knownModelIDs())+i)
+		addModel(source, target, "cfgate-cc mapping to "+target, len(knownModelIDs())+i)
 	}
 	b, err := json.MarshalIndent(map[string]any{"models": models}, "", "  ")
 	if err != nil {
