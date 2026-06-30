@@ -854,6 +854,117 @@ func contentString(v any) string {
 	return s
 }
 
+func TestBuildCloudflareURL(t *testing.T) {
+	got := buildCloudflareURL("a9ffc25861cdda67e0b6c8e7475bc5e3", "webmobile-ai-gateway")
+	want := "https://gateway.ai.cloudflare.com/v1/a9ffc25861cdda67e0b6c8e7475bc5e3/webmobile-ai-gateway/compat/v1"
+	if got != want {
+		t.Fatalf("buildCloudflareURL = %q, want %q", got, want)
+	}
+}
+
+func TestSetupCloudflareWritesAssembledConfig(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
+	t.Setenv("CLOUDFLARE_API_TOKEN", "")
+	t.Setenv("CLOUDFLARE_ACCOUNT_ID", "")
+	t.Setenv("CLOUDFLARE_GATEWAY_ID", "")
+
+	cmd := setupCloudflareCmd()
+	cmd.SetArgs([]string{"--token", "tok-xyz", "--account", "acct-123", "--gateway", "gw-456"})
+	cmd.SetIn(strings.NewReader(""))
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := os.ReadFile(filepath.Join(dir, "config.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cfg Config
+	if err := json.Unmarshal(b, &cfg); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.UpstreamBaseURL != "https://gateway.ai.cloudflare.com/v1/acct-123/gw-456/compat/v1" {
+		t.Fatalf("upstream_base_url = %q", cfg.UpstreamBaseURL)
+	}
+	if cfg.UpstreamAPIKey != "tok-xyz" {
+		t.Fatalf("upstream_api_key = %q", cfg.UpstreamAPIKey)
+	}
+	if cfg.UpstreamAuth != "bearer" {
+		t.Fatalf("upstream_auth = %q, want bearer", cfg.UpstreamAuth)
+	}
+}
+
+func TestReadCloudflareValuesPromptsAndFallsBackToEnv(t *testing.T) {
+	t.Setenv("CLOUDFLARE_API_TOKEN", "env-tok")
+	t.Setenv("CLOUDFLARE_ACCOUNT_ID", "")
+	t.Setenv("CLOUDFLARE_GATEWAY_ID", "")
+
+	in := strings.NewReader("env-acct\nenv-gw\n")
+	values, err := readCloudflareValues(in, "", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if values.token != "env-tok" || values.account != "env-acct" || values.gateway != "env-gw" {
+		t.Fatalf("unexpected values: %+v", values)
+	}
+}
+
+func TestReadCloudflareValuesFlagOverridesEnv(t *testing.T) {
+	t.Setenv("CLOUDFLARE_API_TOKEN", "env-tok")
+	t.Setenv("CLOUDFLARE_ACCOUNT_ID", "env-acct")
+	t.Setenv("CLOUDFLARE_GATEWAY_ID", "env-gw")
+
+	values, err := readCloudflareValues(strings.NewReader(""), "flag-tok", "", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if values.token != "flag-tok" || values.account != "env-acct" || values.gateway != "env-gw" {
+		t.Fatalf("flag should win over env: %+v", values)
+	}
+}
+
+func TestReadCloudflareValuesRejectsMissing(t *testing.T) {
+	t.Setenv("CLOUDFLARE_API_TOKEN", "")
+	t.Setenv("CLOUDFLARE_ACCOUNT_ID", "")
+	t.Setenv("CLOUDFLARE_GATEWAY_ID", "")
+	if _, err := readCloudflareValues(strings.NewReader("\n\n\n"), "", "", ""); err == nil {
+		t.Fatal("expected error when all values are empty")
+	}
+}
+
+func TestSetupCloudflareRefusesToOverwriteExisting(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
+	t.Setenv("CLOUDFLARE_API_TOKEN", "")
+	t.Setenv("CLOUDFLARE_ACCOUNT_ID", "")
+	t.Setenv("CLOUDFLARE_GATEWAY_ID", "")
+
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	existing := `{"upstream_base_url":"https://example.com/v1/","upstream_api_key":"k","upstream_auth":"bearer"}`
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(existing), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := setupCloudflareCmd()
+	cmd.SetArgs([]string{"--token", "t", "--account", "a", "--gateway", "g"})
+	if err := cmd.Execute(); err == nil || !strings.Contains(err.Error(), "--force") {
+		t.Fatalf("expected overwrite guard error, got %v", err)
+	}
+
+	cmd = setupCloudflareCmd()
+	cmd.SetArgs([]string{"--token", "t", "--account", "a", "--gateway", "g", "--force"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(filepath.Join(dir, "config.json"))
+	if !strings.Contains(string(b), "https://gateway.ai.cloudflare.com/v1/a/g/compat/v1") {
+		t.Fatalf("forced overwrite did not update URL:\n%s", string(b))
+	}
+}
+
 func TestParseWindowsNetstatPID(t *testing.T) {
 	output := strings.Join([]string{
 		"Proto  Local Address          Foreign Address        State           PID",

@@ -288,10 +288,19 @@ func main() {
 }
 
 func setupCmd() *cobra.Command {
-	var key string
 	cmd := &cobra.Command{
 		Use:   "setup",
-		Short: "Save your upstream provider API key",
+		Short: "Configure your upstream provider",
+	}
+	cmd.AddCommand(setupOpencodeGoCmd(), setupCloudflareCmd())
+	return cmd
+}
+
+func setupOpencodeGoCmd() *cobra.Command {
+	var key string
+	cmd := &cobra.Command{
+		Use:   "opencode-go",
+		Short: "Save your OpenCode Go API key",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if strings.TrimSpace(key) == "" {
 				key = os.Getenv("OCGO_API_KEY")
@@ -313,6 +322,90 @@ func setupCmd() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&key, "api-key", "", "Upstream provider API key")
 	return cmd
+}
+
+func setupCloudflareCmd() *cobra.Command {
+	var token, account, gateway string
+	var force bool
+	cmd := &cobra.Command{
+		Use:   "cloudflare",
+		Short: "Configure Cloudflare AI Gateway as the upstream",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			values, err := readCloudflareValues(os.Stdin, token, account, gateway)
+			if err != nil {
+				return err
+			}
+			cfg, err := loadConfig()
+			if err != nil {
+				return err
+			}
+			if cfg.UpstreamBaseURL != "" && cfg.UpstreamBaseURL != buildCloudflareURL(values.account, values.gateway) && !force {
+				return fmt.Errorf("upstream_base_url is already set to %q; pass --force to overwrite", cfg.UpstreamBaseURL)
+			}
+			cfg.UpstreamBaseURL = buildCloudflareURL(values.account, values.gateway)
+			cfg.UpstreamAPIKey = values.token
+			cfg.UpstreamAuth = "bearer"
+			return saveConfig(cfg)
+		},
+	}
+	cmd.Flags().StringVar(&token, "token", "", "Cloudflare API token (falls back to $CLOUDFLARE_API_TOKEN)")
+	cmd.Flags().StringVar(&account, "account", "", "Cloudflare account ID (falls back to $CLOUDFLARE_ACCOUNT_ID)")
+	cmd.Flags().StringVar(&gateway, "gateway", "", "Cloudflare AI Gateway ID (falls back to $CLOUDFLARE_GATEWAY_ID)")
+	cmd.Flags().BoolVar(&force, "force", false, "Overwrite an existing upstream_base_url without prompting")
+	return cmd
+}
+
+type cloudflareValues struct {
+	token, account, gateway string
+}
+
+// readCloudflareValues resolves each input from flag → env var → stdin prompt.
+// the reader parameter is os.Stdin in production; tests pass a strings.Reader
+// to drive the prompts without forking.
+func readCloudflareValues(r io.Reader, tokenFlag, accountFlag, gatewayFlag string) (cloudflareValues, error) {
+	// ponytail: bufio.NewReader must be created once and reused — wrapping r
+	// per-prompt drains the rest of the underlying reader into the new
+	// buffer, so the next prompt sees EOF.
+	br := bufio.NewReader(r)
+	prompt := func(label, envName, flagVal string) (string, error) {
+		if v := strings.TrimSpace(flagVal); v != "" {
+			return v, nil
+		}
+		if v := strings.TrimSpace(os.Getenv(envName)); v != "" {
+			return v, nil
+		}
+		fmt.Fprintf(os.Stderr, "%s: ", label)
+		line, err := br.ReadString('\n')
+		if err != nil && line == "" {
+			if err == io.EOF {
+				return "", nil
+			}
+			return "", err
+		}
+		return strings.TrimSpace(line), nil
+	}
+	t, err := prompt("Cloudflare API token", "CLOUDFLARE_API_TOKEN", tokenFlag)
+	if err != nil {
+		return cloudflareValues{}, err
+	}
+	a, err := prompt("Cloudflare account ID", "CLOUDFLARE_ACCOUNT_ID", accountFlag)
+	if err != nil {
+		return cloudflareValues{}, err
+	}
+	g, err := prompt("Cloudflare gateway ID", "CLOUDFLARE_GATEWAY_ID", gatewayFlag)
+	if err != nil {
+		return cloudflareValues{}, err
+	}
+	if t == "" || a == "" || g == "" {
+		return cloudflareValues{}, errors.New("token, account ID, and gateway ID are all required")
+	}
+	return cloudflareValues{token: t, account: a, gateway: g}, nil
+}
+
+// buildCloudflareURL assembles the AI Gateway compat URL from account and gateway IDs.
+// ponytail: if cloudflare ever changes the URL shape, only this function moves.
+func buildCloudflareURL(account, gateway string) string {
+	return fmt.Sprintf("https://gateway.ai.cloudflare.com/v1/%s/%s/compat/v1", account, gateway)
 }
 
 func listCmd() *cobra.Command {
@@ -857,7 +950,7 @@ func launchCmd() *cobra.Command {
 		}
 		c := exec.Command(bin, codexArgs...)
 		c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
-		c.Env = append(os.Environ(), "OPENAI_API_KEY=ocgo")
+		c.Env = append(os.Environ(), "OPENAI_API_KEY=cfgate-cc")
 		if mappings, err := loadModelMappings(); err == nil {
 			printLaunchMapping("codex", mappings["codex"])
 		}
@@ -2464,7 +2557,7 @@ func openAIUsage(u tokenUsage) map[string]any {
 func streamAnthropic(w http.ResponseWriter, body io.Reader, model string) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	flusher, _ := w.(http.Flusher)
-	fmt.Fprintf(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"ocgo\",\"type\":\"message\",\"role\":\"assistant\",\"model\":%q,\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n", model)
+	fmt.Fprintf(w, "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"cfgate-cc\",\"type\":\"message\",\"role\":\"assistant\",\"model\":%q,\"content\":[],\"stop_reason\":null,\"stop_sequence\":null,\"usage\":{\"input_tokens\":0,\"output_tokens\":0}}}\n\n", model)
 	if flusher != nil {
 		flusher.Flush()
 	}
@@ -2587,7 +2680,7 @@ func writeAnthropicResponse(w http.ResponseWriter, body io.Reader, model string)
 		text = v.Choices[0].Message.Content
 	}
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(map[string]any{"id": "ocgo", "type": "message", "role": "assistant", "model": model, "content": []map[string]string{{"type": "text", "text": text}}, "stop_reason": "end_turn", "usage": anthropicUsage(usageFromJSON(v.Usage))})
+	_ = json.NewEncoder(w).Encode(map[string]any{"id": "cfgate-cc", "type": "message", "role": "assistant", "model": model, "content": []map[string]string{{"type": "text", "text": text}}, "stop_reason": "end_turn", "usage": anthropicUsage(usageFromJSON(v.Usage))})
 }
 
 type anthropicParsedResponse struct {
