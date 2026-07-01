@@ -116,11 +116,17 @@ cfgate-cc mapping --provider opencode-go claude show
 
 ### migrating mappings from a pre-split config
 
-the mapping file used to be tool-scoped (`{"claude": {...}, "codex": {...}}`). it's now per-provider. on first load after upgrading, a one-shot warning prints:
+the mapping file used to be tool-scoped (`{"claude": {...}, "codex": {...}}`). it's now per-provider. on first read for a known provider, the legacy entries are lifted into that provider's section in place and the file is rewritten in the new shape — your existing mappings carry over, no manual `mapping set` re-run needed:
 
-> warning: `~/.config/ocgo/model-mapping.json` is in the old tool-scoped format. run `cfgate-cc mapping --provider <name> <tool> set ...` to re-create mappings per provider.
+```
+cfgate-cc: migrated legacy model-mapping.json into "opencode-go" section (one-time)
+```
 
-the warning is gated by a sentinel at `~/.config/ocgo/model-mapping.migrated` — it fires once per user, not once per process. no auto-migration: re-run `mapping set` per provider.
+the migration needs an active provider. with multiple providers configured and no `--provider` / `$OCGO_PROVIDER`, the legacy file is left alone and a one-shot warning fires:
+
+> warning: `~/.config/ocgo/model-mapping.json` is in the old tool-scoped format. run `cfgate-cc mapping --provider <name> <tool> set ...` to migrate per provider.
+
+the warning is gated by a sentinel at `~/.config/ocgo/model-mapping.migrated` — it fires once per user, not once per process.
 
 ## cloudflare ai gateway example
 

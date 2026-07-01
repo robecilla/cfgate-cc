@@ -724,10 +724,22 @@ var modelMappingMigratedSentinel = func() string { return filepath.Join(configDi
 
 // loadAllModelMappings reads the model-mapping file. the file shape is
 // per-provider at the top level: { "opencode-go": { "claude": {...} },
-// "cloudflare": { "claude": {...} } }. if the file has the old tool-scoped
-// shape (top-level "claude" / "codex"), the result is empty and a one-shot
-// warning is printed (gated by modelMappingMigratedSentinel).
-func loadAllModelMappings() (map[string]map[string]map[string]string, error) {
+// "cloudflare": { "claude": {...} } }.
+//
+// if the file is in the old tool-scoped shape (top-level "claude" /
+// "codex") and providerName is a known provider, the legacy entries are
+// lifted into that provider's section in place — the user's existing
+// mappings carry over without a manual `mapping set` re-run. the on-disk
+// file is rewritten in the new shape and the migration sentinel is
+// removed so the next read sees the new format. pass "" for providerName
+// to skip migration (used by tests and the warn-only path).
+//
+// if the file is in the old shape but providerName is empty or not a
+// known provider, the result is empty and a one-shot warning is printed
+// (gated by modelMappingMigratedSentinel) — picking a target without
+// knowing the active provider would just dump the entries somewhere
+// arbitrary.
+func loadAllModelMappings(providerName string) (map[string]map[string]map[string]string, error) {
 	b, err := os.ReadFile(modelMappingFile())
 	if errors.Is(err, os.ErrNotExist) {
 		return map[string]map[string]map[string]string{}, nil
@@ -743,6 +755,9 @@ func loadAllModelMappings() (map[string]map[string]map[string]string, error) {
 		return nil, fmt.Errorf("parse %s: %w", modelMappingFile(), err)
 	}
 	if looksLikeOldMappingFormatRaw(raw) {
+		if isKnownProvider(providerName) {
+			return migrateOldMappingFormatInPlace(raw, providerName)
+		}
 		warnOldMappingFormatOnce()
 		return map[string]map[string]map[string]string{}, nil
 	}
@@ -758,16 +773,63 @@ func loadAllModelMappings() (map[string]map[string]map[string]string, error) {
 			if typed[name][tool] == nil {
 				typed[name][tool] = map[string]string{}
 			}
-			cleaned := map[string]string{}
-			for source, target := range entries {
-				if strings.TrimSpace(source) != "" && strings.TrimSpace(target) != "" {
-					cleaned[strings.TrimSpace(source)] = modelID(target)
-				}
-			}
-			typed[name][tool] = cleaned
+			typed[name][tool] = cleanMappingEntries(entries)
 		}
 	}
 	return typed, nil
+}
+
+// cleanMappingEntries drops empty source/target pairs and strips the
+// opencode-go/ prefix from targets. shared by the new-format read path
+// and the old-format migration so both end up with the same shape on
+// disk.
+func cleanMappingEntries(entries map[string]string) map[string]string {
+	cleaned := map[string]string{}
+	for source, target := range entries {
+		if strings.TrimSpace(source) != "" && strings.TrimSpace(target) != "" {
+			cleaned[strings.TrimSpace(source)] = modelID(target)
+		}
+	}
+	return cleaned
+}
+
+// migrateOldMappingFormatInPlace lifts a legacy tool-scoped model-mapping
+// file into providerName's section, writes the new-shape file back, and
+// drops the migration sentinel. preserves any non-tool top-level entries
+// (none expected, but be safe). the caller has already confirmed the
+// file is in the old shape via looksLikeOldMappingFormatRaw. returns the
+// full post-migration shape so callers see peer provider sections too.
+func migrateOldMappingFormatInPlace(raw map[string]json.RawMessage, providerName string) (map[string]map[string]map[string]string, error) {
+	oldShape := map[string]map[string]string{}
+	for _, tool := range []string{"claude", "codex"} {
+		v, ok := raw[tool]
+		if !ok {
+			continue
+		}
+		var entries map[string]string
+		if err := json.Unmarshal(v, &entries); err != nil {
+			return nil, fmt.Errorf("parse legacy %s/%s: %w", modelMappingFile(), tool, err)
+		}
+		oldShape[tool] = cleanMappingEntries(entries)
+	}
+	newShape := map[string]map[string]map[string]string{}
+	for k, v := range raw {
+		if k == "claude" || k == "codex" {
+			continue
+		}
+		var sec map[string]map[string]string
+		if err := json.Unmarshal(v, &sec); err == nil {
+			newShape[k] = sec
+		}
+	}
+	newShape[providerName] = oldShape
+	if err := saveAllModelMappings(newShape); err != nil {
+		return nil, err
+	}
+	_ = os.Remove(modelMappingMigratedSentinel())
+	oldMappingFormatWarned = true
+	fmt.Fprintf(os.Stderr, "cfgate-cc: migrated legacy model-mapping.json into %q section (one-time)\n", providerName)
+	return newShape, nil
 }
 
 func saveAllModelMappings(all map[string]map[string]map[string]string) error {
@@ -787,7 +849,7 @@ func saveAllModelMappings(all map[string]map[string]map[string]string) error {
 // the proxy falls through to the default model passthrough when the section
 // has no entries for the requested tool.
 func loadModelMappingsForProvider(name string) (map[string]map[string]string, error) {
-	all, err := loadAllModelMappings()
+	all, err := loadAllModelMappings(name)
 	if err != nil {
 		return nil, err
 	}
@@ -804,7 +866,7 @@ func loadModelMappingsForProvider(name string) (map[string]map[string]string, er
 // saveModelMappingsForProvider updates the section for name and writes the
 // file back, preserving other providers' sections.
 func saveModelMappingsForProvider(name string, m map[string]map[string]string) error {
-	all, err := loadAllModelMappings()
+	all, err := loadAllModelMappings(name)
 	if err != nil {
 		return err
 	}
