@@ -37,7 +37,7 @@ cfgate-cc launch claude --provider cloudflare --model workers-ai/@cf/zai-org/glm
 cfgate-cc launch codex  --provider cloudflare --model workers-ai/@cf/zai-org/glm-5.2
 ```
 
-if you'd rather keep the env-var style, `OCGO_UPSTREAM_BASE_URL` / `OCGO_UPSTREAM_API_KEY` still override the active provider's file at request time. with no provider configured yet, they fall through to the opencode-go defaults.
+if you'd rather keep the env-var style, `OCGO_UPSTREAM_BASE_URL` / `OCGO_UPSTREAM_API_KEY` still override the active provider's file at request time. with no provider configured yet, you must still tell cfgate-cc which upstream to use — pass `--provider` or set `$OCGO_PROVIDER`, the env vars alone don't pick one.
 
 ## upstream config
 
@@ -45,7 +45,7 @@ if you'd rather keep the env-var style, `OCGO_UPSTREAM_BASE_URL` / `OCGO_UPSTREA
 
 | file | written by | purpose |
 |---|---|---|
-| `config.json` | — | local proxy settings: `host`, `port`, `api_key` |
+| `config.json` | — | local proxy settings: `host`, `port` |
 | `opencode-go.json` | `setup opencode-go` | opencode-go / zen upstream |
 | `cloudflare.json` | `setup cloudflare` | cloudflare ai gateway upstream |
 
@@ -65,10 +65,10 @@ if you'd rather keep the env-var style, `OCGO_UPSTREAM_BASE_URL` / `OCGO_UPSTREA
 |---|---|---|
 | `upstream_base_url` | `OCGO_UPSTREAM_BASE_URL` | the cloudflare REST API endpoint. `/chat/completions` is appended automatically. |
 | `upstream_api_key` | `OCGO_UPSTREAM_API_KEY` | bearer / x-api-key value |
-| `upstream_auth` | `OCGO_UPSTREAM_AUTH` | `bearer` (default), `x-api-key`, or `header` |
+| `upstream_auth` | `OCGO_UPSTREAM_AUTH` | `bearer` (default), `x-api-key`, `header`, or `both` (sends `Authorization: Bearer` *and* `x-api-key` — needed for opencode-go, whose `/chat/completions` and `/v1/messages` disagree on the header) |
 | `upstream_auth_hdr` | `OCGO_UPSTREAM_AUTH_HDR` | header name when `upstream_auth=header` |
 | `upstream_extra_hdr` | `OCGO_UPSTREAM_EXTRA_HDR` | extra headers as json object |
-| `gateway` | — | cloudflare AI gateway id, sent as `cf-aig-gateway-id` for workers-ai models |
+| `gateway` | — | cloudflare AI gateway id. sent as `cf-aig-gateway-id` only for workers-ai (`@cf/...`) models; third-party gateway models use the default gateway and don't need the header. |
 | `endpoint_overrides` | — | glob → route mapping, e.g. `[{ "pattern": "claude-*", "route": "anthropic" }]` |
 
 ## provider selection
@@ -88,7 +88,7 @@ cfgate-cc list --provider cloudflare
 cfgate-cc mapping --provider cloudflare claude set claude-opus workers-ai/@cf/zai-org/glm-5.2
 ```
 
-`list` and `mapping` also accept `--provider` on the parent command (cobra persistent flag), so the child commands inherit it.
+`list` and `mapping` both accept `--provider` — pass it on the leaf subcommand you actually want it for. (it's a local flag on `list` and a persistent flag on `mapping`, so behaviour matches but the cobra wiring differs.)
 
 ## model mapping
 
@@ -112,6 +112,9 @@ cfgate-cc mapping --provider cloudflare claude set claude-opus workers-ai/@cf/za
 cfgate-cc mapping --provider opencode-go claude set claude-opus minimax-m3
 cfgate-cc mapping --provider cloudflare  claude set claude-opus workers-ai/@cf/zai-org/glm-5.2
 cfgate-cc mapping --provider opencode-go claude show
+cfgate-cc mapping --provider opencode-go claude get  claude-opus
+cfgate-cc mapping --provider opencode-go claude unset claude-opus   # aliases: rm, remove, delete
+cfgate-cc mapping open       # open the mapping file in $EDITOR
 ```
 
 ### migrating mappings from a pre-split config
@@ -133,9 +136,15 @@ the warning is gated by a sentinel at `~/.config/ocgo/model-mapping.migrated` �
 ```bash
 # one-time setup (writes ~/.config/ocgo/cloudflare.json)
 cfgate-cc setup cloudflare --token <token> --account <account> --gateway <gateway>
+# each flag also reads from $CLOUDFLARE_API_TOKEN, $CLOUDFLARE_ACCOUNT_ID,
+# $CLOUDFLARE_GATEWAY_ID respectively. pass --force to overwrite an existing
+# config pointing at a different account.
 
 # use it
 cfgate-cc launch claude --provider cloudflare --model workers-ai/@cf/zai-org/glm-5.2
+# launch flags:
+#   --yes    pass --dangerously-skip-permissions to claude
+#   --config (codex only) write the codex profile but don't launch codex
 ```
 
 or, if you'd rather keep the fish-alias style, `OCGO_UPSTREAM_*` still overrides the file:
@@ -153,12 +162,13 @@ the model id for cloudflare workers-ai accepts both `workers-ai/@cf/...` and bar
 ```bash
 # one-time setup (writes ~/.config/ocgo/opencode-go.json)
 cfgate-cc setup opencode-go --api-key <key>
+# falls back to $OCGO_API_KEY when --api-key is omitted.
 
 # use it
 cfgate-cc launch claude --provider opencode-go --model kimi-k2.6
 ```
 
-leave `upstream_base_url` unset to use the original opencode-go URL. the qwen/minimax/kimi anthropic-endpoint heuristic from ocgo is preserved — empty `endpoint_overrides` means those models still hit `/messages` and everything else hits `/chat/completions`.
+leave `upstream_base_url` unset to use the original opencode-go URL. the qwen/minimax anthropic-endpoint heuristic from ocgo is preserved — empty `endpoint_overrides` means `qwen3.7-max` and `minimax-m3` / `minimax-m2.7` / `minimax-m2.5` hit `/messages` and everything else hits `/chat/completions`. (kimi does not use the anthropic endpoint.)
 
 ## migrating from a pre-split config
 
@@ -183,7 +193,7 @@ defaults to `~/.config/ocgo` for ocgo compat.
 
 - routes claude code through any openai-compatible upstream
 - routes codex cli through any openai-compatible upstream
-- pluggable auth: bearer, x-api-key, or arbitrary header
+- pluggable auth: bearer, x-api-key, arbitrary header, or both (for opencode-go)
 - extra headers (e.g. `cf-aig-authorization`) via `upstream_extra_hdr`
 - per-model endpoint routing via `endpoint_overrides` (glob → openai or anthropic)
 - per-provider model mapping (claude → upstream model, codex → upstream model)
