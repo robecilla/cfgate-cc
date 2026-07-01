@@ -555,6 +555,9 @@ func knownModelIDs() (ids []string, usedCache bool, err error) {
 		sort.Strings(out)
 		return out, true, oerr
 	}
+	if rerr != nil {
+		return nil, false, rerr
+	}
 	return nil, false, oerr
 }
 
