@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-APP_NAME="${APP_NAME:-ocgo}"
-CMD_PATH="${CMD_PATH:-./cmd/ocgo}"
+APP_NAME="${APP_NAME:-cfgate-cc}"
+CMD_PATH="${CMD_PATH:-./cmd/cfgate-cc}"
 TAG="${1:-${TAG:-}}"
 
 if [[ -z "$TAG" ]]; then
@@ -12,7 +12,7 @@ if [[ -z "$TAG" ]]; then
 fi
 
 VERSION="${TAG#v}"
-REPO="${GITHUB_REPOSITORY:-emanuelcasco/ocgo}"
+REPO="${GITHUB_REPOSITORY:-robecilla/cfgate-cc}"
 if [[ -z "$REPO" ]]; then
   origin_url="$(git config --get remote.origin.url || true)"
   if [[ "$origin_url" =~ github.com[:/]([^/]+)/([^/.]+)(\.git)?$ ]]; then
@@ -23,7 +23,11 @@ if [[ -z "$REPO" ]]; then
   fi
 fi
 
-HOMEBREW_TAP_REPO="${HOMEBREW_TAP_REPO:-emanuelcasco/homebrew-tap}"
+# homebrew tap is optional. leave HOMEBREW_TAP_REPO unset to skip the
+# formula update step entirely (e.g. on a first release before the tap
+# repo exists). to enable, create the tap repo and set e.g.
+# HOMEBREW_TAP_REPO=robecilla/homebrew-tap.
+HOMEBREW_TAP_REPO="${HOMEBREW_TAP_REPO:-}"
 
 if ! command -v gh >/dev/null 2>&1; then
   echo "GitHub CLI is required: brew install gh && gh auth login"
@@ -106,18 +110,20 @@ else
 fi
 
 # Update Homebrew tap formula to install the macOS artifacts.
-TAP_TMP="$(mktemp -d)"
-trap 'rm -rf "$TAP_TMP"' EXIT
+# skipped when HOMEBREW_TAP_REPO is unset.
+if [[ -n "$HOMEBREW_TAP_REPO" ]]; then
+  TAP_TMP="$(mktemp -d)"
+  trap 'rm -rf "$TAP_TMP"' EXIT
 
-gh repo clone "$HOMEBREW_TAP_REPO" "$TAP_TMP" -- --quiet
-mkdir -p "$TAP_TMP/Formula"
+  gh repo clone "$HOMEBREW_TAP_REPO" "$TAP_TMP" -- --quiet
+  mkdir -p "$TAP_TMP/Formula"
 
-DARWIN_ARM_SHA="$(shasum -a 256 "$DIST_DIR/${APP_NAME}_${VERSION}_darwin_arm64.tar.gz" | awk '{print $1}')"
-DARWIN_AMD_SHA="$(shasum -a 256 "$DIST_DIR/${APP_NAME}_${VERSION}_darwin_x86_64.tar.gz" | awk '{print $1}')"
+  DARWIN_ARM_SHA="$(shasum -a 256 "$DIST_DIR/${APP_NAME}_${VERSION}_darwin_arm64.tar.gz" | awk '{print $1}')"
+  DARWIN_AMD_SHA="$(shasum -a 256 "$DIST_DIR/${APP_NAME}_${VERSION}_darwin_x86_64.tar.gz" | awk '{print $1}')"
 
-cat > "$TAP_TMP/Formula/${APP_NAME}.rb" <<EOF_FORMULA
-class Ocgo < Formula
-  desc "Run Claude Code through an OpenCode Go-compatible Anthropic proxy"
+  cat > "$TAP_TMP/Formula/${APP_NAME}.rb" <<EOF_FORMULA
+class CfgateCc < Formula
+  desc "Proxy Claude Code and Codex CLI through a pluggable openai-compatible upstream"
   homepage "https://github.com/${REPO}"
   version "${VERSION}"
   license "MIT"
@@ -142,20 +148,22 @@ class Ocgo < Formula
 end
 EOF_FORMULA
 
-(
-  cd "$TAP_TMP"
-  git add "Formula/${APP_NAME}.rb"
-  if git diff --cached --quiet; then
-    echo "Homebrew formula is already up to date."
-  else
-    git commit -m "Update ${APP_NAME} to ${TAG}"
-    git push
-  fi
-)
+  (
+    cd "$TAP_TMP"
+    git add "Formula/${APP_NAME}.rb"
+    if git diff --cached --quiet; then
+      echo "Homebrew formula is already up to date."
+    else
+      git commit -m "Update ${APP_NAME} to ${TAG}"
+      git push
+    fi
+  )
 
-TAP_OWNER="${HOMEBREW_TAP_REPO%%/*}"
-TAP_REPO_NAME="${HOMEBREW_TAP_REPO#*/}"
-TAP_NAME="${TAP_REPO_NAME#homebrew-}"
+  TAP_OWNER="${HOMEBREW_TAP_REPO%%/*}"
+  TAP_REPO_NAME="${HOMEBREW_TAP_REPO#*/}"
+  TAP_NAME="${TAP_REPO_NAME#homebrew-}"
+
+  echo "Install with: brew install ${TAP_OWNER}/${TAP_NAME}/${APP_NAME}"
+fi
 
 echo "Release complete: https://github.com/${REPO}/releases/tag/${TAG}"
-echo "Install with: brew install ${TAP_OWNER}/${TAP_NAME}/${APP_NAME}"
