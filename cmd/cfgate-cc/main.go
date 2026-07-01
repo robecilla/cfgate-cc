@@ -156,6 +156,7 @@ type Config struct {
 // require rewriting local-proxy settings, and so two providers can coexist
 // (e.g. cloudflare for prod, opencode-go for the opencode.ai default).
 type ProviderConfig struct {
+	Name              string                  `json:"-"`                  // populated by loadActiveProvider, used by the proxy + list to dispatch on provider identity
 	UpstreamBaseURL   string                  `json:"upstream_base_url"`  // e.g. cloudflare /ai/v1 or opencode-go
 	UpstreamAPIKey    string                  `json:"upstream_api_key"`   // bearer/x-api-key value sent upstream
 	UpstreamAuth      string                  `json:"upstream_auth"`      // "bearer" | "x-api-key" | "header"
@@ -433,13 +434,40 @@ func buildCloudflareURL(account string) string {
 }
 
 func listCmd() *cobra.Command {
-	return &cobra.Command{Use: "list", Aliases: []string{"ls", "models"}, Short: "List models exposed by the configured upstream", Run: func(cmd *cobra.Command, args []string) {
-		refreshAllModels()
-		fmt.Println("Upstream models:")
-		for _, m := range knownModelIDs() {
-			fmt.Printf("  %s\n", m)
+	cmd := &cobra.Command{Use: "list", Aliases: []string{"ls", "models"}, Short: "List models exposed by the configured upstream", RunE: func(cmd *cobra.Command, args []string) error {
+		providerName, err := resolveProvider(cmd)
+		if err != nil {
+			return err
+		}
+		out := cmd.OutOrStdout()
+		switch providerName {
+		case "opencode-go":
+			refreshAllModelsForProvider(providerName)
+			fmt.Fprintf(out, "Upstream models (provider %s):\n", providerName)
+			for _, m := range knownModelIDs() {
+				fmt.Fprintf(out, "  %s\n", m)
+			}
+			return nil
+		case "cloudflare":
+			p, err := loadActiveProvider(providerName)
+			if err != nil {
+				return err
+			}
+			ids, err := cloudflareModelIDs(p)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(out, "Upstream models (provider %s):\n", providerName)
+			for _, m := range ids {
+				fmt.Fprintf(out, "  %s\n", m)
+			}
+			return nil
+		default:
+			return fmt.Errorf("list: unsupported provider %q", providerName)
 		}
 	}}
+	cmd.Flags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $OCGO_PROVIDER or the single configured provider")
+	return cmd
 }
 
 var fallbackModelIDs = []string{"glm-5.1", "glm-5", "kimi-k2.6", "kimi-k2.5", "mimo-v2.5-pro", "mimo-v2.5", "mimo-v2-pro", "mimo-v2-omni", "minimax-m3", "minimax-m2.7", "minimax-m2.5", "deepseek-v4-pro", "deepseek-v4-flash", "qwen3.7-max", "qwen3.6-plus", "qwen3.5-plus"}
@@ -629,6 +657,60 @@ func refreshAllModels() {
 	wg.Wait()
 }
 
+// refreshAllModelsForProvider dispatches the per-provider refresh chain.
+// opencode-go has two upstream sources; cloudflare has no cache (live
+// fetch happens at print time, the account's URL is the cache key).
+func refreshAllModelsForProvider(name string) {
+	if name == "opencode-go" {
+		refreshAllModels()
+	}
+}
+
+// fetchCloudflareModels hits the live /v1/models endpoint on the active
+// cloudflare account and returns the model ids. no static fallback —
+// the REST API is the source of truth, a failure is reported to the user.
+// caller (listCmd) is responsible for dispatching on provider; this helper
+// trusts the URL it gets and doesn't re-validate the prefix.
+func fetchCloudflareModels(cfg ProviderConfig) ([]string, error) {
+	url := strings.TrimRight(cfg.UpstreamBaseURL, "/") + "/models"
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	applyUpstreamAuth(req, cfg)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("cloudflare models API returned status %d", resp.StatusCode)
+	}
+	var apiResp officialModelsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
+		return nil, fmt.Errorf("failed to decode cloudflare models: %w", err)
+	}
+	ids := make([]string, 0, len(apiResp.Data))
+	seen := map[string]bool{}
+	for _, m := range apiResp.Data {
+		id := strings.TrimSpace(m.ID)
+		if id != "" && !seen[id] {
+			ids = append(ids, id)
+			seen[id] = true
+		}
+	}
+	return ids, nil
+}
+
+// cloudflareModelIDs returns the live cloudflare model list. unlike
+// opencode-go's knownModelIDs chain there's no static fallback — the
+// REST API is the only source.
+func cloudflareModelIDs(cfg ProviderConfig) ([]string, error) {
+	return fetchCloudflareModels(cfg)
+}
+
 func defaultModelMappings() map[string]map[string]string {
 	return map[string]map[string]string{
 		"claude": {},
@@ -636,16 +718,172 @@ func defaultModelMappings() map[string]map[string]string {
 	}
 }
 
+// modelMappingMigratedSentinel marks that the old tool-scoped format warning
+// has already been printed. file presence = warning already shown.
+var modelMappingMigratedSentinel = func() string { return filepath.Join(configDir(), "model-mapping.migrated") }
+
+// loadAllModelMappings reads the model-mapping file. the file shape is
+// per-provider at the top level: { "opencode-go": { "claude": {...} },
+// "cloudflare": { "claude": {...} } }. if the file has the old tool-scoped
+// shape (top-level "claude" / "codex"), the result is empty and a one-shot
+// warning is printed (gated by modelMappingMigratedSentinel).
+func loadAllModelMappings() (map[string]map[string]map[string]string, error) {
+	b, err := os.ReadFile(modelMappingFile())
+	if errors.Is(err, os.ErrNotExist) {
+		return map[string]map[string]map[string]string{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	// two-stage parse: first as a flat map of raw json so we can detect
+	// the old tool-scoped shape before committing to a typed unmarshal
+	// (the old shape doesn't fit map[string]map[string]map[string]string).
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", modelMappingFile(), err)
+	}
+	if looksLikeOldMappingFormatRaw(raw) {
+		warnOldMappingFormatOnce()
+		return map[string]map[string]map[string]string{}, nil
+	}
+	var typed map[string]map[string]map[string]string
+	if err := json.Unmarshal(b, &typed); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", modelMappingFile(), err)
+	}
+	if typed == nil {
+		typed = map[string]map[string]map[string]string{}
+	}
+	for name, byTool := range typed {
+		for tool, entries := range byTool {
+			if typed[name][tool] == nil {
+				typed[name][tool] = map[string]string{}
+			}
+			cleaned := map[string]string{}
+			for source, target := range entries {
+				if strings.TrimSpace(source) != "" && strings.TrimSpace(target) != "" {
+					cleaned[strings.TrimSpace(source)] = modelID(target)
+				}
+			}
+			typed[name][tool] = cleaned
+		}
+	}
+	return typed, nil
+}
+
+func saveAllModelMappings(all map[string]map[string]map[string]string) error {
+	if err := os.MkdirAll(filepath.Dir(modelMappingFile()), 0755); err != nil {
+		return err
+	}
+	b, err := json.MarshalIndent(all, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(modelMappingFile(), append(b, '\n'), 0644)
+}
+
+// loadModelMappingsForProvider returns the tool → source→target section for
+// the named provider. known provider with no section: empty default mapping
+// (claude/codex keys, no entries). unknown provider: empty map. either way
+// the proxy falls through to the default model passthrough when the section
+// has no entries for the requested tool.
+func loadModelMappingsForProvider(name string) (map[string]map[string]string, error) {
+	all, err := loadAllModelMappings()
+	if err != nil {
+		return nil, err
+	}
+	if !isKnownProvider(name) {
+		return map[string]map[string]string{}, nil
+	}
+	section := all[name]
+	if section == nil {
+		return defaultModelMappings(), nil
+	}
+	return section, nil
+}
+
+// saveModelMappingsForProvider updates the section for name and writes the
+// file back, preserving other providers' sections.
+func saveModelMappingsForProvider(name string, m map[string]map[string]string) error {
+	all, err := loadAllModelMappings()
+	if err != nil {
+		return err
+	}
+	if m == nil {
+		m = defaultModelMappings()
+	}
+	all[name] = m
+	return saveAllModelMappings(all)
+}
+
+// looksLikeOldMappingFormatRaw detects the old tool-scoped shape by
+// checking the top-level keys. only the old format's tools are checked —
+// the new format's providers are opencode-go and cloudflare, which the
+// old format never used.
+func looksLikeOldMappingFormatRaw(raw map[string]json.RawMessage) bool {
+	if len(raw) == 0 {
+		return false
+	}
+	for _, tool := range []string{"claude", "codex"} {
+		if _, ok := raw[tool]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+var oldMappingFormatWarned bool
+
+// warnOldMappingFormatOnce prints the migration warning the first time an
+// old-format model-mapping.json is read, and creates the sentinel file so
+// subsequent runs are silent. the in-process flag avoids duplicate prints
+// when many calls happen in one invocation (e.g. tests).
+func warnOldMappingFormatOnce() {
+	if oldMappingFormatWarned {
+		return
+	}
+	if _, err := os.Stat(modelMappingMigratedSentinel()); err == nil {
+		oldMappingFormatWarned = true
+		return
+	}
+	fmt.Fprintf(os.Stderr, "warning: %s is in the old tool-scoped format. run `cfgate-cc mapping --provider <name> <tool> set ...` to re-create mappings per provider.\n", modelMappingFile())
+	oldMappingFormatWarned = true
+	_ = os.MkdirAll(filepath.Dir(modelMappingMigratedSentinel()), 0755)
+	_ = os.WriteFile(modelMappingMigratedSentinel(), []byte("warned at "+time.Now().UTC().Format(time.RFC3339)+"\n"), 0644)
+	_ = os.Stderr.Sync()
+}
+
 func mappingCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "mapping", Short: "Manage tool model mappings to upstream models"}
+	cmd.PersistentFlags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $OCGO_PROVIDER or the single configured provider")
 	cmd.AddCommand(toolMappingCmd("claude"), toolMappingCmd("codex"))
 	return cmd
+}
+
+// providerFromMappingCmd resolves --provider from the mapping subcommand
+// tree. the flag lives on the parent (`mapping`), cobra inherits persistent
+// flags to children, so cmd.Flags().Lookup("provider") on a leaf works.
+func providerFromMappingCmd(cmd *cobra.Command) (string, error) {
+	if cmd != nil {
+		if f := cmd.Flags().Lookup("provider"); f != nil {
+			if v := strings.TrimSpace(f.Value.String()); v != "" {
+				if !isKnownProvider(v) {
+					return "", fmt.Errorf("unknown --provider %q (known: %s)", v, strings.Join(knownProviders, ", "))
+				}
+				return v, nil
+			}
+		}
+	}
+	return resolveProvider(cmd)
 }
 
 func toolMappingCmd(tool string) *cobra.Command {
 	cmd := &cobra.Command{Use: tool, Short: fmt.Sprintf("Manage %s model mappings", tool)}
 	cmd.AddCommand(&cobra.Command{Use: "show", Short: "Show current mapping", RunE: func(cmd *cobra.Command, args []string) error {
-		m, err := loadModelMappings()
+		name, err := providerFromMappingCmd(cmd)
+		if err != nil {
+			return err
+		}
+		m, err := loadModelMappingsForProvider(name)
 		if err != nil {
 			return err
 		}
@@ -653,7 +891,11 @@ func toolMappingCmd(tool string) *cobra.Command {
 		return nil
 	}})
 	cmd.AddCommand(&cobra.Command{Use: "get <source-model>", Short: "Get one mapped upstream model", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		m, err := loadModelMappings()
+		name, err := providerFromMappingCmd(cmd)
+		if err != nil {
+			return err
+		}
+		m, err := loadModelMappingsForProvider(name)
 		if err != nil {
 			return err
 		}
@@ -666,15 +908,19 @@ func toolMappingCmd(tool string) *cobra.Command {
 		return fmt.Errorf("no mapping for %q in %s", source, tool)
 	}})
 	cmd.AddCommand(&cobra.Command{Use: "set <source-model> <opencode-model>", Short: "Set one model mapping", Args: cobra.ExactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
+		name, err := providerFromMappingCmd(cmd)
+		if err != nil {
+			return err
+		}
 		source := strings.TrimSpace(args[0])
 		target := strings.TrimSpace(args[1])
 		if source == "" || target == "" {
 			return errors.New("source and target models cannot be empty")
 		}
-		if !knownOpenCodeModel(target) {
-			return fmt.Errorf("unknown upstream model %q; run `cfgate-cc models`", target)
+		if !knownModelForProvider(name, target) {
+			return fmt.Errorf("unknown upstream model %q for provider %q; run `cfgate-cc list --provider %s`", target, name, name)
 		}
-		m, err := loadModelMappings()
+		m, err := loadModelMappingsForProvider(name)
 		if err != nil {
 			return err
 		}
@@ -682,18 +928,22 @@ func toolMappingCmd(tool string) *cobra.Command {
 			m[tool] = map[string]string{}
 		}
 		m[tool][source] = modelID(target)
-		if err := saveModelMappings(m); err != nil {
+		if err := saveModelMappingsForProvider(name, m); err != nil {
 			return err
 		}
 		fmt.Printf("%s %s -> %s\n", tool, source, modelID(target))
 		return nil
 	}})
 	cmd.AddCommand(&cobra.Command{Use: "unset <source-model>", Aliases: []string{"rm", "remove", "delete"}, Short: "Remove one model mapping", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
+		name, err := providerFromMappingCmd(cmd)
+		if err != nil {
+			return err
+		}
 		source := strings.TrimSpace(args[0])
 		if source == "" {
 			return errors.New("source model cannot be empty")
 		}
-		m, err := loadModelMappings()
+		m, err := loadModelMappingsForProvider(name)
 		if err != nil {
 			return err
 		}
@@ -704,19 +954,15 @@ func toolMappingCmd(tool string) *cobra.Command {
 			return fmt.Errorf("no mapping for %q in %s", source, tool)
 		}
 		delete(m[tool], source)
-		if err := saveModelMappings(m); err != nil {
+		if err := saveModelMappingsForProvider(name, m); err != nil {
 			return err
 		}
 		fmt.Printf("removed %s mapping for %s\n", tool, source)
 		return nil
 	}})
 	cmd.AddCommand(&cobra.Command{Use: "open", Short: "Open mapping file in $EDITOR", RunE: func(cmd *cobra.Command, args []string) error {
-		m, err := loadModelMappings()
-		if err != nil {
-			return err
-		}
 		if _, err := os.Stat(modelMappingFile()); errors.Is(err, os.ErrNotExist) {
-			if err := saveModelMappings(m); err != nil {
+			if err := saveAllModelMappings(map[string]map[string]map[string]string{}); err != nil {
 				return err
 			}
 		}
@@ -780,41 +1026,62 @@ func knownOpenCodeModel(model string) bool {
 	return false
 }
 
-func loadModelMappings() (map[string]map[string]string, error) {
-	mappings := defaultModelMappings()
-	b, err := os.ReadFile(modelMappingFile())
-	if errors.Is(err, os.ErrNotExist) {
-		return mappings, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	var custom map[string]map[string]string
-	if err := json.Unmarshal(b, &custom); err != nil {
-		return mappings, nil
-	}
-	for tool, entries := range custom {
-		if mappings[tool] == nil {
-			mappings[tool] = map[string]string{}
-		}
-		for source, target := range entries {
-			if strings.TrimSpace(source) != "" && strings.TrimSpace(target) != "" {
-				mappings[tool][strings.TrimSpace(source)] = modelID(target)
+// knownModelForProvider dispatches the "is this model valid for this provider"
+// check. opencode-go has a static/live chain; cloudflare uses its live
+// /v1/models list. unknown providers always return false. loads the active
+// provider's config internally so callers (e.g. mapping set) don't have
+// to thread it through.
+func knownModelForProvider(name, model string) bool {
+	id := modelID(model)
+	switch name {
+	case "opencode-go":
+		for _, candidate := range knownModelIDs() {
+			if candidate == id {
+				return true
 			}
 		}
+		return false
+	case "cloudflare":
+		p, err := loadActiveProvider(name)
+		if err != nil {
+			return false
+		}
+		ids, err := cloudflareModelIDs(p)
+		if err != nil {
+			return false
+		}
+		for _, candidate := range ids {
+			if candidate == id {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
 	}
-	return mappings, nil
+}
+
+// providerKnownModelIDs returns the model id list for the named provider.
+// used by writeCodexModelCatalog and any other codex-side caller that needs
+// the active provider's model list, not a hardcoded one.
+func providerKnownModelIDs(name string, p ProviderConfig) ([]string, error) {
+	switch name {
+	case "opencode-go":
+		refreshAllModels()
+		return knownModelIDs(), nil
+	case "cloudflare":
+		return cloudflareModelIDs(p)
+	default:
+		return nil, fmt.Errorf("unknown provider %q", name)
+	}
+}
+
+func loadModelMappings() (map[string]map[string]string, error) {
+	return loadModelMappingsForProvider("opencode-go")
 }
 
 func saveModelMappings(mappings map[string]map[string]string) error {
-	if err := os.MkdirAll(filepath.Dir(modelMappingFile()), 0755); err != nil {
-		return err
-	}
-	b, err := json.MarshalIndent(mappings, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(modelMappingFile(), append(b, '\n'), 0644)
+	return saveModelMappingsForProvider("opencode-go", mappings)
 }
 
 func resolveMappedModel(tool, source string, mappings map[string]map[string]string) string {
@@ -900,7 +1167,7 @@ func launchCmd() *cobra.Command {
 		c := exec.Command(bin, claudeArgs...)
 		c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
 		c.Env = append(os.Environ(), "ANTHROPIC_BASE_URL="+base, "ANTHROPIC_AUTH_TOKEN=unused")
-		mappings, err := loadModelMappings()
+		mappings, err := loadModelMappingsForProvider(providerName)
 		if err != nil {
 			return err
 		}
@@ -955,7 +1222,11 @@ func launchCmd() *cobra.Command {
 			return err
 		}
 		base := fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port)
-		if err := ensureCodexConfig(base); err != nil {
+		p, err := loadActiveProvider(providerName)
+		if err != nil {
+			return err
+		}
+		if err := ensureCodexConfig(base, p); err != nil {
 			return fmt.Errorf("failed to configure codex: %w", err)
 		}
 		if codexConfigOnly {
@@ -984,7 +1255,7 @@ func launchCmd() *cobra.Command {
 		c := exec.Command(bin, codexArgs...)
 		c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
 		c.Env = append(os.Environ(), "OPENAI_API_KEY=cfgate-cc")
-		if mappings, err := loadModelMappings(); err == nil {
+		if mappings, err := loadModelMappingsForProvider(providerName); err == nil {
 			printLaunchMapping("codex", mappings["codex"])
 		}
 		return c.Run()
@@ -1098,7 +1369,7 @@ func proxyMessages(w http.ResponseWriter, r *http.Request, cfg ProviderConfig) {
 	}
 	if modelUsesAnthropicEndpoint(ar.Model, cfg) {
 		ar.Model = modelID(ar.Model)
-		ensureAnthropicRequestDefaults(&ar)
+		ensureAnthropicRequestDefaults(&ar, cfg)
 		resp, err := forwardAnthropic(r.Context(), cfg, ar)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
@@ -1110,7 +1381,7 @@ func proxyMessages(w http.ResponseWriter, r *http.Request, cfg ProviderConfig) {
 		_, _ = io.Copy(w, resp.Body)
 		return
 	}
-	or := convertRequest(ar)
+	or := convertRequest(ar, cfg)
 	if err := validateImageSupport(or); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -1153,7 +1424,7 @@ func proxyChatCompletions(w http.ResponseWriter, r *http.Request, cfg ProviderCo
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
 	}
-	body, err = prepareChatBody(body)
+	body, err = prepareChatBody(body, cfg)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
@@ -1165,7 +1436,7 @@ func proxyChatCompletions(w http.ResponseWriter, r *http.Request, cfg ProviderCo
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		resp, err := forwardAnthropic(r.Context(), cfg, chatToAnthropic(or))
+		resp, err := forwardAnthropic(r.Context(), cfg, chatToAnthropic(or, cfg))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
@@ -1213,14 +1484,14 @@ func proxyResponses(w http.ResponseWriter, r *http.Request, cfg ProviderConfig) 
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
 	}
-	or := responsesToChat(rr)
+	or := responsesToChat(rr, cfg)
 	if err := validateImageSupport(or); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if modelUsesAnthropicEndpoint(or.Model, cfg) {
 		or.Model = modelID(or.Model)
-		resp, err := forwardAnthropic(r.Context(), cfg, chatToAnthropic(or))
+		resp, err := forwardAnthropic(r.Context(), cfg, chatToAnthropic(or, cfg))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
@@ -1363,7 +1634,7 @@ func applyCloudflareGatewayHeader(req *http.Request, cfg ProviderConfig, wireMod
 }
 
 func forwardAnthropic(ctx context.Context, cfg ProviderConfig, ar AnthropicRequest) (*http.Response, error) {
-	normalizeAnthropicRequestForUpstream(&ar)
+	normalizeAnthropicRequestForUpstream(&ar, cfg)
 	body, err := json.Marshal(ar)
 	if err != nil {
 		return nil, err
@@ -1377,8 +1648,8 @@ func forwardAnthropic(ctx context.Context, cfg ProviderConfig, ar AnthropicReque
 	return (&http.Client{Timeout: 10 * time.Minute}).Do(req)
 }
 
-func normalizeAnthropicRequestForUpstream(ar *AnthropicRequest) {
-	ensureAnthropicRequestDefaults(ar)
+func normalizeAnthropicRequestForUpstream(ar *AnthropicRequest, p ProviderConfig) {
+	ensureAnthropicRequestDefaults(ar, p)
 	// OpenCode Go's Anthropic-compatible endpoint is stricter than Anthropic's
 	// Claude endpoint for some model families (notably qwen3.7-max). Claude Code
 	// can send Anthropic-specific prompt-caching and extended-thinking fields that
@@ -1544,22 +1815,22 @@ func stripCacheControl(v any) any {
 	}
 }
 
-func ensureAnthropicRequestDefaults(ar *AnthropicRequest) {
-	ar.Model = resolveToolModel("claude", ar.Model)
+func ensureAnthropicRequestDefaults(ar *AnthropicRequest, p ProviderConfig) {
+	ar.Model = resolveToolModel("claude", ar.Model, p)
 	if ar.MaxTokens == 0 {
 		ar.MaxTokens = 4096
 	}
 }
 
-func resolveToolModel(tool, source string) string {
-	mappings, err := loadModelMappings()
+func resolveToolModel(tool, source string, p ProviderConfig) string {
+	mappings, err := loadModelMappingsForProvider(p.Name)
 	if err != nil {
 		mappings = defaultModelMappings()
 	}
 	return resolveMappedModel(tool, source, mappings)
 }
 
-func prepareChatBody(body []byte) ([]byte, error) {
+func prepareChatBody(body []byte, p ProviderConfig) ([]byte, error) {
 	var req map[string]any
 	if json.Unmarshal(body, &req) != nil {
 		return body, nil
@@ -1569,7 +1840,7 @@ func prepareChatBody(body []byte) ([]byte, error) {
 		changed = true
 	}
 	model, _ := req["model"].(string)
-	if mapped := resolveToolModel("codex", model); mapped != model {
+	if mapped := resolveToolModel("codex", model, p); mapped != model {
 		req["model"] = mapped
 		model = mapped
 		changed = true
@@ -1760,8 +2031,8 @@ func stripRawChatImageDetails(req map[string]any) bool {
 	return changed
 }
 
-func convertRequest(ar AnthropicRequest) OAIRequest {
-	model := resolveToolModel("claude", ar.Model)
+func convertRequest(ar AnthropicRequest, p ProviderConfig) OAIRequest {
+	model := resolveToolModel("claude", ar.Model, p)
 	out := OAIRequest{Model: model, Stream: ar.Stream, StreamOptions: streamUsageOptions(ar.Stream), MaxTokens: ar.MaxTokens, Temperature: ar.Temperature, TopP: ar.TopP, ReasoningEffort: downstreamReasoningEffort(ar.Reasoning, ar.Thinking, ar.OutputConfig, ar.ReasoningEffort, ar.Effort, ar.Level, ar.Depth)}
 	if sys := systemText(ar.System); sys != "" {
 		out.Messages = append(out.Messages, OAIMessage{Role: "system", Content: sys})
@@ -1777,8 +2048,8 @@ func convertRequest(ar AnthropicRequest) OAIRequest {
 	return out
 }
 
-func responsesToChat(rr ResponsesRequest) OAIRequest {
-	model := resolveToolModel("codex", rr.Model)
+func responsesToChat(rr ResponsesRequest, p ProviderConfig) OAIRequest {
+	model := resolveToolModel("codex", rr.Model, p)
 	out := OAIRequest{Model: model, Stream: rr.Stream, StreamOptions: streamUsageOptions(rr.Stream), MaxTokens: rr.MaxTokens, Temperature: rr.Temperature, TopP: rr.TopP, ReasoningEffort: downstreamReasoningEffort(rr.Reasoning, rr.Thinking, rr.OutputConfig, rr.ReasoningEffort, rr.Effort, rr.Level, rr.Depth)}
 	if rr.Instructions != "" {
 		out.Messages = append(out.Messages, OAIMessage{Role: "system", Content: rr.Instructions})
@@ -1824,8 +2095,8 @@ func toolParametersOrDefault(raw json.RawMessage) json.RawMessage {
 	return raw
 }
 
-func chatToAnthropic(or OAIRequest) AnthropicRequest {
-	model := resolveToolModel("codex", or.Model)
+func chatToAnthropic(or OAIRequest, p ProviderConfig) AnthropicRequest {
+	model := resolveToolModel("codex", or.Model, p)
 	out := AnthropicRequest{Model: model, MaxTokens: or.MaxTokens, Stream: or.Stream, Temperature: or.Temperature, TopP: or.TopP}
 	if out.MaxTokens == 0 {
 		out.MaxTokens = 4096
@@ -3381,12 +3652,12 @@ func codexModelCatalogFile() string {
 	return filepath.Join(home, ".codex", "ocgo-models.json")
 }
 
-func ensureCodexConfig(base string) error {
+func ensureCodexConfig(base string, p ProviderConfig) error {
 	path := codexConfigFile()
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
 	}
-	if err := writeCodexModelCatalog(codexModelCatalogFile()); err != nil {
+	if err := writeCodexModelCatalog(codexModelCatalogFile(), p); err != nil {
 		return err
 	}
 	return writeCodexProfile(path, strings.TrimRight(base, "/")+"/v1/")
@@ -3470,12 +3741,16 @@ func isLegacyCodexProfileSection(section string) bool {
 	return false
 }
 
-func writeCodexModelCatalog(path string) error {
-	mappings, err := loadModelMappings()
+func writeCodexModelCatalog(path string, p ProviderConfig) error {
+	mappings, err := loadModelMappingsForProvider(p.Name)
 	if err != nil {
 		mappings = defaultModelMappings()
 	}
-	models := make([]map[string]any, 0, len(knownModelIDs())+len(mappings["codex"]))
+	providerIDs, err := providerKnownModelIDs(p.Name, p)
+	if err != nil {
+		return err
+	}
+	models := make([]map[string]any, 0, len(providerIDs)+len(mappings["codex"]))
 	seen := map[string]bool{}
 	addModel := func(id, target, description string, i int) {
 		if seen[id] {
@@ -3518,7 +3793,7 @@ func writeCodexModelCatalog(path string) error {
 			"supports_search_tool":             meta.SupportsSearchTool,
 		})
 	}
-	for i, id := range knownModelIDs() {
+	for i, id := range providerIDs {
 		addModel(id, id, modelMetadata(id).Description, i)
 	}
 	keys := make([]string, 0, len(mappings["codex"]))
@@ -3697,12 +3972,15 @@ func resolveProvider(cmd *cobra.Command) (string, error) {
 
 // loadActiveProvider returns the provider config for name, with
 // OCGO_UPSTREAM_* env vars applied on top so the fish-alias pattern
-// (env-overrides-file) still works for the active provider.
+// (env-overrides-file) still works for the active provider. sets Name
+// so downstream code (proxy handlers, list dispatch) can identify the
+// provider without re-resolving it.
 func loadActiveProvider(name string) (ProviderConfig, error) {
 	p, err := loadProviderConfig(name)
 	if err != nil {
 		return p, err
 	}
+	p.Name = name
 	if v := os.Getenv("OCGO_UPSTREAM_BASE_URL"); v != "" {
 		p.UpstreamBaseURL = v
 	}
