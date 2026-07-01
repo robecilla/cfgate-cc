@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -2327,5 +2328,177 @@ func TestLoadActiveProviderOpencodeGoDefaultURL(t *testing.T) {
 	}
 	if got := openAIURL(p); got != "https://opencode.ai/zen/go/v1/chat/completions" {
 		t.Fatalf("openAIURL = %q, want opencode-go default", got)
+	}
+}
+
+func TestDebugLoggingProxyMessages(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "debug.log")
+	t.Setenv("OCGO_DEBUG", logPath)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer secret-key" {
+			t.Errorf("upstream Authorization = %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"x","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`))
+	}))
+	defer upstream.Close()
+
+	// enable debug + re-arm after the test so other tests stay quiet
+	prev := debugEnabled
+	debugEnabled = false
+	t.Cleanup(func() {
+		debugEnabled = prev
+		log.SetOutput(os.Stderr)
+	})
+	setupDebug()
+
+	cfg := ProviderConfig{Name: "opencode-go", UpstreamBaseURL: upstream.URL, UpstreamAPIKey: "secret-key", UpstreamAuth: "bearer"}
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { proxyMessages(w, r, cfg) }))
+	defer proxy.Close()
+
+	body := strings.NewReader(`{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`)
+	resp, err := http.Post(proxy.URL+"/v1/messages", "application/json", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	debugLog := string(logBytes)
+	for _, want := range []string{
+		"[messages] incoming POST /v1/messages",
+		"[upstream] POST " + upstream.URL + "/chat/completions",
+		"[upstream] response 200 application/json",
+		"[messages] client response: 200",
+		"Authorization: [REDACTED]",
+		`"content":"hi"`,
+	} {
+		if !strings.Contains(debugLog, want) {
+			t.Errorf("debug log missing %q\n---\n%s\n---", want, debugLog)
+		}
+	}
+	if strings.Contains(debugLog, "secret-key") {
+		t.Errorf("debug log leaked upstream key\n---\n%s\n---", debugLog)
+	}
+}
+
+func TestDebugLoggingStderr(t *testing.T) {
+	t.Setenv("OCGO_DEBUG", "1")
+
+	// capture stderr
+	orig := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	t.Cleanup(func() { os.Stderr = orig })
+
+	prev := debugEnabled
+	debugEnabled = false
+	t.Cleanup(func() {
+		debugEnabled = prev
+		log.SetOutput(os.Stderr)
+	})
+	setupDebug()
+	if !debugEnabled {
+		t.Fatal("setupDebug did not enable debug")
+	}
+
+	dlogf("hello from stderr")
+
+	w.Close()
+	out, _ := io.ReadAll(r)
+	if !strings.Contains(string(out), "hello from stderr") {
+		t.Errorf("stderr capture missing log line: %q", string(out))
+	}
+	if !strings.Contains(string(out), "debug log: 1") {
+		t.Errorf("stderr capture missing setup banner: %q", string(out))
+	}
+}
+
+func TestDebugLoggingUnset(t *testing.T) {
+	t.Setenv("OCGO_DEBUG", "")
+
+	prev := debugEnabled
+	debugEnabled = false
+	t.Cleanup(func() { debugEnabled = prev })
+	setupDebug()
+	if debugEnabled {
+		t.Fatal("setupDebug enabled debug with OCGO_DEBUG unset")
+	}
+
+	// capture stderr to confirm dlogf is a no-op
+	orig := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	dlogf("this should be dropped")
+	w.Close()
+	out, _ := io.ReadAll(r)
+	os.Stderr = orig
+	if strings.Contains(string(out), "this should be dropped") {
+		t.Errorf("debug log emitted with OCGO_DEBUG unset: %q", string(out))
+	}
+}
+
+func TestDebugLoggingStreamSSE(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "debug.log")
+	t.Setenv("OCGO_DEBUG", logPath)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		// 5 events so first 2 + last 2 are visible
+		for i := 0; i < 5; i++ {
+			fmt.Fprintf(w, "data: {\"i\":%d}\n\n", i)
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+	}))
+	defer upstream.Close()
+
+	prev := debugEnabled
+	debugEnabled = false
+	t.Cleanup(func() {
+		debugEnabled = prev
+		log.SetOutput(os.Stderr)
+	})
+	setupDebug()
+
+	cfg := ProviderConfig{Name: "opencode-go", UpstreamBaseURL: upstream.URL, UpstreamAPIKey: "k", UpstreamAuth: "bearer"}
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { proxyMessages(w, r, cfg) }))
+	defer proxy.Close()
+
+	body := strings.NewReader(`{"model":"m","max_tokens":1,"stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	resp, err := http.Post(proxy.URL+"/v1/messages", "application/json", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	debugLog := string(logBytes)
+	for _, want := range []string{
+		"[upstream] response 200 text/event-stream",
+		"[messages] stream end: events=5",
+		`event[first/1]: data: {"i":0}`,
+		`event[last/5]: data: {"i":4}`,
+	} {
+		if !strings.Contains(debugLog, want) {
+			t.Errorf("debug log missing %q\n---\n%s\n---", want, debugLog)
+		}
 	}
 }
