@@ -1,4 +1,4 @@
-.PHONY: build run test clean install release
+.PHONY: build run test test-release clean install release
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 EXE := $(shell go env GOEXE)
@@ -15,6 +15,9 @@ run:
 
 test:
 	go test ./...
+
+test-release:
+	bash scripts/test_next_version.sh
 
 clean:
 	rm -rf bin

@@ -1,0 +1,54 @@
+name: release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "cmd/**"
+      - "scripts/**"
+      - "go.mod"
+      - "go.sum"
+      - "Makefile"
+      - ".github/workflows/release.yml"
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: setup go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: compute next version
+        id: next
+        run: |
+          NEXT="$(bash scripts/next-version.sh)"
+          if [[ -z "$NEXT" ]]; then
+            echo "no bump-worthy commits since last tag; skipping release"
+            exit 0
+          fi
+          echo "tag=$NEXT" >>"$GITHUB_OUTPUT"
+          echo "next tag: $NEXT"
+
+      - name: cut release
+        if: steps.next.outputs.tag != ''
+        env:
+          TAG: ${{ steps.next.outputs.tag }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          HOMEBREW_TAP_REPO: ${{ secrets.HOMEBREW_TAP_REPO }}
+          GH_TOKEN: ${{ secrets.TAP_REPO_TOKEN || secrets.GITHUB_TOKEN }}
+        run: make release
