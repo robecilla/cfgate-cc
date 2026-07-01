@@ -2397,13 +2397,12 @@ func TestDebugLoggingStderr(t *testing.T) {
 		t.Fatal(err)
 	}
 	os.Stderr = w
-	t.Cleanup(func() { os.Stderr = orig })
-
 	prev := debugEnabled
 	debugEnabled = false
 	t.Cleanup(func() {
 		debugEnabled = prev
-		log.SetOutput(os.Stderr)
+		log.SetOutput(orig)
+		os.Stderr = orig
 	})
 	setupDebug()
 	if !debugEnabled {
