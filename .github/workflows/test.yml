@@ -1,0 +1,33 @@
+name: test
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: checkout
+        uses: actions/checkout@v5
+
+      - name: setup go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: go test
+        run: go test ./...
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      - name: test next-version.sh fixtures
+        run: bash scripts/test_next_version.sh
