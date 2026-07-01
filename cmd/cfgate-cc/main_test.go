@@ -514,6 +514,99 @@ func TestSaveModelMappingsForProviderPreservesOthers(t *testing.T) {
 	}
 }
 
+func TestLoadModelMappingsAutoMigratesOldFormat(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "model-mapping.json")
+	withTempModelMappingFile(t, path)
+	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
+	oldWarned := oldMappingFormatWarned
+	oldMappingFormatWarned = false
+	t.Cleanup(func() { oldMappingFormatWarned = oldWarned })
+
+	old := `{"claude":{"claude-haiku":"opencode-go/deepseek-v4-flash","claude-opus":"minimax-m3","claude-sonnet":"kimi-k2.7-code"},"codex":{}}`
+	if err := os.WriteFile(path, []byte(old), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// load with a known provider: legacy entries get lifted into that
+	// provider's section in place, the on-disk file is rewritten, and
+	// the returned shape reflects the original entries (with the
+	// opencode-go/ prefix stripped from the haiku target).
+	all, err := loadAllModelMappings("opencode-go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if all["opencode-go"] == nil {
+		t.Fatalf("expected opencode-go section, got %+v", all)
+	}
+	claude := all["opencode-go"]["claude"]
+	if claude["claude-opus"] != "minimax-m3" ||
+		claude["claude-sonnet"] != "kimi-k2.7-code" ||
+		claude["claude-haiku"] != "deepseek-v4-flash" {
+		t.Fatalf("entries not lifted as expected: %+v", claude)
+	}
+	if codex := all["opencode-go"]["codex"]; len(codex) != 0 {
+		t.Fatalf("codex section should be empty, got %+v", codex)
+	}
+
+	// on-disk file is now in the new shape with no legacy tool keys at
+	// the top level
+	b, _ := os.ReadFile(path)
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := raw["claude"]; ok {
+		t.Fatalf("legacy top-level claude should be gone, got: %s", string(b))
+	}
+	if _, ok := raw["opencode-go"]; !ok {
+		t.Fatalf("opencode-go section should be at top level, got: %s", string(b))
+	}
+
+	// sentinel was cleared so the warning stays silent
+	if _, err := os.Stat(filepath.Join(dir, "model-mapping.migrated")); err == nil {
+		t.Fatalf("sentinel should be removed after migration: %v", err)
+	}
+
+	// subsequent load sees the new format and returns the same section
+	// without touching the file again
+	again, err := loadAllModelMappings("opencode-go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if again["opencode-go"]["claude"]["claude-opus"] != "minimax-m3" {
+		t.Fatalf("second load lost the migrated entry: %+v", again)
+	}
+}
+
+func TestLoadModelMappingsAutoMigrationPreservesPeerProvider(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "model-mapping.json")
+	withTempModelMappingFile(t, path)
+	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
+	oldWarned := oldMappingFormatWarned
+	oldMappingFormatWarned = false
+	t.Cleanup(func() { oldMappingFormatWarned = oldWarned })
+
+	// malformed-but-tolerable: legacy tool keys alongside a real
+	// per-provider section. migration should leave the peer section
+	// alone and lift the legacy keys into the active provider.
+	hybrid := `{"opencode-go":{"claude":{"claude-opus":"minimax-m3"}},"claude":{"claude-haiku":"deepseek-v4-flash"},"codex":{}}`
+	if err := os.WriteFile(path, []byte(hybrid), 0644); err != nil {
+		t.Fatal(err)
+	}
+	all, err := loadAllModelMappings("cloudflare")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if all["opencode-go"]["claude"]["claude-opus"] != "minimax-m3" {
+		t.Fatalf("peer opencode-go section was clobbered: %+v", all["opencode-go"])
+	}
+	if all["cloudflare"]["claude"]["claude-haiku"] != "deepseek-v4-flash" {
+		t.Fatalf("legacy entries not lifted into cloudflare: %+v", all["cloudflare"])
+	}
+}
+
 func TestOneShotMappingFormatWarning(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "model-mapping.json")
@@ -544,7 +637,7 @@ func TestOneShotMappingFormatWarning(t *testing.T) {
 	})
 
 	// first load: warning fires, sentinel is created
-	all, err := loadAllModelMappings()
+	all, err := loadAllModelMappings("")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -566,7 +659,7 @@ func TestOneShotMappingFormatWarning(t *testing.T) {
 
 	// second load: warning is silent (sentinel exists)
 	oldMappingFormatWarned = false // simulate a fresh process
-	_, _ = loadAllModelMappings()
+	_, _ = loadAllModelMappings("")
 	_ = f.Sync()
 	captured, _ = os.ReadFile(capturePath)
 	if len(captured) != 0 {
