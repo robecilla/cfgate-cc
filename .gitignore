@@ -4,5 +4,5 @@ dist/
 *.pid
 .env
 .tmp/
-oc-go-cc
-cfgate-cc
+/oc-go-cc
+/cfgate-cc
