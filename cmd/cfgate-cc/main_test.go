@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -117,6 +118,13 @@ func TestWriteCodexProfileMigratesLegacySections(t *testing.T) {
 
 func TestWriteCodexModelCatalog(t *testing.T) {
 	withTempModelMappingFile(t, filepath.Join(t.TempDir(), "model-mapping.json"))
+	// feed the opencode-go model set through the remote fetcher so the
+	// catalog writer has a deterministic set to work with.
+	withModelFetchers(t, map[string]remoteModelInfo{
+		"deepseek-v4-pro": testRemoteModel("DeepSeek V4 Pro", 128000, "text"),
+		"qwen3.7-max":     testRemoteModel("Qwen 3.7 Max", 128000, "text"),
+		"minimax-m3":      testRemoteModel("MiniMax M3", 512000, "text", "image"),
+	}, nil)
 	path := filepath.Join(t.TempDir(), "ocgo-models.json")
 	if err := writeCodexModelCatalog(path, testProviderCfg); err != nil {
 		t.Fatal(err)
@@ -281,18 +289,18 @@ func testRemoteModel(name string, contextWindow int, modalities ...string) remot
 
 func TestKnownModelIDsPreferOfficialThenRemoteThenFallback(t *testing.T) {
 	withModelFetchers(t, map[string]remoteModelInfo{"remote-b": {}, "remote-a": {}}, []string{"official-b", "official-a"})
-	if got := strings.Join(knownModelIDs(), ","); got != "official-a,official-b" {
-		t.Fatalf("official IDs = %s", got)
+	if got, usedCache, err := knownModelIDs(); err != nil || usedCache || strings.Join(got, ",") != "official-a,official-b" {
+		t.Fatalf("official IDs = %v, usedCache = %v, err = %v", got, usedCache, err)
 	}
 
 	withModelFetchers(t, map[string]remoteModelInfo{"remote-b": {}, "remote-a": {}}, nil)
-	if got := strings.Join(knownModelIDs(), ","); got != "remote-a,remote-b" {
-		t.Fatalf("remote fallback IDs = %s", got)
+	if got, usedCache, err := knownModelIDs(); err != nil || usedCache || strings.Join(got, ",") != "remote-a,remote-b" {
+		t.Fatalf("remote fallback IDs = %v, usedCache = %v, err = %v", got, usedCache, err)
 	}
 
 	withModelFetchers(t, nil, nil)
-	if got := knownModelIDs(); len(got) == 0 || got[0] != fallbackModelIDs[0] {
-		t.Fatalf("hardcoded fallback IDs = %+v", got)
+	if got, usedCache, err := knownModelIDs(); err == nil || usedCache || len(got) != 0 {
+		t.Fatalf("expected (nil, false, err); got (%v, %v, %v)", got, usedCache, err)
 	}
 }
 
@@ -309,17 +317,87 @@ func TestListProviderDispatch(t *testing.T) {
 		defer os.Remove(filepath.Join(dir, "opencode-go.json"))
 
 		cmd := listCmd()
-		buf := &bytes.Buffer{}
-		cmd.SetOut(buf)
-		cmd.SetErr(buf)
+		outBuf, errBuf := &bytes.Buffer{}, &bytes.Buffer{}
+		cmd.SetOut(outBuf)
+		cmd.SetErr(errBuf)
 		if err := cmd.Execute(); err != nil {
 			t.Fatalf("list opencode-go: %v", err)
 		}
-		if !strings.Contains(buf.String(), "minimax-m3") {
-			t.Fatalf("opencode-go list should include model: %s", buf.String())
+		if !strings.Contains(outBuf.String(), "minimax-m3") {
+			t.Fatalf("opencode-go list should include model: %s", outBuf.String())
 		}
-		if !strings.Contains(buf.String(), "provider opencode-go") {
-			t.Fatalf("list should label provider: %s", buf.String())
+		if !strings.Contains(outBuf.String(), "provider opencode-go") {
+			t.Fatalf("list should label provider: %s", outBuf.String())
+		}
+		if strings.Contains(errBuf.String(), "warning:") {
+			t.Fatalf("unexpected warning on success path: %s", errBuf.String())
+		}
+	})
+
+	t.Run("opencode-go warns and uses cached list on refresh failure", func(t *testing.T) {
+		if err := os.WriteFile(filepath.Join(dir, "opencode-go.json"), []byte(`{"upstream_api_key":"k"}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		defer os.Remove(filepath.Join(dir, "opencode-go.json"))
+
+		// stub both fetchers so refreshAllModels() doesn't hit the live
+		// opencode.ai endpoint; otherwise a connected dev machine gets
+		// fresh officialModels, usedCache=false, and the warning assertion
+		// below fails.
+		withModelFetchers(t, nil, nil)
+
+		// one lazyFetcher with a flag-controlled fetch: prime while the
+		// flag is "succeed", then flip to "fail" and let the next refresh
+		// hit the failing path. the fetcher instance — and its cached data
+		// — stays the same across the flip.
+		primed := map[string]remoteModelInfo{"model-a": {}, "model-b": {}}
+		fail := false
+		var failMu sync.Mutex
+		oldRemote := remoteModels
+		remoteModels = newLazyFetcher(func() (map[string]remoteModelInfo, error) {
+			failMu.Lock()
+			defer failMu.Unlock()
+			if fail {
+				return nil, errors.New("simulated offline")
+			}
+			return primed, nil
+		})
+		t.Cleanup(func() { remoteModels = oldRemote })
+
+		if _, err := getRemoteModels(); err != nil {
+			t.Fatalf("prime cache: %v", err)
+		}
+		failMu.Lock()
+		fail = true
+		failMu.Unlock()
+
+		cmd := listCmd()
+		outBuf, errBuf := &bytes.Buffer{}, &bytes.Buffer{}
+		cmd.SetOut(outBuf)
+		cmd.SetErr(errBuf)
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("expected success on stale cache, got: %v", err)
+		}
+		if !strings.Contains(outBuf.String(), "model-a") || !strings.Contains(outBuf.String(), "model-b") {
+			t.Fatalf("cached models missing from output: %s", outBuf.String())
+		}
+		if !strings.Contains(errBuf.String(), "warning:") {
+			t.Fatalf("expected warning on stderr, got: %s", errBuf.String())
+		}
+	})
+
+	t.Run("opencode-go errors when both fetchers fail with no cache", func(t *testing.T) {
+		if err := os.WriteFile(filepath.Join(dir, "opencode-go.json"), []byte(`{"upstream_api_key":"k"}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		defer os.Remove(filepath.Join(dir, "opencode-go.json"))
+
+		withModelFetchers(t, nil, nil)
+		cmd := listCmd()
+		cmd.SetOut(io.Discard)
+		cmd.SetErr(io.Discard)
+		if err := cmd.Execute(); err == nil {
+			t.Fatal("expected error when no data is available")
 		}
 	})
 
