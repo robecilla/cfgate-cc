@@ -115,12 +115,33 @@ func (f *lazyFetcher[T]) get() (T, error) {
 		return data, err
 	}
 	f.mu.RUnlock()
-	return f.forceFetch()
+	return f.getOnce()
+}
+
+// getOnce is the cold-start path for get(): grab the write lock, re-check
+// fetched (so two cold get()s share one fetch, not two), then call f.fetch().
+// ponytail: serialised under f.mu; switch to a sync.Once or a coalescing
+// channel if cold-start latency under concurrent access ever shows up in
+// traces.
+func (f *lazyFetcher[T]) getOnce() (T, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.fetched {
+		return f.data, f.err
+	}
+	f.fetched = true
+	newData, err := f.fetch()
+	if err == nil {
+		f.data = newData
+	}
+	f.err = err
+	return f.data, f.err
 }
 
 // forceFetch always runs the fetch under the write lock, commits data
-// only on success, and updates err either way. used by get() on first
-// access and by refresh() to re-attempt without dropping a cached value.
+// only on success, and updates err either way. used by refresh() to
+// re-attempt without dropping a cached value — distinct from getOnce,
+// which skips the fetch when another goroutine already populated data.
 func (f *lazyFetcher[T]) forceFetch() (T, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -1015,7 +1036,11 @@ func toolMappingCmd(tool string) *cobra.Command {
 		if source == "" || target == "" {
 			return errors.New("source and target models cannot be empty")
 		}
-		if !knownModelForProvider(name, target) {
+		ok, kerr := knownModelForProvider(name, target)
+		if !ok {
+			if kerr != nil {
+				return fmt.Errorf("cannot validate %q for provider %q: %w (run `cfgate-cc list --provider %s` to see the cached model list)", target, name, kerr, name)
+			}
 			return fmt.Errorf("unknown upstream model %q for provider %q; run `cfgate-cc list --provider %s`", target, name, name)
 		}
 		m, err := loadModelMappingsForProvider(name)
@@ -1127,37 +1152,39 @@ func knownOpenCodeModel(model string) bool {
 
 // knownModelForProvider dispatches the "is this model valid for this provider"
 // check. opencode-go has a static/live chain; cloudflare uses its live
-// /v1/models list. unknown providers always return false. loads the active
-// provider's config internally so callers (e.g. mapping set) don't have
-// to thread it through.
-func knownModelForProvider(name, model string) bool {
+// /v1/models list. unknown providers always return (false, nil). the second
+// return is the upstream fetch error, surfaced to the caller so a network
+// failure doesn't masquerade as "unknown model". loads the active provider's
+// config internally so callers (e.g. mapping set) don't have to thread it
+// through.
+func knownModelForProvider(name, model string) (bool, error) {
 	id := modelID(model)
 	switch name {
 	case "opencode-go":
-		ids, _, _ := knownModelIDs()
+		ids, _, kerr := knownModelIDs()
 		for _, candidate := range ids {
 			if candidate == id {
-				return true
+				return true, nil
 			}
 		}
-		return false
+		return false, kerr
 	case "cloudflare":
 		p, err := loadActiveProvider(name)
 		if err != nil {
-			return false
+			return false, err
 		}
 		ids, err := cloudflareModelIDs(p)
 		if err != nil {
-			return false
+			return false, err
 		}
 		for _, candidate := range ids {
 			if candidate == id {
-				return true
+				return true, nil
 			}
 		}
-		return false
+		return false, nil
 	default:
-		return false
+		return false, nil
 	}
 }
 

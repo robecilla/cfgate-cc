@@ -340,6 +340,12 @@ func TestListProviderDispatch(t *testing.T) {
 		}
 		defer os.Remove(filepath.Join(dir, "opencode-go.json"))
 
+		// stub both fetchers so refreshAllModels() doesn't hit the live
+		// opencode.ai endpoint; otherwise a connected dev machine gets
+		// fresh officialModels, usedCache=false, and the warning assertion
+		// below fails.
+		withModelFetchers(t, nil, nil)
+
 		// one lazyFetcher with a flag-controlled fetch: prime while the
 		// flag is "succeed", then flip to "fail" and let the next refresh
 		// hit the failing path. the fetcher instance — and its cached data
