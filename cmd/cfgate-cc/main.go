@@ -66,6 +66,15 @@ type officialModelsResponse struct {
 	} `json:"data"`
 }
 
+// cloudflareModelsResponse matches the cloudflare /ai/models/search shape.
+type cloudflareModelsResponse struct {
+	Success bool `json:"success"`
+	Result  []struct {
+		ID   string `json:"id"`
+		Name string `json:"name"`
+	} `json:"result"`
+}
+
 // remoteModelInfo represents the subset of models.dev metadata ocgo needs.
 type remoteModelInfo struct {
 	ID         string `json:"id"`
@@ -736,13 +745,16 @@ func refreshAllModelsForProvider(name string) {
 	}
 }
 
-// fetchCloudflareModels hits the live /v1/models endpoint on the active
-// cloudflare account and returns the model ids. no static fallback —
-// the REST API is the source of truth, a failure is reported to the user.
-// caller (listCmd) is responsible for dispatching on provider; this helper
-// trusts the URL it gets and doesn't re-validate the prefix.
+// fetchCloudflareModels hits cloudflare's /ai/models/search endpoint and
+// returns the @cf/... model names. no static fallback — the REST API is the
+// source of truth, a failure is reported to the user.
 func fetchCloudflareModels(cfg ProviderConfig) ([]string, error) {
-	url := strings.TrimRight(cfg.UpstreamBaseURL, "/") + "/models"
+	// cfg.UpstreamBaseURL is the inference base (.../accounts/<id>/ai/v1).
+	// model listing lives at (.../accounts/<id>/ai/models/search).
+	url := strings.Replace(cfg.UpstreamBaseURL, "/ai/v1", "/ai/models/search", 1)
+	if url == cfg.UpstreamBaseURL {
+		return nil, fmt.Errorf("fetchCloudflareModels: base URL %q does not contain /ai/v1; cannot derive /ai/models/search", cfg.UpstreamBaseURL)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
@@ -758,14 +770,17 @@ func fetchCloudflareModels(cfg ProviderConfig) ([]string, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("cloudflare models API returned status %d", resp.StatusCode)
 	}
-	var apiResp officialModelsResponse
+	var apiResp cloudflareModelsResponse
 	if err := json.NewDecoder(resp.Body).Decode(&apiResp); err != nil {
 		return nil, fmt.Errorf("failed to decode cloudflare models: %w", err)
 	}
-	ids := make([]string, 0, len(apiResp.Data))
+	if !apiResp.Success {
+		return nil, fmt.Errorf("cloudflare models API: success=false")
+	}
+	ids := make([]string, 0, len(apiResp.Result))
 	seen := map[string]bool{}
-	for _, m := range apiResp.Data {
-		id := strings.TrimSpace(m.ID)
+	for _, m := range apiResp.Result {
+		id := strings.TrimSpace(m.Name)
 		if id != "" && !seen[id] {
 			ids = append(ids, id)
 			seen[id] = true
