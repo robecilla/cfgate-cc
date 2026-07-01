@@ -103,10 +103,18 @@ if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
   echo "GitHub release $TAG already exists; uploading artifacts with --clobber."
   gh release upload "$TAG" "$DIST_DIR"/*.tar.gz "$DIST_DIR/checksums.txt" --repo "$REPO" --clobber
 else
+  # Release notes: set RELEASE_NOTES (inline) or RELEASE_NOTES_FILE (path) for
+  # a hand-written body. unset falls back to --generate-notes.
+  notes_args=(--generate-notes)
+  if [[ -n "${RELEASE_NOTES_FILE:-}" ]]; then
+    notes_args=(--notes-file "$RELEASE_NOTES_FILE")
+  elif [[ -n "${RELEASE_NOTES:-}" ]]; then
+    notes_args=(--notes "$RELEASE_NOTES")
+  fi
   gh release create "$TAG" "$DIST_DIR"/*.tar.gz "$DIST_DIR/checksums.txt" \
     --repo "$REPO" \
     --title "$TAG" \
-    --generate-notes
+    "${notes_args[@]}"
 fi
 
 # Update Homebrew tap formula to install the macOS artifacts.
