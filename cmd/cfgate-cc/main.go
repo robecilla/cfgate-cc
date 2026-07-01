@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"container/list"
 	"context"
 	"encoding/json"
 	"errors"
@@ -145,9 +146,8 @@ type ModelEndpointOverride struct {
 }
 
 type Config struct {
-	APIKey string `json:"api_key"` // local proxy auth, used by claude/codex clients
-	Host   string `json:"host"`    // local proxy bind
-	Port   int    `json:"port"`    // local proxy port (default 3456)
+	Host string `json:"host"` // local proxy bind
+	Port int    `json:"port"` // local proxy port (default 3456)
 }
 
 // ProviderConfig is the per-provider upstream config. each named provider
@@ -293,10 +293,20 @@ type OAICallFunction struct {
 	Arguments string `json:"arguments"`
 }
 
+// reasoningContentCache holds the last reasoning_content per tool call id.
+// bounded LRU; the oldest entries fall off when the cap is reached.
+// ponytail: global lock + list.List, not a third-party LRU.
+const reasoningCacheCap = 1024
+
+type reasoningCacheEntry struct {
+	key, value string
+}
+
 var reasoningContentCache = struct {
 	sync.Mutex
-	byCallID map[string]string
-}{byCallID: map[string]string{}}
+	ll   *list.List
+	keys map[string]*list.Element
+}{ll: list.New(), keys: map[string]*list.Element{}}
 
 func main() {
 	root := &cobra.Command{Use: appName, Short: "Proxy for Claude Code and Codex CLI with a pluggable openai/anthropic-compatible upstream (cloudflare ai gateway, opencode-go/zen, etc.)", Version: version}
@@ -1372,6 +1382,7 @@ func stopCmd() *cobra.Command {
 			return err
 		}
 		_ = os.Remove(pidFile())
+		_ = os.Remove(activeProviderFile())
 		if err := p.Kill(); err != nil {
 			return err
 		}
@@ -1406,7 +1417,9 @@ func statusCmd() *cobra.Command {
 func runServer(cfg Config, p ProviderConfig) error {
 	if err := os.MkdirAll(configDir(), 0755); err == nil {
 		_ = os.WriteFile(pidFile(), []byte(fmt.Sprint(os.Getpid())), 0644)
+		_ = os.WriteFile(activeProviderFile(), []byte(p.Name), 0644)
 		defer os.Remove(pidFile())
+		defer os.Remove(activeProviderFile())
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("ok\n")) })
@@ -1510,7 +1523,8 @@ func proxyChatCompletions(w http.ResponseWriter, r *http.Request, cfg ProviderCo
 			return
 		}
 		if or.Stream {
-			streamChatCompletionsFromAnthropic(w, resp.Body, or.Model)
+			includeUsage := or.StreamOptions != nil && or.StreamOptions.IncludeUsage
+			streamChatCompletionsFromAnthropic(w, resp.Body, or.Model, includeUsage)
 			return
 		}
 		writeChatCompletionsResponseFromAnthropic(w, resp.Body, or.Model)
@@ -2615,8 +2629,11 @@ func cachedReasoningContent(calls []OAIToolCall) string {
 	reasoningContentCache.Lock()
 	defer reasoningContentCache.Unlock()
 	for _, call := range calls {
-		if reasoning := reasoningContentCache.byCallID[call.ID]; reasoning != "" {
-			return reasoning
+		if e, ok := reasoningContentCache.keys[call.ID]; ok {
+			reasoningContentCache.ll.MoveToFront(e)
+			if v := e.Value.(*reasoningCacheEntry).value; v != "" {
+				return v
+			}
 		}
 	}
 	if len(calls) > 0 {
@@ -2636,9 +2653,25 @@ func cacheReasoningContent(calls []OAIToolCall, reasoning string) {
 	reasoningContentCache.Lock()
 	defer reasoningContentCache.Unlock()
 	for _, call := range calls {
-		if call.ID != "" {
-			reasoningContentCache.byCallID[call.ID] = reasoning
+		if call.ID == "" {
+			continue
 		}
+		if e, ok := reasoningContentCache.keys[call.ID]; ok {
+			e.Value.(*reasoningCacheEntry).value = reasoning
+			reasoningContentCache.ll.MoveToFront(e)
+			continue
+		}
+		for reasoningContentCache.ll.Len() >= reasoningCacheCap {
+			oldest := reasoningContentCache.ll.Back()
+			if oldest == nil {
+				break
+			}
+			evicted := oldest.Value.(*reasoningCacheEntry)
+			reasoningContentCache.ll.Remove(oldest)
+			delete(reasoningContentCache.keys, evicted.key)
+		}
+		entry := &reasoningCacheEntry{key: call.ID, value: reasoning}
+		reasoningContentCache.keys[call.ID] = reasoningContentCache.ll.PushFront(entry)
 	}
 }
 
@@ -2896,8 +2929,12 @@ func mergeUsage(a, b tokenUsage) tokenUsage {
 	if b.CachedInputTokens != 0 {
 		a.CachedInputTokens = b.CachedInputTokens
 	}
-	if a.TotalTokens == 0 && (a.InputTokens > 0 || a.OutputTokens > 0) {
-		a.TotalTokens = a.InputTokens + a.OutputTokens
+	// ponytail: assumes upstream total == input+output. every current upstream
+	// (anthropic, openai) follows this; revisit if one splits tool-use tokens.
+	if a.InputTokens > 0 || a.OutputTokens > 0 {
+		if sum := a.InputTokens + a.OutputTokens; sum > a.TotalTokens {
+			a.TotalTokens = sum
+		}
 	}
 	return a
 }
@@ -3197,11 +3234,12 @@ func writeResponsesResponseFromAnthropic(w http.ResponseWriter, body io.Reader, 
 	_ = json.NewEncoder(w).Encode(map[string]any{"id": "resp_cfgate", "object": "response", "created_at": time.Now().Unix(), "model": model, "status": "completed", "output": output, "usage": responsesUsage(parsed.Usage)})
 }
 
-func streamChatCompletionsFromAnthropic(w http.ResponseWriter, body io.Reader, model string) {
+func streamChatCompletionsFromAnthropic(w http.ResponseWriter, body io.Reader, model string, includeUsage bool) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	flusher, _ := w.(http.Flusher)
 	writeChatCompletionChunk(w, model, map[string]any{"role": "assistant"}, nil)
 	tools := map[int]streamedResponseToolCall{}
+	usage := tokenUsage{}
 	readSSE(body, func(_ string, data []byte) bool {
 		var v map[string]any
 		if json.Unmarshal(data, &v) != nil {
@@ -3209,6 +3247,10 @@ func streamChatCompletionsFromAnthropic(w http.ResponseWriter, body io.Reader, m
 		}
 		typ, _ := v["type"].(string)
 		switch typ {
+		case "message_start":
+			if msg, _ := v["message"].(map[string]any); msg != nil {
+				usage = mergeUsage(usage, usageFromAnyMap(msg["usage"]))
+			}
 		case "content_block_start":
 			idx := intFromAny(v["index"])
 			block, _ := v["content_block"].(map[string]any)
@@ -3237,6 +3279,8 @@ func streamChatCompletionsFromAnthropic(w http.ResponseWriter, body io.Reader, m
 					writeChatCompletionChunk(w, model, map[string]any{"tool_calls": []map[string]any{{"index": tool.OutputIndex, "function": map[string]any{"arguments": part}}}}, nil)
 				}
 			}
+		case "message_delta":
+			usage = mergeUsage(usage, usageFromAnyMap(v["usage"]))
 		case "message_stop":
 			return false
 		}
@@ -3250,6 +3294,9 @@ func streamChatCompletionsFromAnthropic(w http.ResponseWriter, body io.Reader, m
 		finish = "tool_calls"
 	}
 	writeChatCompletionChunk(w, model, map[string]any{}, &finish)
+	if includeUsage && usage.Present {
+		writeChatCompletionUsageChunk(w, model, openAIUsage(usage))
+	}
 	fmt.Fprint(w, "data: [DONE]\n\n")
 }
 
@@ -3259,6 +3306,11 @@ func writeChatCompletionChunk(w io.Writer, model string, delta map[string]any, f
 		choice["finish_reason"] = *finishReason
 	}
 	b, _ := json.Marshal(map[string]any{"id": "chatcmpl_cfgate", "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []map[string]any{choice}})
+	fmt.Fprintf(w, "data: %s\n\n", b)
+}
+
+func writeChatCompletionUsageChunk(w io.Writer, model string, usage map[string]any) {
+	b, _ := json.Marshal(map[string]any{"id": "chatcmpl_cfgate", "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model, "choices": []any{}, "usage": usage})
 	fmt.Fprintf(w, "data: %s\n\n", b)
 }
 
@@ -3609,7 +3661,17 @@ func ensureServer(base, providerName string) error {
 
 func startLaunchServer(base, providerName string) (*exec.Cmd, error) {
 	if healthy(base) {
-		return nil, nil
+		active, _ := readActiveProvider()
+		if !shouldRestartForLaunch(active, providerName) {
+			if active == "" && providerName != "" {
+				fmt.Fprintf(os.Stderr, "cfgate-cc: running proxy has no recorded provider; reusing it instead of switching to %q. run `cfgate-cc stop` to force a restart.\n", providerName)
+			}
+			return nil, nil
+		}
+		if err := stopRunningServer(); err != nil {
+			return nil, err
+		}
+		// fall through: spawn a fresh server for the new provider.
 	}
 	cmd, err := startServerProcess(false, providerName)
 	if err != nil {
@@ -3627,6 +3689,44 @@ func startLaunchServer(base, providerName string) (*exec.Cmd, error) {
 	return nil, errors.New("proxy did not start")
 }
 
+// shouldRestartForLaunch reports whether a healthy running server should be
+// killed and restarted. an empty active provider means "unknown" (legacy
+// startup or first launch) — keep the running server to preserve behavior
+// for users upgrading into a config without an active-provider file.
+func shouldRestartForLaunch(activeProvider, requested string) bool {
+	return activeProvider != "" && activeProvider != requested
+}
+
+func readActiveProvider() (string, error) {
+	b, err := os.ReadFile(activeProviderFile())
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(b)), nil
+}
+
+// stopRunningServer kills the process recorded in pidFile and removes
+// both the pid file and the active-provider file. used by
+// startLaunchServer when the running server's provider doesn't match
+// the requested one. a no-op when there's no pid file.
+func stopRunningServer() error {
+	pid, err := readPID()
+	if err != nil {
+		return nil
+	}
+	p, err := os.FindProcess(pid)
+	if err != nil {
+		return nil
+	}
+	_ = os.Remove(pidFile())
+	_ = os.Remove(activeProviderFile())
+	if err := p.Kill(); err != nil {
+		return err
+	}
+	_, _ = p.Wait()
+	return nil
+}
+
 func stopManagedServer(cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil {
 		return
@@ -3634,6 +3734,7 @@ func stopManagedServer(cmd *exec.Cmd) {
 	_ = cmd.Process.Kill()
 	_, _ = cmd.Process.Wait()
 	_ = os.Remove(pidFile())
+	_ = os.Remove(activeProviderFile())
 }
 
 func healthy(base string) bool {
@@ -3694,8 +3795,9 @@ func configDir() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".config", "ocgo")
 }
-func configFile() string { return filepath.Join(configDir(), "config.json") }
-func pidFile() string    { return filepath.Join(configDir(), "ocgo.pid") }
+func configFile() string       { return filepath.Join(configDir(), "config.json") }
+func pidFile() string          { return filepath.Join(configDir(), "ocgo.pid") }
+func activeProviderFile() string { return filepath.Join(configDir(), "active-provider") }
 
 var modelMappingFile = func() string { return filepath.Join(configDir(), "model-mapping.json") }
 
@@ -3929,12 +4031,14 @@ func loadConfig() (Config, error) {
 	migrateConfigIfNeeded()
 	migrateCloudflareURLIfNeeded()
 	cfg := Config{
-		Host:   defaultHost,
-		Port:   defaultPort,
-		APIKey: os.Getenv("OCGO_API_KEY"),
+		Host: defaultHost,
+		Port: defaultPort,
 	}
 	b, err := os.ReadFile(configFile())
 	if err == nil {
+		if bytes.Contains(b, []byte(`"api_key"`)) {
+			fmt.Fprintln(os.Stderr, "cfgate-cc: config.json contains api_key which is no longer used; remove it to silence this warning.")
+		}
 		_ = json.Unmarshal(b, &cfg)
 	}
 	if cfg.Host == "" {
@@ -3943,8 +4047,6 @@ func loadConfig() (Config, error) {
 	if cfg.Port == 0 {
 		cfg.Port = defaultPort
 	}
-	// local proxy api_key is optional — serve only needs it if a client sends
-	// an Authorization header.
 	return cfg, nil
 }
 
@@ -4118,9 +4220,11 @@ func migrateConfigIfNeeded() {
 	}
 	p.UpstreamBaseURL = url
 	if err := os.MkdirAll(configDir(), 0755); err != nil {
+		fmt.Fprintln(os.Stderr, "config migration: mkdir:", err)
 		return
 	}
 	if err := saveProviderConfig(name, p); err != nil {
+		fmt.Fprintln(os.Stderr, "config migration: save provider:", err)
 		return
 	}
 	delete(raw, "upstream_base_url")
@@ -4131,9 +4235,12 @@ func migrateConfigIfNeeded() {
 	delete(raw, "endpoint_overrides")
 	out, err := json.MarshalIndent(raw, "", "  ")
 	if err != nil {
+		fmt.Fprintln(os.Stderr, "config migration: marshal config:", err)
 		return
 	}
-	_ = os.WriteFile(configFile(), append(out, '\n'), 0600)
+	if err := os.WriteFile(configFile(), append(out, '\n'), 0600); err != nil {
+		fmt.Fprintln(os.Stderr, "config migration: write config:", err)
+	}
 }
 
 // providerForUpstreamURL picks the provider name from a URL pattern.

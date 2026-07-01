@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"container/list"
 	"context"
 	"encoding/json"
 	"errors"
@@ -1455,9 +1456,165 @@ func TestStreamResponsesIncludesCompletedUsage(t *testing.T) {
 	}
 }
 
+func TestStreamResponsesFromAnthropicAccumulatesUsage(t *testing.T) {
+	body := strings.NewReader(strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":100,"output_tokens":0,"total_tokens":100}}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}`,
+		``,
+		`event: message_delta`,
+		`data: {"type":"message_delta","usage":{"input_tokens":100,"output_tokens":50,"total_tokens":50}}`,
+		``,
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+		``,
+	}, "\n"))
+	w := httptest.NewRecorder()
+	streamResponsesFromAnthropic(w, body, "kimi-k2.6")
+	out := w.Body.String()
+	if !strings.Contains(out, `"total_tokens":150`) {
+		t.Fatalf("total_tokens should be 150 (100 input + 50 output), got:\n%s", out)
+	}
+}
+
+func TestStreamChatCompletionsFromAnthropicForwardsUsage(t *testing.T) {
+	body := strings.NewReader(strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":100,"output_tokens":0,"total_tokens":100}}}`,
+		``,
+		`event: content_block_delta`,
+		`data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hi"}}`,
+		``,
+		`event: message_delta`,
+		`data: {"type":"message_delta","usage":{"input_tokens":100,"output_tokens":50,"total_tokens":50}}`,
+		``,
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+		``,
+	}, "\n"))
+	w := httptest.NewRecorder()
+	streamChatCompletionsFromAnthropic(w, body, "kimi-k2.6", true)
+	out := w.Body.String()
+	for _, want := range []string{`"prompt_tokens":100`, `"completion_tokens":50`, `"total_tokens":150`} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %q in:\n%s", want, out)
+		}
+	}
+}
+
+func TestStreamChatCompletionsFromAnthropicSkipsUsageWhenNotRequested(t *testing.T) {
+	body := strings.NewReader(strings.Join([]string{
+		`event: message_start`,
+		`data: {"type":"message_start","message":{"usage":{"input_tokens":100,"output_tokens":0}}}`,
+		``,
+		`event: message_stop`,
+		`data: {"type":"message_stop"}`,
+		``,
+	}, "\n"))
+	w := httptest.NewRecorder()
+	streamChatCompletionsFromAnthropic(w, body, "kimi-k2.6", false)
+	if strings.Contains(w.Body.String(), `"usage"`) {
+		t.Fatalf("usage chunk should not appear when includeUsage=false:\n%s", w.Body.String())
+	}
+}
+
+func TestReasoningContentCacheBoundedLRU(t *testing.T) {
+	reasoningContentCache.Lock()
+	reasoningContentCache.ll = list.New()
+	reasoningContentCache.keys = map[string]*list.Element{}
+	reasoningContentCache.Unlock()
+
+	// fill to cap-1, re-touch the first key (moves to front), then push one
+	// more. the first key should survive; the second key (oldest now) should
+	// be the one evicted.
+	for i := 0; i < reasoningCacheCap-1; i++ {
+		cacheReasoningContent([]OAIToolCall{{ID: fmt.Sprintf("call_%d", i), Function: OAICallFunction{Name: "x"}}}, fmt.Sprintf("r%d", i))
+	}
+	if got := cachedReasoningContent([]OAIToolCall{{ID: "call_0"}}); got != "r0" {
+		t.Fatalf("re-touch should not lose the first key, got %q", got)
+	}
+	cacheReasoningContent([]OAIToolCall{{ID: fmt.Sprintf("call_%d", reasoningCacheCap-1), Function: OAICallFunction{Name: "x"}}}, fmt.Sprintf("r%d", reasoningCacheCap-1))
+	if got := cachedReasoningContent([]OAIToolCall{{ID: "call_0"}}); got != "r0" {
+		t.Fatalf("call_0 should still be present after re-touch, got %q", got)
+	}
+
+	// fill past the cap. first key must be evicted; later keys must remain.
+	for i := 0; i <= reasoningCacheCap; i++ {
+		cacheReasoningContent([]OAIToolCall{{ID: fmt.Sprintf("call_%d", i), Function: OAICallFunction{Name: "x"}}}, fmt.Sprintf("r%d", i))
+	}
+	reasoningContentCache.Lock()
+	size := len(reasoningContentCache.keys)
+	_, hasFirst := reasoningContentCache.keys["call_0"]
+	_, hasLast := reasoningContentCache.keys[fmt.Sprintf("call_%d", reasoningCacheCap)]
+	reasoningContentCache.Unlock()
+
+	if size > reasoningCacheCap {
+		t.Fatalf("cache size %d exceeds cap %d", size, reasoningCacheCap)
+	}
+	if hasFirst {
+		t.Fatal("call_0 should have been evicted")
+	}
+	if !hasLast {
+		t.Fatalf("call_%d should still be present", reasoningCacheCap)
+	}
+}
+
+func TestMergeUsagePreservesUpstreamTotal(t *testing.T) {
+	// an upstream that already reports total == input+output should not be
+	// clobbered by the sum-fallback.
+	a := tokenUsage{Present: true, InputTokens: 100, OutputTokens: 50, TotalTokens: 150}
+	b := tokenUsage{Present: true, InputTokens: 100, OutputTokens: 50, TotalTokens: 150}
+	got := mergeUsage(a, b)
+	if got.TotalTokens != 150 {
+		t.Fatalf("mergeUsage should preserve upstream total=150, got %d", got.TotalTokens)
+	}
+}
+
+func TestShouldRestartForLaunch(t *testing.T) {
+	cases := []struct {
+		active, requested string
+		want              bool
+	}{
+		{"", "opencode-go", false},         // unknown active → keep running
+		{"opencode-go", "opencode-go", false}, // match → keep
+		{"opencode-go", "cloudflare", true},   // mismatch → restart
+	}
+	for _, c := range cases {
+		if got := shouldRestartForLaunch(c.active, c.requested); got != c.want {
+			t.Errorf("shouldRestartForLaunch(%q,%q)=%v want %v", c.active, c.requested, got, c.want)
+		}
+	}
+}
+
+func TestActiveProviderRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
+	if err := os.WriteFile(activeProviderFile(), []byte("cloudflare"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readActiveProvider()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "cloudflare" {
+		t.Fatalf("readActiveProvider=%q want cloudflare", got)
+	}
+}
+
+func TestStopRunningServerNoPidFileIsNoop(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
+	if err := stopRunningServer(); err != nil {
+		t.Fatalf("stopRunningServer with no pid file should be a no-op, got %v", err)
+	}
+}
+
 func TestStreamAnthropicForwardsToolCalls(t *testing.T) {
 	reasoningContentCache.Lock()
-	reasoningContentCache.byCallID = map[string]string{}
+	reasoningContentCache.ll = list.New()
+	reasoningContentCache.keys = map[string]*list.Element{}
 	reasoningContentCache.Unlock()
 	body := strings.NewReader(strings.Join([]string{
 		`data: {"choices":[{"delta":{"reasoning_content":"Need pwd.","tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"Bash","arguments":"{\"command\":"}}]}}]}`,
@@ -1487,7 +1644,8 @@ func TestStreamAnthropicForwardsToolCalls(t *testing.T) {
 
 func TestStreamResponsesForwardsToolCalls(t *testing.T) {
 	reasoningContentCache.Lock()
-	reasoningContentCache.byCallID = map[string]string{}
+	reasoningContentCache.ll = list.New()
+	reasoningContentCache.keys = map[string]*list.Element{}
 	reasoningContentCache.Unlock()
 	body := strings.NewReader(strings.Join([]string{
 		`data: {"choices":[{"delta":{"reasoning_content":"I should call the tool.","tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"shell","arguments":"{\"cmd\":"}}]}}]}`,
@@ -1755,8 +1913,8 @@ func TestMigrateConfigMovesUpstreamToProviderFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.APIKey != "local" {
-		t.Fatalf("local api_key lost: %q", cfg.APIKey)
+	if cfg.Host != "127.0.0.1" || cfg.Port != 3456 {
+		t.Fatalf("config lost: %+v", cfg)
 	}
 
 	p, err := loadProviderConfig("cloudflare")
