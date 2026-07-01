@@ -1553,8 +1553,10 @@ func proxyMessages(w http.ResponseWriter, r *http.Request, cfg ProviderConfig) {
 		dlogUpstreamResp(resp)
 		if isSSEResponse(resp) {
 			sr := &streamReader{r: resp.Body, label: "messages", start: time.Now()}
-			streamAnthropic(w, sr, ar.Model)
-			dlogClientResp("messages", http.StatusOK)
+			copyHeaders(w.Header(), resp.Header)
+			w.WriteHeader(resp.StatusCode)
+			_, _ = io.Copy(w, sr)
+			dlogClientResp("messages", resp.StatusCode)
 			return
 		}
 		bodyBytes, _ := io.ReadAll(resp.Body)
@@ -1689,6 +1691,7 @@ func proxyChatCompletions(w http.ResponseWriter, r *http.Request, cfg ProviderCo
 	if resp.StatusCode >= 400 {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		dlogBody("upstream", bodyBytes)
+		copyHeaders(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		dlogClientResp("chat", resp.StatusCode)
 		_, _ = w.Write(bodyBytes)
@@ -4596,11 +4599,11 @@ type streamReader struct {
 
 func (s *streamReader) Read(p []byte) (int, error) {
 	n, err := s.r.Read(p)
-	if n > 0 {
+	if n > 0 && debugEnabled {
 		s.bytes += int64(n)
 		s.scan(p[:n])
 	}
-	if err == io.EOF && !s.logged {
+	if err == io.EOF && debugEnabled && !s.logged {
 		s.logged = true
 		s.logEnd()
 	}
