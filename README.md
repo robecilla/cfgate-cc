@@ -24,7 +24,7 @@
 
 `cfgate-cc` is a fork of [emanuelcasco/ocgo](https://github.com/emanuelcasco/ocgo) that replaces the hardcoded opencode-go upstream with a pluggable one. it lets [Claude Code](https://docs.anthropic.com/en/docs/claude-code) and [Codex CLI](https://developers.openai.com/codex/cli/) run against any openai-compatible provider — Cloudflare AI Gateway, OpenRouter, OpenCode Go, or a self-hosted box.
 
-the binary is small (one file, single go module), MIT-licensed, and built on ocgo's proven request/response translation. the only thing we changed is the upstream.
+the binary is small (one file, single go module), MIT-licensed, and built on ocgo's proven request/response translation. the upstream is now pluggable and the env-var surface is renamed to `CFGATE_CC_*`.
 
 ```bash
 # 1. configure an upstream
@@ -37,11 +37,11 @@ cfgate-cc launch claude --provider cloudflare --model workers-ai/@cf/zai-org/glm
 cfgate-cc launch codex  --provider cloudflare --model workers-ai/@cf/zai-org/glm-5.2
 ```
 
-if you'd rather keep the env-var style, `OCGO_UPSTREAM_BASE_URL` / `OCGO_UPSTREAM_API_KEY` still override the active provider's file at request time. with no provider configured yet, you must still tell cfgate-cc which upstream to use — pass `--provider` or set `$OCGO_PROVIDER`, the env vars alone don't pick one.
+if you'd rather keep the env-var style, `CFGATE_CC_UPSTREAM_BASE_URL` / `CFGATE_CC_UPSTREAM_API_KEY` still override the active provider's file at request time. with no provider configured yet, you must still tell cfgate-cc which upstream to use — pass `--provider` or set `$CFGATE_CC_PROVIDER`, the env vars alone don't pick one.
 
 ## upstream config
 
-`cfgate-cc` keeps one config file per upstream provider under `~/.config/ocgo/` (override with `CFGATE_CC_CONFIG_DIR`):
+`cfgate-cc` keeps one config file per upstream provider under `~/.config/cfgate-cc/` (override with `CFGATE_CC_CONFIG_DIR`):
 
 | file | written by | purpose |
 |---|---|---|
@@ -49,10 +49,10 @@ if you'd rather keep the env-var style, `OCGO_UPSTREAM_BASE_URL` / `OCGO_UPSTREA
 | `opencode-go.json` | `setup opencode-go` | opencode-go / zen upstream |
 | `cloudflare.json` | `setup cloudflare` | cloudflare ai gateway upstream |
 
-`OCGO_UPSTREAM_*` env vars still work and override the active provider's file at request time. set `$OCGO_PROVIDER` (or pass `--provider`) to pick which one wins when both are configured.
+`CFGATE_CC_UPSTREAM_*` env vars still work and override the active provider's file at request time. set `$CFGATE_CC_PROVIDER` (or pass `--provider`) to pick which one wins when both are configured.
 
 ```json5
-// ~/.config/ocgo/cloudflare.json
+// ~/.config/cfgate-cc/cloudflare.json
 {
   "upstream_base_url": "https://api.cloudflare.com/client/v4/accounts/<account>/ai/v1",
   "upstream_api_key": "<your-token>",
@@ -63,11 +63,11 @@ if you'd rather keep the env-var style, `OCGO_UPSTREAM_BASE_URL` / `OCGO_UPSTREA
 
 | field | env var (overrides file) | notes |
 |---|---|---|
-| `upstream_base_url` | `OCGO_UPSTREAM_BASE_URL` | the cloudflare REST API endpoint. `/chat/completions` is appended automatically. |
-| `upstream_api_key` | `OCGO_UPSTREAM_API_KEY` | bearer / x-api-key value |
-| `upstream_auth` | `OCGO_UPSTREAM_AUTH` | `bearer` (default), `x-api-key`, `header`, or `both` (sends `Authorization: Bearer` *and* `x-api-key` — needed for opencode-go, whose `/chat/completions` and `/v1/messages` disagree on the header) |
-| `upstream_auth_hdr` | `OCGO_UPSTREAM_AUTH_HDR` | header name when `upstream_auth=header` |
-| `upstream_extra_hdr` | `OCGO_UPSTREAM_EXTRA_HDR` | extra headers as json object |
+| `upstream_base_url` | `CFGATE_CC_UPSTREAM_BASE_URL` | the cloudflare REST API endpoint. `/chat/completions` is appended automatically. |
+| `upstream_api_key` | `CFGATE_CC_UPSTREAM_API_KEY` | bearer / x-api-key value |
+| `upstream_auth` | `CFGATE_CC_UPSTREAM_AUTH` | `bearer` (default), `x-api-key`, `header`, or `both` (sends `Authorization: Bearer` *and* `x-api-key` — needed for opencode-go, whose `/chat/completions` and `/v1/messages` disagree on the header) |
+| `upstream_auth_hdr` | `CFGATE_CC_UPSTREAM_AUTH_HDR` | header name when `upstream_auth=header` |
+| `upstream_extra_hdr` | `CFGATE_CC_UPSTREAM_EXTRA_HDR` | extra headers as json object |
 | `gateway` | — | cloudflare AI gateway id. sent as `cf-aig-gateway-id` only for workers-ai (`@cf/...`) models; third-party gateway models use the default gateway and don't need the header. |
 | `endpoint_overrides` | — | glob → route mapping, e.g. `[{ "pattern": "claude-*", "route": "anthropic" }]` |
 
@@ -76,14 +76,14 @@ if you'd rather keep the env-var style, `OCGO_UPSTREAM_BASE_URL` / `OCGO_UPSTREA
 resolution order (first match wins):
 
 1. `--provider` flag on `launch` / `serve` / `status` / `list` / `mapping`
-2. `$OCGO_PROVIDER` env var
+2. `$CFGATE_CC_PROVIDER` env var
 3. the single configured provider (if exactly one of `opencode-go.json` / `cloudflare.json` exists)
 4. error if multiple providers are configured and nothing else pins one down
 
 ```bash
 cfgate-cc launch claude --provider cloudflare --model workers-ai/@cf/zai-org/glm-5.2
 cfgate-cc launch codex --provider opencode-go --model kimi-k2.6
-OCGO_PROVIDER=cloudflare cfgate-cc serve -b
+CFGATE_CC_PROVIDER=cloudflare cfgate-cc serve -b
 cfgate-cc list --provider cloudflare
 cfgate-cc mapping --provider cloudflare claude set claude-opus workers-ai/@cf/zai-org/glm-5.2
 ```
@@ -95,7 +95,7 @@ cfgate-cc mapping --provider cloudflare claude set claude-opus workers-ai/@cf/za
 `cfgate-cc` lets you remap the model id claude/codex sends to a different upstream model. the file is per-provider, so the same source model can map to different upstreams depending on which provider is active:
 
 ```json5
-// ~/.config/ocgo/model-mapping.json
+// ~/.config/cfgate-cc/model-mapping.json
 {
   "opencode-go": {
     "claude": { "claude-opus": "minimax-m3", "claude-sonnet": "qwen3.7-max" },
@@ -125,16 +125,16 @@ the mapping file used to be tool-scoped (`{"claude": {...}, "codex": {...}}`). i
 cfgate-cc: migrated legacy model-mapping.json into "opencode-go" section (one-time)
 ```
 
-the migration needs an active provider. with multiple providers configured and no `--provider` / `$OCGO_PROVIDER`, the legacy file is left alone and a one-shot warning fires:
+the migration needs an active provider. with multiple providers configured and no `--provider` / `$CFGATE_CC_PROVIDER`, the legacy file is left alone and a one-shot warning fires:
 
-> warning: `~/.config/ocgo/model-mapping.json` is in the old tool-scoped format. run `cfgate-cc mapping --provider <name> <tool> set ...` to migrate per provider.
+> warning: `~/.config/cfgate-cc/model-mapping.json` is in the old tool-scoped format. run `cfgate-cc mapping --provider <name> <tool> set ...` to migrate per provider.
 
-the warning is gated by a sentinel at `~/.config/ocgo/model-mapping.migrated` — it fires once per user, not once per process.
+the warning is gated by a sentinel at `~/.config/cfgate-cc/model-mapping.migrated` — it fires once per user, not once per process.
 
 ## cloudflare ai gateway example
 
 ```bash
-# one-time setup (writes ~/.config/ocgo/cloudflare.json)
+# one-time setup (writes ~/.config/cfgate-cc/cloudflare.json)
 cfgate-cc setup cloudflare --token <token> --account <account> --gateway <gateway>
 # each flag also reads from $CLOUDFLARE_API_TOKEN, $CLOUDFLARE_ACCOUNT_ID,
 # $CLOUDFLARE_GATEWAY_ID respectively. pass --force to overwrite an existing
@@ -147,22 +147,22 @@ cfgate-cc launch claude --provider cloudflare --model workers-ai/@cf/zai-org/glm
 #   --config (codex only) write the codex profile but don't launch codex
 ```
 
-or, if you'd rather keep the fish-alias style, `OCGO_UPSTREAM_*` still overrides the file:
+or, if you'd rather keep the fish-alias style, `CFGATE_CC_UPSTREAM_*` still overrides the file:
 
 ```bash
-alias claude-cf 'OCGO_PROVIDER=cloudflare cfgate-cc launch claude --model workers-ai/@cf/zai-org/glm-5.2 -- $argv'
+alias claude-cf 'CFGATE_CC_PROVIDER=cloudflare cfgate-cc launch claude --model workers-ai/@cf/zai-org/glm-5.2 -- $argv'
 
 claude-cf "echo hi"
 ```
 
 the model id for cloudflare workers-ai accepts both `workers-ai/@cf/...` and bare `@cf/...` — the `workers-ai/` prefix is stripped automatically. the full list of available cloudflare ai gateway model ids lives in the [cloudflare ai models docs](https://developers.cloudflare.com/ai/models/index.md).
 
-## opencode-go (ocgo compat)
+## opencode-go
 
 ```bash
-# one-time setup (writes ~/.config/ocgo/opencode-go.json)
+# one-time setup (writes ~/.config/cfgate-cc/opencode-go.json)
 cfgate-cc setup opencode-go --api-key <key>
-# falls back to $OCGO_API_KEY when --api-key is omitted.
+# falls back to $CFGATE_CC_API_KEY when --api-key is omitted.
 
 # use it
 cfgate-cc launch claude --provider opencode-go --model kimi-k2.6
@@ -179,15 +179,13 @@ if you have an older `config.json` with the `upstream_*` fields inline, the firs
 
 it's a one-shot, runs in `loadConfig`, and is a no-op once the upstream fields are gone from `config.json`. if a provider file already exists for the target, the migration leaves your `config.json` alone — you have two configs to reconcile, do it by hand.
 
-## side-by-side with ocgo
+## custom config dir
 
-set `CFGATE_CC_CONFIG_DIR` to keep cfgate-cc's config separate from a running ocgo install:
+set `CFGATE_CC_CONFIG_DIR` to redirect the config dir (defaults to `~/.config/cfgate-cc/`):
 
 ```bash
-CFGATE_CC_CONFIG_DIR=~/.config/cfgate-cc cfgate-cc serve -b
+CFGATE_CC_CONFIG_DIR=~/.config/cfgate-cc-staging cfgate-cc serve -b
 ```
-
-defaults to `~/.config/ocgo` for ocgo compat.
 
 ## features
 
@@ -198,7 +196,6 @@ defaults to `~/.config/ocgo` for ocgo compat.
 - per-model endpoint routing via `endpoint_overrides` (glob → openai or anthropic)
 - per-provider model mapping (claude → upstream model, codex → upstream model)
 - streaming text and tool-call translation
-- ocgo-compatible: same proxy lifecycle, same codex profile management, same env vars
 
 ## installation
 

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"os"
 	"os/exec"
@@ -367,7 +368,7 @@ func setupOpencodeGoCmd() *cobra.Command {
 		Short: "Save your OpenCode Go API key",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if strings.TrimSpace(key) == "" {
-				key = os.Getenv("OCGO_API_KEY")
+				key = os.Getenv("CFGATE_CC_API_KEY")
 			}
 			if strings.TrimSpace(key) == "" {
 				fmt.Print("Upstream provider API key: ")
@@ -519,7 +520,7 @@ func listCmd() *cobra.Command {
 			return fmt.Errorf("list: unsupported provider %q", providerName)
 		}
 	}}
-	cmd.Flags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $OCGO_PROVIDER or the single configured provider")
+	cmd.Flags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $CFGATE_CC_PROVIDER or the single configured provider")
 	return cmd
 }
 
@@ -1001,7 +1002,7 @@ func warnOldMappingFormatOnce() {
 
 func mappingCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "mapping", Short: "Manage tool model mappings to upstream models"}
-	cmd.PersistentFlags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $OCGO_PROVIDER or the single configured provider")
+	cmd.PersistentFlags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $CFGATE_CC_PROVIDER or the single configured provider")
 	cmd.AddCommand(toolMappingCmd("claude"), toolMappingCmd("codex"))
 	return cmd
 }
@@ -1370,7 +1371,7 @@ func launchCmd() *cobra.Command {
 	}}
 	claude.Flags().StringVar(&model, "model", "", "Upstream model ID")
 	claude.Flags().BoolVar(&yes, "yes", false, "Allow Claude Code to skip permission prompts")
-	claude.Flags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $OCGO_PROVIDER or the single configured provider")
+	claude.Flags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $CFGATE_CC_PROVIDER or the single configured provider")
 	codex := &cobra.Command{Use: "codex [-- codex args...]", Short: "Launch Codex CLI through the configured upstream provider", Args: cobra.ArbitraryArgs, RunE: func(cmd *cobra.Command, args []string) error {
 		cfg, err := loadConfig()
 		if err != nil {
@@ -1421,7 +1422,7 @@ func launchCmd() *cobra.Command {
 	}}
 	codex.Flags().StringVar(&model, "model", "", "Upstream model ID")
 	codex.Flags().BoolVar(&codexConfigOnly, "config", false, "Configure Codex profile without launching")
-	codex.Flags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $OCGO_PROVIDER or the single configured provider")
+	codex.Flags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $CFGATE_CC_PROVIDER or the single configured provider")
 	cmd.AddCommand(claude, codex)
 	return cmd
 }
@@ -1447,7 +1448,7 @@ func serveCmd() *cobra.Command {
 		return runServer(cfg, p)
 	}}
 	cmd.Flags().BoolVarP(&background, "background", "b", false, "Run proxy in the background")
-	cmd.Flags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $OCGO_PROVIDER or the single configured provider")
+	cmd.Flags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $CFGATE_CC_PROVIDER or the single configured provider")
 	return cmd
 }
 
@@ -1508,6 +1509,7 @@ func runServer(cfg Config, p ProviderConfig) error {
 		defer os.Remove(pidFile())
 		defer os.Remove(activeProviderFile())
 	}
+	setupDebug()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("ok\n")) })
 	mux.HandleFunc("/v1/messages/count_tokens", countTokens)
@@ -1521,30 +1523,53 @@ func runServer(cfg Config, p ProviderConfig) error {
 
 func proxyMessages(w http.ResponseWriter, r *http.Request, cfg ProviderConfig) {
 	if r.Method != http.MethodPost {
+		dlogHandlerErr("messages", errors.New("method not allowed"), http.StatusMethodNotAllowed)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	var ar AnthropicRequest
-	if err := json.NewDecoder(r.Body).Decode(&ar); err != nil {
+	rawBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		dlogHandlerErr("messages", err, http.StatusBadRequest)
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
 	}
+	var ar AnthropicRequest
+	if err := json.Unmarshal(rawBody, &ar); err != nil {
+		dlogHandlerErr("messages", err, http.StatusBadRequest)
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	dlogIncoming("messages", r, rawBody)
 	if modelUsesAnthropicEndpoint(ar.Model, cfg) {
 		ar.Model = modelID(ar.Model)
 		ensureAnthropicRequestDefaults(&ar, cfg)
 		resp, err := forwardAnthropic(r.Context(), cfg, ar)
 		if err != nil {
+			dlogHandlerErr("messages", err, http.StatusBadGateway)
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
 		defer resp.Body.Close()
+		dlogUpstreamResp(resp)
+		if isSSEResponse(resp) {
+			sr := &streamReader{r: resp.Body, label: "messages", start: time.Now()}
+			copyHeaders(w.Header(), resp.Header)
+			w.WriteHeader(resp.StatusCode)
+			_, _ = io.Copy(w, sr)
+			dlogClientResp("messages", resp.StatusCode)
+			return
+		}
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		dlogBody("upstream", bodyBytes)
 		copyHeaders(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
+		dlogClientResp("messages", resp.StatusCode)
+		_, _ = w.Write(bodyBytes)
 		return
 	}
 	or := convertRequest(ar, cfg)
 	if err := validateImageSupport(or); err != nil {
+		dlogHandlerErr("messages", err, http.StatusBadRequest)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -1552,42 +1577,58 @@ func proxyMessages(w http.ResponseWriter, r *http.Request, cfg ProviderConfig) {
 	body, wireModel := cloudflarePrepareBody(body, cfg)
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, openAIURL(cfg), bytes.NewReader(body))
 	if err != nil {
+		dlogHandlerErr("messages", err, http.StatusInternalServerError)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	applyUpstreamAuth(req, cfg)
 	applyCloudflareGatewayHeader(req, cfg, wireModel)
 	req.Header.Set("Content-Type", "application/json")
+	dlogUpstreamReq(req, body)
 	resp, err := (&http.Client{Timeout: 10 * time.Minute}).Do(req)
 	if err != nil {
+		dlogHandlerErr("messages", err, http.StatusBadGateway)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
+	dlogUpstreamResp(resp)
 	if resp.StatusCode >= 400 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		dlogBody("upstream", bodyBytes)
 		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
+		dlogClientResp("messages", resp.StatusCode)
+		_, _ = w.Write(bodyBytes)
 		return
 	}
 	if ar.Stream {
-		streamAnthropic(w, resp.Body, or.Model)
+		sr := &streamReader{r: resp.Body, label: "messages", start: time.Now()}
+		streamAnthropic(w, sr, or.Model)
+		dlogClientResp("messages", http.StatusOK)
 		return
 	}
-	writeAnthropicResponse(w, resp.Body, or.Model)
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	dlogBody("upstream", bodyBytes)
+	writeAnthropicResponse(w, bytes.NewReader(bodyBytes), or.Model)
+	dlogClientResp("messages", http.StatusOK)
 }
 
 func proxyChatCompletions(w http.ResponseWriter, r *http.Request, cfg ProviderConfig) {
 	if r.Method != http.MethodPost {
+		dlogHandlerErr("chat", errors.New("method not allowed"), http.StatusMethodNotAllowed)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	body, err := io.ReadAll(r.Body)
+	rawBody, err := io.ReadAll(r.Body)
 	if err != nil {
+		dlogHandlerErr("chat", err, http.StatusBadRequest)
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
 	}
-	body, err = prepareChatBody(body, cfg)
+	dlogIncoming("chat", r, rawBody)
+	body, err := prepareChatBody(rawBody, cfg)
 	if err != nil {
+		dlogHandlerErr("chat", err, http.StatusBadRequest)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -1595,60 +1636,95 @@ func proxyChatCompletions(w http.ResponseWriter, r *http.Request, cfg ProviderCo
 	if json.Unmarshal(body, &or) == nil && modelUsesAnthropicEndpoint(or.Model, cfg) {
 		or.Model = modelID(or.Model)
 		if err := validateImageSupport(or); err != nil {
+			dlogHandlerErr("chat", err, http.StatusBadRequest)
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
 		resp, err := forwardAnthropic(r.Context(), cfg, chatToAnthropic(or, cfg))
 		if err != nil {
+			dlogHandlerErr("chat", err, http.StatusBadGateway)
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
 		defer resp.Body.Close()
+		dlogUpstreamResp(resp)
 		if resp.StatusCode >= 400 {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			dlogBody("upstream", bodyBytes)
 			w.WriteHeader(resp.StatusCode)
-			_, _ = io.Copy(w, resp.Body)
+			dlogClientResp("chat", resp.StatusCode)
+			_, _ = w.Write(bodyBytes)
 			return
 		}
 		if or.Stream {
 			includeUsage := or.StreamOptions != nil && or.StreamOptions.IncludeUsage
-			streamChatCompletionsFromAnthropic(w, resp.Body, or.Model, includeUsage)
+			sr := &streamReader{r: resp.Body, label: "chat", start: time.Now()}
+			streamChatCompletionsFromAnthropic(w, sr, or.Model, includeUsage)
+			dlogClientResp("chat", http.StatusOK)
 			return
 		}
-		writeChatCompletionsResponseFromAnthropic(w, resp.Body, or.Model)
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		dlogBody("upstream", bodyBytes)
+		writeChatCompletionsResponseFromAnthropic(w, bytes.NewReader(bodyBytes), or.Model)
+		dlogClientResp("chat", http.StatusOK)
 		return
 	}
 	body, wireModel := cloudflarePrepareBody(body, cfg)
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, openAIURL(cfg), bytes.NewReader(body))
 	if err != nil {
+		dlogHandlerErr("chat", err, http.StatusInternalServerError)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	applyUpstreamAuth(req, cfg)
 	applyCloudflareGatewayHeader(req, cfg, wireModel)
 	req.Header.Set("Content-Type", "application/json")
+	dlogUpstreamReq(req, body)
 	resp, err := (&http.Client{Timeout: 10 * time.Minute}).Do(req)
 	if err != nil {
+		dlogHandlerErr("chat", err, http.StatusBadGateway)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
+	dlogUpstreamResp(resp)
+	if resp.StatusCode >= 400 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		dlogBody("upstream", bodyBytes)
+		copyHeaders(w.Header(), resp.Header)
+		w.WriteHeader(resp.StatusCode)
+		dlogClientResp("chat", resp.StatusCode)
+		_, _ = w.Write(bodyBytes)
+		return
+	}
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
+	dlogClientResp("chat", resp.StatusCode)
 	_, _ = io.Copy(w, resp.Body)
 }
 
 func proxyResponses(w http.ResponseWriter, r *http.Request, cfg ProviderConfig) {
 	if r.Method != http.MethodPost {
+		dlogHandlerErr("responses", errors.New("method not allowed"), http.StatusMethodNotAllowed)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	rawBody, err := io.ReadAll(r.Body)
+	if err != nil {
+		dlogHandlerErr("responses", err, http.StatusBadRequest)
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	dlogIncoming("responses", r, rawBody)
 	var rr ResponsesRequest
-	if err := json.NewDecoder(r.Body).Decode(&rr); err != nil {
+	if err := json.Unmarshal(rawBody, &rr); err != nil {
+		dlogHandlerErr("responses", err, http.StatusBadRequest)
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
 	}
 	or := responsesToChat(rr, cfg)
 	if err := validateImageSupport(or); err != nil {
+		dlogHandlerErr("responses", err, http.StatusBadRequest)
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
@@ -1656,48 +1732,70 @@ func proxyResponses(w http.ResponseWriter, r *http.Request, cfg ProviderConfig) 
 		or.Model = modelID(or.Model)
 		resp, err := forwardAnthropic(r.Context(), cfg, chatToAnthropic(or, cfg))
 		if err != nil {
+			dlogHandlerErr("responses", err, http.StatusBadGateway)
 			http.Error(w, err.Error(), http.StatusBadGateway)
 			return
 		}
 		defer resp.Body.Close()
+		dlogUpstreamResp(resp)
 		if resp.StatusCode >= 400 {
+			bodyBytes, _ := io.ReadAll(resp.Body)
+			dlogBody("upstream", bodyBytes)
 			w.WriteHeader(resp.StatusCode)
-			_, _ = io.Copy(w, resp.Body)
+			dlogClientResp("responses", resp.StatusCode)
+			_, _ = w.Write(bodyBytes)
 			return
 		}
 		if rr.Stream {
-			streamResponsesFromAnthropic(w, resp.Body, or.Model)
+			sr := &streamReader{r: resp.Body, label: "responses", start: time.Now()}
+			streamResponsesFromAnthropic(w, sr, or.Model)
+			dlogClientResp("responses", http.StatusOK)
 			return
 		}
-		writeResponsesResponseFromAnthropic(w, resp.Body, or.Model)
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		dlogBody("upstream", bodyBytes)
+		writeResponsesResponseFromAnthropic(w, bytes.NewReader(bodyBytes), or.Model)
+		dlogClientResp("responses", http.StatusOK)
 		return
 	}
 	body, _ := json.Marshal(or)
 	body, wireModel := cloudflarePrepareBody(body, cfg)
 	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, openAIURL(cfg), bytes.NewReader(body))
 	if err != nil {
+		dlogHandlerErr("responses", err, http.StatusInternalServerError)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	applyUpstreamAuth(req, cfg)
 	applyCloudflareGatewayHeader(req, cfg, wireModel)
 	req.Header.Set("Content-Type", "application/json")
+	dlogUpstreamReq(req, body)
 	resp, err := (&http.Client{Timeout: 10 * time.Minute}).Do(req)
 	if err != nil {
+		dlogHandlerErr("responses", err, http.StatusBadGateway)
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
+	dlogUpstreamResp(resp)
 	if resp.StatusCode >= 400 {
+		bodyBytes, _ := io.ReadAll(resp.Body)
+		dlogBody("upstream", bodyBytes)
 		w.WriteHeader(resp.StatusCode)
-		_, _ = io.Copy(w, resp.Body)
+		dlogClientResp("responses", resp.StatusCode)
+		_, _ = w.Write(bodyBytes)
 		return
 	}
 	if rr.Stream {
-		streamResponses(w, resp.Body, or.Model)
+		sr := &streamReader{r: resp.Body, label: "responses", start: time.Now()}
+		streamResponses(w, sr, or.Model)
+		dlogClientResp("responses", http.StatusOK)
 		return
 	}
-	writeResponsesResponse(w, resp.Body, or.Model)
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	dlogBody("upstream", bodyBytes)
+	writeResponsesResponse(w, bytes.NewReader(bodyBytes), or.Model)
+	dlogClientResp("responses", http.StatusOK)
 }
 
 func copyHeaders(dst, src http.Header) {
@@ -1808,6 +1906,7 @@ func forwardAnthropic(ctx context.Context, cfg ProviderConfig, ar AnthropicReque
 	}
 	applyUpstreamAuth(req, cfg)
 	req.Header.Set("Content-Type", "application/json")
+	dlogUpstreamReq(req, body)
 	return (&http.Client{Timeout: 10 * time.Minute}).Do(req)
 }
 
@@ -3854,9 +3953,9 @@ func startServerProcess(detached bool, providerName string) (*exec.Cmd, error) {
 		// sees the same value. env-wins over single-configured inside the
 		// subprocess, so this is the one place the user's --provider flag
 		// has to cross the process boundary.
-		cmd.Env = append(os.Environ(), "OCGO_PROVIDER="+providerName)
+		cmd.Env = append(os.Environ(), "CFGATE_CC_PROVIDER="+providerName)
 	}
-	logf, err := os.OpenFile(filepath.Join(configDir(), "ocgo.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	logf, err := os.OpenFile(filepath.Join(configDir(), "cfgate-cc.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return nil, err
 	}
@@ -3873,17 +3972,17 @@ func startServerProcess(detached bool, providerName string) (*exec.Cmd, error) {
 }
 
 // configDir returns the cfgate-cc config dir. honors CFGATE_CC_CONFIG_DIR
-// override so the binary can run side-by-side with ocgo (different ports,
-// different keys) and so smoke tests don't clobber ~/.config/ocgo/.
+// override so smoke tests and per-user installs can redirect it without
+// touching $HOME.
 func configDir() string {
 	if d := os.Getenv("CFGATE_CC_CONFIG_DIR"); d != "" {
 		return d
 	}
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "ocgo")
+	return filepath.Join(home, ".config", "cfgate-cc")
 }
 func configFile() string       { return filepath.Join(configDir(), "config.json") }
-func pidFile() string          { return filepath.Join(configDir(), "ocgo.pid") }
+func pidFile() string          { return filepath.Join(configDir(), "cfgate-cc.pid") }
 func activeProviderFile() string { return filepath.Join(configDir(), "active-provider") }
 
 var modelMappingFile = func() string { return filepath.Join(configDir(), "model-mapping.json") }
@@ -3900,7 +3999,7 @@ func codexProfileConfigFile() string {
 
 func codexModelCatalogFile() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".codex", "ocgo-models.json")
+	return filepath.Join(home, ".codex", "cfgate-cc-models.json")
 }
 
 func ensureCodexConfig(base string, p ProviderConfig) error {
@@ -3965,7 +4064,7 @@ func stripLegacyCodexProfile(text string) string {
 			parts := strings.SplitN(trimmed, "=", 2)
 			if len(parts) == 2 && strings.TrimSpace(parts[0]) == "profile" {
 				val := strings.Trim(strings.TrimSpace(parts[1]), `"'`)
-				if val == codexProfileName || val == "ocgo-launch" {
+				if val == codexProfileName {
 					continue
 				}
 			}
@@ -3976,18 +4075,17 @@ func stripLegacyCodexProfile(text string) string {
 }
 
 func isLegacyCodexProfileSection(section string) bool {
-	// strip sections from the upstream ocgo binary (`ocgo-launch`) AND the
-	// cfgate-cc profile name, in case a user is upgrading and the prior
-	// install wrote the old name into their ~/.codex/config.toml.
-	for _, name := range []string{"ocgo-launch", codexProfileName} {
-		profiles := fmt.Sprintf("[profiles.%s", name)
-		providers := fmt.Sprintf("[model_providers.%s", name)
-		if section == fmt.Sprintf("[profiles.%s]", name) ||
-			strings.HasPrefix(section, profiles+".") ||
-			section == fmt.Sprintf("[model_providers.%s]", name) ||
-			strings.HasPrefix(section, providers+".") {
-			return true
-		}
+	// strip stale sections for the cfgate-cc profile name in case a user
+	// is upgrading and the prior install wrote the old name into their
+	// ~/.codex/config.toml.
+	name := codexProfileName
+	profiles := fmt.Sprintf("[profiles.%s", name)
+	providers := fmt.Sprintf("[model_providers.%s", name)
+	if section == fmt.Sprintf("[profiles.%s]", name) ||
+		strings.HasPrefix(section, profiles+".") ||
+		section == fmt.Sprintf("[model_providers.%s]", name) ||
+		strings.HasPrefix(section, providers+".") {
+		return true
 	}
 	return false
 }
@@ -4189,7 +4287,7 @@ func listConfiguredProviders() ([]string, error) {
 }
 
 // resolveProvider picks a provider name from the four precedence sources:
-// --provider flag > $OCGO_PROVIDER > single configured provider > error.
+// --provider flag > $CFGATE_CC_PROVIDER > single configured provider > error.
 // returns an error when none of the four yield a name.
 func resolveProvider(cmd *cobra.Command) (string, error) {
 	if cmd != nil {
@@ -4202,9 +4300,9 @@ func resolveProvider(cmd *cobra.Command) (string, error) {
 			}
 		}
 	}
-	if v := strings.TrimSpace(os.Getenv("OCGO_PROVIDER")); v != "" {
+	if v := strings.TrimSpace(os.Getenv("CFGATE_CC_PROVIDER")); v != "" {
 		if !isKnownProvider(v) {
-			return "", fmt.Errorf("unknown $OCGO_PROVIDER %q (known: %s)", v, strings.Join(knownProviders, ", "))
+			return "", fmt.Errorf("unknown $CFGATE_CC_PROVIDER %q (known: %s)", v, strings.Join(knownProviders, ", "))
 		}
 		return v, nil
 	}
@@ -4218,12 +4316,12 @@ func resolveProvider(cmd *cobra.Command) (string, error) {
 	case 1:
 		return names[0], nil
 	default:
-		return "", fmt.Errorf("multiple providers configured (%s); pass --provider or set $OCGO_PROVIDER", strings.Join(names, ", "))
+		return "", fmt.Errorf("multiple providers configured (%s); pass --provider or set $CFGATE_CC_PROVIDER", strings.Join(names, ", "))
 	}
 }
 
 // loadActiveProvider returns the provider config for name, with
-// OCGO_UPSTREAM_* env vars applied on top so the fish-alias pattern
+// CFGATE_CC_UPSTREAM_* env vars applied on top so the fish-alias pattern
 // (env-overrides-file) still works for the active provider. sets Name
 // so downstream code (proxy handlers, list dispatch) can identify the
 // provider without re-resolving it.
@@ -4233,19 +4331,19 @@ func loadActiveProvider(name string) (ProviderConfig, error) {
 		return p, err
 	}
 	p.Name = name
-	if v := os.Getenv("OCGO_UPSTREAM_BASE_URL"); v != "" {
+	if v := os.Getenv("CFGATE_CC_UPSTREAM_BASE_URL"); v != "" {
 		p.UpstreamBaseURL = v
 	}
-	if v := os.Getenv("OCGO_UPSTREAM_API_KEY"); v != "" {
+	if v := os.Getenv("CFGATE_CC_UPSTREAM_API_KEY"); v != "" {
 		p.UpstreamAPIKey = v
 	}
-	if v := os.Getenv("OCGO_UPSTREAM_AUTH"); v != "" {
+	if v := os.Getenv("CFGATE_CC_UPSTREAM_AUTH"); v != "" {
 		p.UpstreamAuth = v
 	}
-	if v := os.Getenv("OCGO_UPSTREAM_AUTH_HDR"); v != "" {
+	if v := os.Getenv("CFGATE_CC_UPSTREAM_AUTH_HDR"); v != "" {
 		p.UpstreamAuthHdr = v
 	}
-	if raw := os.Getenv("OCGO_UPSTREAM_EXTRA_HDR"); raw != "" {
+	if raw := os.Getenv("CFGATE_CC_UPSTREAM_EXTRA_HDR"); raw != "" {
 		var hdrs map[string]string
 		if err := json.Unmarshal([]byte(raw), &hdrs); err == nil {
 			p.UpstreamExtraHdr = hdrs
@@ -4378,4 +4476,171 @@ func readPID() (int, error) {
 	var pid int
 	_, err = fmt.Sscan(string(b), &pid)
 	return pid, err
+}
+
+// ponytail: ~120 lines inline, keeps the single-file layout. lift into
+// debug.go if a second consumer of CFGATE_CC_DEBUG ever appears.
+var debugEnabled bool
+
+const (
+	debugMaxBodyBytes  = 1 << 20
+	debugStreamSamples = 2
+)
+
+func setupDebug() {
+	v := os.Getenv("CFGATE_CC_DEBUG")
+	if v == "" {
+		return
+	}
+	var w io.Writer = os.Stderr
+	if v != "1" {
+		f, err := os.OpenFile(v, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "cfgate-cc: CFGATE_CC_DEBUG=%q: %v\n", v, err)
+			return
+		}
+		w = f
+	}
+	log.SetOutput(w)
+	log.SetFlags(log.LstdFlags)
+	debugEnabled = true
+	fmt.Fprintf(os.Stderr, "debug log: %s\n", v)
+}
+
+func dlogf(format string, args ...any) {
+	if !debugEnabled {
+		return
+	}
+	log.Printf(format, args...)
+}
+
+func redactHeader(name string) bool {
+	switch strings.ToLower(name) {
+	case "authorization", "x-api-key", "cookie":
+		return true
+	}
+	return false
+}
+
+func dlogHeaders(h http.Header) {
+	keys := make([]string, 0, len(h))
+	for k := range h {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		v := "[REDACTED]"
+		if !redactHeader(k) {
+			v = strings.Join(h[k], ", ")
+		}
+		dlogf("    %s: %s", k, v)
+	}
+}
+
+func dlogBody(label string, body []byte) {
+	switch {
+	case len(body) == 0:
+		dlogf("    %s body: (empty)", label)
+	case len(body) > debugMaxBodyBytes:
+		out := make([]byte, 0, debugMaxBodyBytes+64)
+		out = append(out, body[:debugMaxBodyBytes]...)
+		out = append(out, fmt.Sprintf("\n[truncated: %d bytes total]", len(body))...)
+		dlogf("    %s body: %s", label, out)
+	default:
+		dlogf("    %s body: %s", label, body)
+	}
+}
+
+func dlogIncoming(label string, r *http.Request, body []byte) {
+	dlogf("[%s] incoming %s %s from %s", label, r.Method, r.URL.Path, r.RemoteAddr)
+	dlogHeaders(r.Header)
+	dlogBody("incoming", body)
+}
+
+func dlogUpstreamReq(req *http.Request, body []byte) {
+	dlogf("[upstream] %s %s", req.Method, req.URL.String())
+	dlogHeaders(req.Header)
+	dlogBody("upstream", body)
+}
+
+func dlogUpstreamResp(resp *http.Response) {
+	dlogf("[upstream] response %d %s", resp.StatusCode, resp.Header.Get("Content-Type"))
+	dlogf("    content-length: %s", resp.Header.Get("Content-Length"))
+	dlogf("    transfer-encoding: %s", resp.Header.Get("Transfer-Encoding"))
+}
+
+func dlogClientResp(label string, status int) {
+	dlogf("[%s] client response: %d", label, status)
+}
+
+func dlogHandlerErr(label string, err error, status int) {
+	dlogf("[%s] error: %v (status %d)", label, err, status)
+}
+
+func isSSEResponse(resp *http.Response) bool {
+	return strings.HasPrefix(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
+}
+
+// streamReader wraps an SSE response body, tracking bytes + event count
+// and capturing the first/last N events verbatim. on EOF it logs a
+// summary. pass it in place of resp.Body to streamAnthropic and friends —
+// no signature change.
+type streamReader struct {
+	r       io.Reader
+	label   string
+	start   time.Time
+	bytes   int64
+	pending []byte
+	first   []string
+	last    []string
+	total   int
+	logged  bool
+}
+
+func (s *streamReader) Read(p []byte) (int, error) {
+	n, err := s.r.Read(p)
+	if n > 0 && debugEnabled {
+		s.bytes += int64(n)
+		s.scan(p[:n])
+	}
+	if err == io.EOF && debugEnabled && !s.logged {
+		s.logged = true
+		s.logEnd()
+	}
+	return n, err
+}
+
+func (s *streamReader) scan(buf []byte) {
+	s.pending = append(s.pending, buf...)
+	for {
+		idx := bytes.Index(s.pending, []byte("\n\n"))
+		if idx < 0 {
+			return
+		}
+		s.recordEvent(string(s.pending[:idx]))
+		s.pending = s.pending[idx+2:]
+	}
+}
+
+func (s *streamReader) recordEvent(e string) {
+	s.total++
+	if s.total <= debugStreamSamples {
+		s.first = append(s.first, e)
+		return
+	}
+	s.last = append(s.last, e)
+	if len(s.last) > debugStreamSamples {
+		s.last = s.last[1:]
+	}
+}
+
+func (s *streamReader) logEnd() {
+	dlogf("[%s] stream end: events=%d bytes=%d elapsed=%s", s.label, s.total, s.bytes, time.Since(s.start).Round(time.Millisecond))
+	for i, e := range s.first {
+		dlogf("    event[first/%d]: %s", i+1, e)
+	}
+	base := s.total - len(s.last)
+	for i, e := range s.last {
+		dlogf("    event[last/%d]: %s", base+i+1, e)
+	}
 }

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -26,7 +27,7 @@ import (
 var testProviderCfg = ProviderConfig{Name: "opencode-go"}
 
 func TestMain(m *testing.M) {
-	dir, err := os.MkdirTemp("", "ocgo-test-*")
+	dir, err := os.MkdirTemp("", "cfgate-cc-test-*")
 	if err != nil {
 		panic(err)
 	}
@@ -81,14 +82,14 @@ func TestWriteCodexProfile(t *testing.T) {
 		t.Fatal(err)
 	}
 	if strings.TrimSpace(string(b)) != "" {
-		t.Fatalf("root Codex config should not contain ocgo legacy profile entries:\n%s", string(b))
+		t.Fatalf("root Codex config should not contain stale cfgate-cc-launch profile entries:\n%s", string(b))
 	}
 }
 
 func TestWriteCodexProfileMigratesLegacySections(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")
-	existing := "profile = \"ocgo-launch\"\nkeep = \"top\"\n\n[profiles.ocgo-launch]\nopenai_base_url = \"http://old/v1/\"\n\n[profiles.ocgo-launch.features]\nmemories = false\n\n[other]\nkey = \"value\"\n\n[model_providers.ocgo-launch]\nbase_url = \"http://old/v1/\"\n\n[model_providers.ocgo-launch.headers]\nfoo = \"bar\"\n"
+	existing := "profile = \"cfgate-cc-launch\"\nkeep = \"top\"\n\n[profiles.cfgate-cc-launch]\nopenai_base_url = \"http://old/v1/\"\n\n[profiles.cfgate-cc-launch.features]\nmemories = false\n\n[other]\nkey = \"value\"\n\n[model_providers.cfgate-cc-launch]\nbase_url = \"http://old/v1/\"\n\n[model_providers.cfgate-cc-launch.headers]\nfoo = \"bar\"\n"
 	if err := os.WriteFile(path, []byte(existing), 0644); err != nil {
 		t.Fatal(err)
 	}
@@ -97,12 +98,12 @@ func TestWriteCodexProfileMigratesLegacySections(t *testing.T) {
 	}
 	b, _ := os.ReadFile(path)
 	content := string(b)
-	for _, gone := range []string{"http://old", `profile = "ocgo-launch"`} {
+	for _, gone := range []string{"http://old", `profile = "cfgate-cc-launch"`} {
 		if strings.Contains(content, gone) {
 			t.Fatalf("legacy Codex profile config %q was not removed:\n%s", gone, content)
 		}
 	}
-	for _, gone := range []string{"[profiles.ocgo-launch]", "[profiles.ocgo-launch.features]", "[model_providers.ocgo-launch]", "[model_providers.ocgo-launch.headers]", `openai_base_url = "http://new/v1/"`} {
+	for _, gone := range []string{"[profiles.cfgate-cc-launch]", "[profiles.cfgate-cc-launch.features]", "[model_providers.cfgate-cc-launch]", "[model_providers.cfgate-cc-launch.headers]", `openai_base_url = "http://new/v1/"`} {
 		if strings.Contains(content, gone) {
 			t.Fatalf("legacy Codex profile config %q was re-added:\n%s", gone, content)
 		}
@@ -125,7 +126,7 @@ func TestWriteCodexModelCatalog(t *testing.T) {
 		"qwen3.7-max":     testRemoteModel("Qwen 3.7 Max", 128000, "text"),
 		"minimax-m3":      testRemoteModel("MiniMax M3", 512000, "text", "image"),
 	}, nil)
-	path := filepath.Join(t.TempDir(), "ocgo-models.json")
+	path := filepath.Join(t.TempDir(), "cfgate-cc-models.json")
 	if err := writeCodexModelCatalog(path, testProviderCfg); err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +231,7 @@ func TestPrepareChatBodyAppliesCodexMapping(t *testing.T) {
 func TestMappingUnsetCommandRemovesMapping(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "model-mapping.json")
 	withTempModelMappingFile(t, path)
-	t.Setenv("OCGO_PROVIDER", "opencode-go")
+	t.Setenv("CFGATE_CC_PROVIDER", "opencode-go")
 	m := defaultModelMappings()
 	m["codex"]["gpt-5.5"] = "deepseek-v4-pro"
 	if err := saveModelMappings(m); err != nil {
@@ -307,7 +308,7 @@ func TestKnownModelIDsPreferOfficialThenRemoteThenFallback(t *testing.T) {
 func TestListProviderDispatch(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	t.Setenv("OCGO_PROVIDER", "")
+	t.Setenv("CFGATE_CC_PROVIDER", "")
 
 	t.Run("opencode-go uses known chain", func(t *testing.T) {
 		withModelFetchers(t, nil, []string{"minimax-m3", "kimi-k2.6"})
@@ -749,7 +750,7 @@ func TestOneShotMappingFormatWarning(t *testing.T) {
 func TestMappingSetUsesPerProviderFormat(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	t.Setenv("OCGO_PROVIDER", "opencode-go")
+	t.Setenv("CFGATE_CC_PROVIDER", "opencode-go")
 	if err := os.WriteFile(filepath.Join(dir, "opencode-go.json"), []byte(`{"upstream_api_key":"k"}`), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -1872,7 +1873,7 @@ func TestSanitizeRawChatToolMessagesDropsLateToolMessage(t *testing.T) {
 func TestResolveProviderFlagWinsOverEnv(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	t.Setenv("OCGO_PROVIDER", "opencode-go")
+	t.Setenv("CFGATE_CC_PROVIDER", "opencode-go")
 	if err := os.WriteFile(filepath.Join(dir, "opencode-go.json"), []byte(`{"upstream_api_key":"k"}`), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -1897,7 +1898,7 @@ func TestResolveProviderFlagWinsOverEnv(t *testing.T) {
 func TestResolveProviderEnvWinsOverSingle(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	t.Setenv("OCGO_PROVIDER", "opencode-go")
+	t.Setenv("CFGATE_CC_PROVIDER", "opencode-go")
 	if err := os.WriteFile(filepath.Join(dir, "cloudflare.json"), []byte(`{"upstream_api_key":"k"}`), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -1914,7 +1915,7 @@ func TestResolveProviderEnvWinsOverSingle(t *testing.T) {
 func TestResolveProviderSingleConfiguredWins(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	t.Setenv("OCGO_PROVIDER", "")
+	t.Setenv("CFGATE_CC_PROVIDER", "")
 	if err := os.WriteFile(filepath.Join(dir, "opencode-go.json"), []byte(`{"upstream_api_key":"k"}`), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -1931,7 +1932,7 @@ func TestResolveProviderSingleConfiguredWins(t *testing.T) {
 func TestResolveProviderAmbiguous(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	t.Setenv("OCGO_PROVIDER", "")
+	t.Setenv("CFGATE_CC_PROVIDER", "")
 	if err := os.WriteFile(filepath.Join(dir, "opencode-go.json"), []byte(`{}`), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -1951,7 +1952,7 @@ func TestResolveProviderAmbiguous(t *testing.T) {
 func TestResolveProviderUnknownValueRejected(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	t.Setenv("OCGO_PROVIDER", "bogus")
+	t.Setenv("CFGATE_CC_PROVIDER", "bogus")
 
 	_, err := resolveProvider(nil)
 	if err == nil {
@@ -1965,7 +1966,7 @@ func TestResolveProviderUnknownValueRejected(t *testing.T) {
 func TestResolveProviderNoConfig(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	t.Setenv("OCGO_PROVIDER", "")
+	t.Setenv("CFGATE_CC_PROVIDER", "")
 
 	_, err := resolveProvider(nil)
 	if err == nil {
@@ -2022,7 +2023,7 @@ func TestMigrateConfigOpencodeGoFallback(t *testing.T) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	old := `{"host":"127.0.0.1","port":3456,"upstream_api_key":"ocgo-key","upstream_auth":"bearer"}`
+	old := `{"host":"127.0.0.1","port":3456,"upstream_api_key":"cfgate-cc-key","upstream_auth":"bearer"}`
 	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(old), 0600); err != nil {
 		t.Fatal(err)
 	}
@@ -2034,7 +2035,7 @@ func TestMigrateConfigOpencodeGoFallback(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p.UpstreamAPIKey != "ocgo-key" {
+	if p.UpstreamAPIKey != "cfgate-cc-key" {
 		t.Fatalf("opencode-go upstream_api_key = %q", p.UpstreamAPIKey)
 	}
 }
@@ -2214,10 +2215,10 @@ func TestMigrateConfigIsIdempotent(t *testing.T) {
 func TestSetupOpencodeGoWritesProviderFile(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	t.Setenv("OCGO_API_KEY", "")
+	t.Setenv("CFGATE_CC_API_KEY", "")
 
 	cmd := setupOpencodeGoCmd()
-	cmd.SetArgs([]string{"--api-key", "test-ocgo-key"})
+	cmd.SetArgs([]string{"--api-key", "test-cfgate-cc-key"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatal(err)
 	}
@@ -2230,8 +2231,8 @@ func TestSetupOpencodeGoWritesProviderFile(t *testing.T) {
 	if err := json.Unmarshal(b, &p); err != nil {
 		t.Fatal(err)
 	}
-	if p.UpstreamAPIKey != "test-ocgo-key" {
-		t.Fatalf("upstream_api_key = %q, want test-ocgo-key", p.UpstreamAPIKey)
+	if p.UpstreamAPIKey != "test-cfgate-cc-key" {
+		t.Fatalf("upstream_api_key = %q, want test-cfgate-cc-key", p.UpstreamAPIKey)
 	}
 	if p.UpstreamAuth != "both" {
 		t.Fatalf("upstream_auth = %q, want both (opencode-go sends Bearer + x-api-key)", p.UpstreamAuth)
@@ -2241,7 +2242,7 @@ func TestSetupOpencodeGoWritesProviderFile(t *testing.T) {
 	// not the upstream key. this is the whole point of the split.
 	if _, err := os.Stat(filepath.Join(dir, "config.json")); err == nil {
 		b, _ := os.ReadFile(filepath.Join(dir, "config.json"))
-		if strings.Contains(string(b), "test-ocgo-key") {
+		if strings.Contains(string(b), "test-cfgate-cc-key") {
 			t.Fatalf("upstream key leaked into config.json:\n%s", string(b))
 		}
 	}
@@ -2249,7 +2250,7 @@ func TestSetupOpencodeGoWritesProviderFile(t *testing.T) {
 
 func TestApplyUpstreamAuthNoLongerFallsBackToLocalKey(t *testing.T) {
 	// empty UpstreamAPIKey must NOT send any Authorization header. pre-refactor
-	// this fell through to cfg.APIKey (ocgo compat hack); post-refactor the
+	// this fell through to cfg.APIKey (ocgo-compat hack); post-refactor the
 	// local key is structurally unreachable from applyUpstreamAuth because
 	// the function only takes ProviderConfig.
 	p := ProviderConfig{UpstreamAuth: "bearer"}
@@ -2293,8 +2294,8 @@ func TestLoadActiveProviderAppliesEnvOverrides(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "opencode-go.json"), []byte(`{"upstream_base_url":"https://file.example/v1","upstream_api_key":"file-key","upstream_auth":"bearer"}`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("OCGO_UPSTREAM_BASE_URL", "https://env.example/v1")
-	t.Setenv("OCGO_UPSTREAM_API_KEY", "env-key")
+	t.Setenv("CFGATE_CC_UPSTREAM_BASE_URL", "https://env.example/v1")
+	t.Setenv("CFGATE_CC_UPSTREAM_API_KEY", "env-key")
 
 	p, err := loadActiveProvider("opencode-go")
 	if err != nil {
@@ -2319,7 +2320,7 @@ func TestLoadActiveProviderOpencodeGoDefaultURL(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "opencode-go.json"), []byte(`{"upstream_api_key":"k"}`), 0600); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("OCGO_UPSTREAM_BASE_URL", "")
+	t.Setenv("CFGATE_CC_UPSTREAM_BASE_URL", "")
 
 	p, err := loadActiveProvider("opencode-go")
 	if err != nil {
@@ -2327,5 +2328,176 @@ func TestLoadActiveProviderOpencodeGoDefaultURL(t *testing.T) {
 	}
 	if got := openAIURL(p); got != "https://opencode.ai/zen/go/v1/chat/completions" {
 		t.Fatalf("openAIURL = %q, want opencode-go default", got)
+	}
+}
+
+func TestDebugLoggingProxyMessages(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "debug.log")
+	t.Setenv("CFGATE_CC_DEBUG", logPath)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("Authorization"); got != "Bearer secret-key" {
+			t.Errorf("upstream Authorization = %q", got)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"x","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`))
+	}))
+	defer upstream.Close()
+
+	// enable debug + re-arm after the test so other tests stay quiet
+	prev := debugEnabled
+	debugEnabled = false
+	t.Cleanup(func() {
+		debugEnabled = prev
+		log.SetOutput(os.Stderr)
+	})
+	setupDebug()
+
+	cfg := ProviderConfig{Name: "opencode-go", UpstreamBaseURL: upstream.URL, UpstreamAPIKey: "secret-key", UpstreamAuth: "bearer"}
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { proxyMessages(w, r, cfg) }))
+	defer proxy.Close()
+
+	body := strings.NewReader(`{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`)
+	resp, err := http.Post(proxy.URL+"/v1/messages", "application/json", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	debugLog := string(logBytes)
+	for _, want := range []string{
+		"[messages] incoming POST /v1/messages",
+		"[upstream] POST " + upstream.URL + "/chat/completions",
+		"[upstream] response 200 application/json",
+		"[messages] client response: 200",
+		"Authorization: [REDACTED]",
+		`"content":"hi"`,
+	} {
+		if !strings.Contains(debugLog, want) {
+			t.Errorf("debug log missing %q\n---\n%s\n---", want, debugLog)
+		}
+	}
+	if strings.Contains(debugLog, "secret-key") {
+		t.Errorf("debug log leaked upstream key\n---\n%s\n---", debugLog)
+	}
+}
+
+func TestDebugLoggingStderr(t *testing.T) {
+	t.Setenv("CFGATE_CC_DEBUG", "1")
+
+	// capture stderr
+	orig := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	prev := debugEnabled
+	debugEnabled = false
+	t.Cleanup(func() {
+		debugEnabled = prev
+		log.SetOutput(orig)
+		os.Stderr = orig
+	})
+	setupDebug()
+	if !debugEnabled {
+		t.Fatal("setupDebug did not enable debug")
+	}
+
+	dlogf("hello from stderr")
+
+	w.Close()
+	out, _ := io.ReadAll(r)
+	if !strings.Contains(string(out), "hello from stderr") {
+		t.Errorf("stderr capture missing log line: %q", string(out))
+	}
+	if !strings.Contains(string(out), "debug log: 1") {
+		t.Errorf("stderr capture missing setup banner: %q", string(out))
+	}
+}
+
+func TestDebugLoggingUnset(t *testing.T) {
+	t.Setenv("CFGATE_CC_DEBUG", "")
+
+	prev := debugEnabled
+	debugEnabled = false
+	t.Cleanup(func() { debugEnabled = prev })
+	setupDebug()
+	if debugEnabled {
+		t.Fatal("setupDebug enabled debug with CFGATE_CC_DEBUG unset")
+	}
+
+	// capture stderr to confirm dlogf is a no-op
+	orig := os.Stderr
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stderr = w
+	dlogf("this should be dropped")
+	w.Close()
+	out, _ := io.ReadAll(r)
+	os.Stderr = orig
+	if strings.Contains(string(out), "this should be dropped") {
+		t.Errorf("debug log emitted with CFGATE_CC_DEBUG unset: %q", string(out))
+	}
+}
+
+func TestDebugLoggingStreamSSE(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "debug.log")
+	t.Setenv("CFGATE_CC_DEBUG", logPath)
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		// 5 events so first 2 + last 2 are visible
+		for i := 0; i < 5; i++ {
+			fmt.Fprintf(w, "data: {\"i\":%d}\n\n", i)
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+	}))
+	defer upstream.Close()
+
+	prev := debugEnabled
+	debugEnabled = false
+	t.Cleanup(func() {
+		debugEnabled = prev
+		log.SetOutput(os.Stderr)
+	})
+	setupDebug()
+
+	cfg := ProviderConfig{Name: "opencode-go", UpstreamBaseURL: upstream.URL, UpstreamAPIKey: "k", UpstreamAuth: "bearer"}
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { proxyMessages(w, r, cfg) }))
+	defer proxy.Close()
+
+	body := strings.NewReader(`{"model":"m","max_tokens":1,"stream":true,"messages":[{"role":"user","content":"hi"}]}`)
+	resp, err := http.Post(proxy.URL+"/v1/messages", "application/json", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	logBytes, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	debugLog := string(logBytes)
+	for _, want := range []string{
+		"[upstream] response 200 text/event-stream",
+		"[messages] stream end: events=5",
+		`event[first/1]: data: {"i":0}`,
+		`event[last/5]: data: {"i":4}`,
+	} {
+		if !strings.Contains(debugLog, want) {
+			t.Errorf("debug log missing %q\n---\n%s\n---", want, debugLog)
+		}
 	}
 }
