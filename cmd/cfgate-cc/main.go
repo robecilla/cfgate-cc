@@ -368,7 +368,7 @@ func setupOpencodeGoCmd() *cobra.Command {
 		Short: "Save your OpenCode Go API key",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if strings.TrimSpace(key) == "" {
-				key = os.Getenv("OCGO_API_KEY")
+				key = os.Getenv("CFGATE_CC_API_KEY")
 			}
 			if strings.TrimSpace(key) == "" {
 				fmt.Print("Upstream provider API key: ")
@@ -520,7 +520,7 @@ func listCmd() *cobra.Command {
 			return fmt.Errorf("list: unsupported provider %q", providerName)
 		}
 	}}
-	cmd.Flags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $OCGO_PROVIDER or the single configured provider")
+	cmd.Flags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $CFGATE_CC_PROVIDER or the single configured provider")
 	return cmd
 }
 
@@ -1002,7 +1002,7 @@ func warnOldMappingFormatOnce() {
 
 func mappingCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "mapping", Short: "Manage tool model mappings to upstream models"}
-	cmd.PersistentFlags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $OCGO_PROVIDER or the single configured provider")
+	cmd.PersistentFlags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $CFGATE_CC_PROVIDER or the single configured provider")
 	cmd.AddCommand(toolMappingCmd("claude"), toolMappingCmd("codex"))
 	return cmd
 }
@@ -1371,7 +1371,7 @@ func launchCmd() *cobra.Command {
 	}}
 	claude.Flags().StringVar(&model, "model", "", "Upstream model ID")
 	claude.Flags().BoolVar(&yes, "yes", false, "Allow Claude Code to skip permission prompts")
-	claude.Flags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $OCGO_PROVIDER or the single configured provider")
+	claude.Flags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $CFGATE_CC_PROVIDER or the single configured provider")
 	codex := &cobra.Command{Use: "codex [-- codex args...]", Short: "Launch Codex CLI through the configured upstream provider", Args: cobra.ArbitraryArgs, RunE: func(cmd *cobra.Command, args []string) error {
 		cfg, err := loadConfig()
 		if err != nil {
@@ -1422,7 +1422,7 @@ func launchCmd() *cobra.Command {
 	}}
 	codex.Flags().StringVar(&model, "model", "", "Upstream model ID")
 	codex.Flags().BoolVar(&codexConfigOnly, "config", false, "Configure Codex profile without launching")
-	codex.Flags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $OCGO_PROVIDER or the single configured provider")
+	codex.Flags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $CFGATE_CC_PROVIDER or the single configured provider")
 	cmd.AddCommand(claude, codex)
 	return cmd
 }
@@ -1448,7 +1448,7 @@ func serveCmd() *cobra.Command {
 		return runServer(cfg, p)
 	}}
 	cmd.Flags().BoolVarP(&background, "background", "b", false, "Run proxy in the background")
-	cmd.Flags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $OCGO_PROVIDER or the single configured provider")
+	cmd.Flags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $CFGATE_CC_PROVIDER or the single configured provider")
 	return cmd
 }
 
@@ -3950,9 +3950,9 @@ func startServerProcess(detached bool, providerName string) (*exec.Cmd, error) {
 		// sees the same value. env-wins over single-configured inside the
 		// subprocess, so this is the one place the user's --provider flag
 		// has to cross the process boundary.
-		cmd.Env = append(os.Environ(), "OCGO_PROVIDER="+providerName)
+		cmd.Env = append(os.Environ(), "CFGATE_CC_PROVIDER="+providerName)
 	}
-	logf, err := os.OpenFile(filepath.Join(configDir(), "ocgo.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	logf, err := os.OpenFile(filepath.Join(configDir(), "cfgate-cc.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return nil, err
 	}
@@ -3969,17 +3969,17 @@ func startServerProcess(detached bool, providerName string) (*exec.Cmd, error) {
 }
 
 // configDir returns the cfgate-cc config dir. honors CFGATE_CC_CONFIG_DIR
-// override so the binary can run side-by-side with ocgo (different ports,
-// different keys) and so smoke tests don't clobber ~/.config/ocgo/.
+// override so smoke tests and per-user installs can redirect it without
+// touching $HOME.
 func configDir() string {
 	if d := os.Getenv("CFGATE_CC_CONFIG_DIR"); d != "" {
 		return d
 	}
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "ocgo")
+	return filepath.Join(home, ".config", "cfgate-cc")
 }
 func configFile() string       { return filepath.Join(configDir(), "config.json") }
-func pidFile() string          { return filepath.Join(configDir(), "ocgo.pid") }
+func pidFile() string          { return filepath.Join(configDir(), "cfgate-cc.pid") }
 func activeProviderFile() string { return filepath.Join(configDir(), "active-provider") }
 
 var modelMappingFile = func() string { return filepath.Join(configDir(), "model-mapping.json") }
@@ -3996,7 +3996,7 @@ func codexProfileConfigFile() string {
 
 func codexModelCatalogFile() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".codex", "ocgo-models.json")
+	return filepath.Join(home, ".codex", "cfgate-cc-models.json")
 }
 
 func ensureCodexConfig(base string, p ProviderConfig) error {
@@ -4061,7 +4061,7 @@ func stripLegacyCodexProfile(text string) string {
 			parts := strings.SplitN(trimmed, "=", 2)
 			if len(parts) == 2 && strings.TrimSpace(parts[0]) == "profile" {
 				val := strings.Trim(strings.TrimSpace(parts[1]), `"'`)
-				if val == codexProfileName || val == "ocgo-launch" {
+				if val == codexProfileName {
 					continue
 				}
 			}
@@ -4072,18 +4072,17 @@ func stripLegacyCodexProfile(text string) string {
 }
 
 func isLegacyCodexProfileSection(section string) bool {
-	// strip sections from the upstream ocgo binary (`ocgo-launch`) AND the
-	// cfgate-cc profile name, in case a user is upgrading and the prior
-	// install wrote the old name into their ~/.codex/config.toml.
-	for _, name := range []string{"ocgo-launch", codexProfileName} {
-		profiles := fmt.Sprintf("[profiles.%s", name)
-		providers := fmt.Sprintf("[model_providers.%s", name)
-		if section == fmt.Sprintf("[profiles.%s]", name) ||
-			strings.HasPrefix(section, profiles+".") ||
-			section == fmt.Sprintf("[model_providers.%s]", name) ||
-			strings.HasPrefix(section, providers+".") {
-			return true
-		}
+	// strip stale sections for the cfgate-cc profile name in case a user
+	// is upgrading and the prior install wrote the old name into their
+	// ~/.codex/config.toml.
+	name := codexProfileName
+	profiles := fmt.Sprintf("[profiles.%s", name)
+	providers := fmt.Sprintf("[model_providers.%s", name)
+	if section == fmt.Sprintf("[profiles.%s]", name) ||
+		strings.HasPrefix(section, profiles+".") ||
+		section == fmt.Sprintf("[model_providers.%s]", name) ||
+		strings.HasPrefix(section, providers+".") {
+		return true
 	}
 	return false
 }
@@ -4285,7 +4284,7 @@ func listConfiguredProviders() ([]string, error) {
 }
 
 // resolveProvider picks a provider name from the four precedence sources:
-// --provider flag > $OCGO_PROVIDER > single configured provider > error.
+// --provider flag > $CFGATE_CC_PROVIDER > single configured provider > error.
 // returns an error when none of the four yield a name.
 func resolveProvider(cmd *cobra.Command) (string, error) {
 	if cmd != nil {
@@ -4298,9 +4297,9 @@ func resolveProvider(cmd *cobra.Command) (string, error) {
 			}
 		}
 	}
-	if v := strings.TrimSpace(os.Getenv("OCGO_PROVIDER")); v != "" {
+	if v := strings.TrimSpace(os.Getenv("CFGATE_CC_PROVIDER")); v != "" {
 		if !isKnownProvider(v) {
-			return "", fmt.Errorf("unknown $OCGO_PROVIDER %q (known: %s)", v, strings.Join(knownProviders, ", "))
+			return "", fmt.Errorf("unknown $CFGATE_CC_PROVIDER %q (known: %s)", v, strings.Join(knownProviders, ", "))
 		}
 		return v, nil
 	}
@@ -4314,12 +4313,12 @@ func resolveProvider(cmd *cobra.Command) (string, error) {
 	case 1:
 		return names[0], nil
 	default:
-		return "", fmt.Errorf("multiple providers configured (%s); pass --provider or set $OCGO_PROVIDER", strings.Join(names, ", "))
+		return "", fmt.Errorf("multiple providers configured (%s); pass --provider or set $CFGATE_CC_PROVIDER", strings.Join(names, ", "))
 	}
 }
 
 // loadActiveProvider returns the provider config for name, with
-// OCGO_UPSTREAM_* env vars applied on top so the fish-alias pattern
+// CFGATE_CC_UPSTREAM_* env vars applied on top so the fish-alias pattern
 // (env-overrides-file) still works for the active provider. sets Name
 // so downstream code (proxy handlers, list dispatch) can identify the
 // provider without re-resolving it.
@@ -4329,19 +4328,19 @@ func loadActiveProvider(name string) (ProviderConfig, error) {
 		return p, err
 	}
 	p.Name = name
-	if v := os.Getenv("OCGO_UPSTREAM_BASE_URL"); v != "" {
+	if v := os.Getenv("CFGATE_CC_UPSTREAM_BASE_URL"); v != "" {
 		p.UpstreamBaseURL = v
 	}
-	if v := os.Getenv("OCGO_UPSTREAM_API_KEY"); v != "" {
+	if v := os.Getenv("CFGATE_CC_UPSTREAM_API_KEY"); v != "" {
 		p.UpstreamAPIKey = v
 	}
-	if v := os.Getenv("OCGO_UPSTREAM_AUTH"); v != "" {
+	if v := os.Getenv("CFGATE_CC_UPSTREAM_AUTH"); v != "" {
 		p.UpstreamAuth = v
 	}
-	if v := os.Getenv("OCGO_UPSTREAM_AUTH_HDR"); v != "" {
+	if v := os.Getenv("CFGATE_CC_UPSTREAM_AUTH_HDR"); v != "" {
 		p.UpstreamAuthHdr = v
 	}
-	if raw := os.Getenv("OCGO_UPSTREAM_EXTRA_HDR"); raw != "" {
+	if raw := os.Getenv("CFGATE_CC_UPSTREAM_EXTRA_HDR"); raw != "" {
 		var hdrs map[string]string
 		if err := json.Unmarshal([]byte(raw), &hdrs); err == nil {
 			p.UpstreamExtraHdr = hdrs
@@ -4477,7 +4476,7 @@ func readPID() (int, error) {
 }
 
 // ponytail: ~120 lines inline, keeps the single-file layout. lift into
-// debug.go if a second consumer of OCGO_DEBUG ever appears.
+// debug.go if a second consumer of CFGATE_CC_DEBUG ever appears.
 var debugEnabled bool
 
 const (
@@ -4486,7 +4485,7 @@ const (
 )
 
 func setupDebug() {
-	v := os.Getenv("OCGO_DEBUG")
+	v := os.Getenv("CFGATE_CC_DEBUG")
 	if v == "" {
 		return
 	}
@@ -4494,7 +4493,7 @@ func setupDebug() {
 	if v != "1" {
 		f, err := os.OpenFile(v, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "cfgate-cc: OCGO_DEBUG=%q: %v\n", v, err)
+			fmt.Fprintf(os.Stderr, "cfgate-cc: CFGATE_CC_DEBUG=%q: %v\n", v, err)
 			return
 		}
 		w = f
