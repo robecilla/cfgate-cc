@@ -75,7 +75,7 @@ if you'd rather keep the env-var style, `OCGO_UPSTREAM_BASE_URL` / `OCGO_UPSTREA
 
 resolution order (first match wins):
 
-1. `--provider` flag on `launch` / `serve` / `status`
+1. `--provider` flag on `launch` / `serve` / `status` / `list` / `mapping`
 2. `$OCGO_PROVIDER` env var
 3. the single configured provider (if exactly one of `opencode-go.json` / `cloudflare.json` exists)
 4. error if multiple providers are configured and nothing else pins one down
@@ -84,7 +84,43 @@ resolution order (first match wins):
 cfgate-cc launch claude --provider cloudflare --model workers-ai/@cf/zai-org/glm-5.2
 cfgate-cc launch codex --provider opencode-go --model kimi-k2.6
 OCGO_PROVIDER=cloudflare cfgate-cc serve -b
+cfgate-cc list --provider cloudflare
+cfgate-cc mapping --provider cloudflare claude set claude-opus workers-ai/@cf/zai-org/glm-5.2
 ```
+
+`list` and `mapping` also accept `--provider` on the parent command (cobra persistent flag), so the child commands inherit it.
+
+## model mapping
+
+`cfgate-cc` lets you remap the model id claude/codex sends to a different upstream model. the file is per-provider, so the same source model can map to different upstreams depending on which provider is active:
+
+```json5
+// ~/.config/ocgo/model-mapping.json
+{
+  "opencode-go": {
+    "claude": { "claude-opus": "minimax-m3", "claude-sonnet": "qwen3.7-max" },
+    "codex":  { "gpt-5": "deepseek-v4-pro" }
+  },
+  "cloudflare": {
+    "claude": { "claude-opus": "workers-ai/@cf/zai-org/glm-5.2" },
+    "codex":  {}
+  }
+}
+```
+
+```bash
+cfgate-cc mapping --provider opencode-go claude set claude-opus minimax-m3
+cfgate-cc mapping --provider cloudflare  claude set claude-opus workers-ai/@cf/zai-org/glm-5.2
+cfgate-cc mapping --provider opencode-go claude show
+```
+
+### migrating mappings from a pre-split config
+
+the mapping file used to be tool-scoped (`{"claude": {...}, "codex": {...}}`). it's now per-provider. on first load after upgrading, a one-shot warning prints:
+
+> warning: `~/.config/ocgo/model-mapping.json` is in the old tool-scoped format. run `cfgate-cc mapping --provider <name> <tool> set ...` to re-create mappings per provider.
+
+the warning is gated by a sentinel at `~/.config/ocgo/model-mapping.migrated` — it fires once per user, not once per process. no auto-migration: re-run `mapping set` per provider.
 
 ## cloudflare ai gateway example
 
@@ -144,7 +180,7 @@ defaults to `~/.config/ocgo` for ocgo compat.
 - pluggable auth: bearer, x-api-key, or arbitrary header
 - extra headers (e.g. `cf-aig-authorization`) via `upstream_extra_hdr`
 - per-model endpoint routing via `endpoint_overrides` (glob → openai or anthropic)
-- model mapping (claude → upstream model, codex → upstream model)
+- per-provider model mapping (claude → upstream model, codex → upstream model)
 - streaming text and tool-call translation
 - ocgo-compatible: same proxy lifecycle, same codex profile management, same env vars
 

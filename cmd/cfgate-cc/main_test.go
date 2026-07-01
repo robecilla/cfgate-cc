@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -15,6 +16,12 @@ import (
 
 	"github.com/spf13/cobra"
 )
+
+// testProviderCfg is the default cfg passed to helpers that need a provider
+// identity to read the right mapping section / model list. tests that don't
+// care about provider-specific behavior use this; tests that do (e.g. cloudflare
+// dispatch) construct their own.
+var testProviderCfg = ProviderConfig{Name: "opencode-go"}
 
 func TestMain(m *testing.M) {
 	dir, err := os.MkdirTemp("", "ocgo-test-*")
@@ -110,7 +117,7 @@ func TestWriteCodexProfileMigratesLegacySections(t *testing.T) {
 func TestWriteCodexModelCatalog(t *testing.T) {
 	withTempModelMappingFile(t, filepath.Join(t.TempDir(), "model-mapping.json"))
 	path := filepath.Join(t.TempDir(), "ocgo-models.json")
-	if err := writeCodexModelCatalog(path); err != nil {
+	if err := writeCodexModelCatalog(path, testProviderCfg); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(path)
@@ -202,7 +209,7 @@ func TestPrepareChatBodyAppliesCodexMapping(t *testing.T) {
 	if err := saveModelMappings(m); err != nil {
 		t.Fatal(err)
 	}
-	body, err := prepareChatBody([]byte(`{"model":"gpt-5","messages":[{"role":"user","content":"hello"}]}`))
+	body, err := prepareChatBody([]byte(`{"model":"gpt-5","messages":[{"role":"user","content":"hello"}]}`), testProviderCfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -214,6 +221,7 @@ func TestPrepareChatBodyAppliesCodexMapping(t *testing.T) {
 func TestMappingUnsetCommandRemovesMapping(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "model-mapping.json")
 	withTempModelMappingFile(t, path)
+	t.Setenv("OCGO_PROVIDER", "opencode-go")
 	m := defaultModelMappings()
 	m["codex"]["gpt-5.5"] = "deepseek-v4-pro"
 	if err := saveModelMappings(m); err != nil {
@@ -287,6 +295,90 @@ func TestKnownModelIDsPreferOfficialThenRemoteThenFallback(t *testing.T) {
 	}
 }
 
+func TestListProviderDispatch(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
+	t.Setenv("OCGO_PROVIDER", "")
+
+	t.Run("opencode-go uses known chain", func(t *testing.T) {
+		withModelFetchers(t, nil, []string{"minimax-m3", "kimi-k2.6"})
+		if err := os.WriteFile(filepath.Join(dir, "opencode-go.json"), []byte(`{"upstream_api_key":"k"}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		defer os.Remove(filepath.Join(dir, "opencode-go.json"))
+
+		cmd := listCmd()
+		buf := &bytes.Buffer{}
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("list opencode-go: %v", err)
+		}
+		if !strings.Contains(buf.String(), "minimax-m3") {
+			t.Fatalf("opencode-go list should include model: %s", buf.String())
+		}
+		if !strings.Contains(buf.String(), "provider opencode-go") {
+			t.Fatalf("list should label provider: %s", buf.String())
+		}
+	})
+
+	t.Run("cloudflare hits live /v1/models", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !strings.HasSuffix(r.URL.Path, "/models") {
+				http.NotFound(w, r)
+				return
+			}
+			if r.Header.Get("Authorization") == "" {
+				t.Errorf("missing Authorization on cloudflare /v1/models call")
+			}
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintln(w, `{"data":[{"id":"@cf/meta/llama-3.1-8b-instruct"},{"id":"workers-ai/@cf/zai-org/glm-5.2"}]}`)
+		}))
+		defer srv.Close()
+		if err := os.WriteFile(filepath.Join(dir, "cloudflare.json"), []byte(`{"upstream_base_url":"`+srv.URL+`","upstream_api_key":"tok","upstream_auth":"bearer"}`), 0600); err != nil {
+			t.Fatal(err)
+		}
+		defer os.Remove(filepath.Join(dir, "cloudflare.json"))
+
+		cmd := listCmd()
+		buf := &bytes.Buffer{}
+		cmd.SetOut(buf)
+		cmd.SetErr(buf)
+		cmd.SetArgs([]string{"--provider", "cloudflare"})
+		if err := cmd.Execute(); err != nil {
+			t.Fatalf("list cloudflare: %v", err)
+		}
+		for _, want := range []string{"@cf/meta/llama-3.1-8b-instruct", "workers-ai/@cf/zai-org/glm-5.2", "provider cloudflare"} {
+			if !strings.Contains(buf.String(), want) {
+				t.Fatalf("cloudflare list missing %q: %s", want, buf.String())
+			}
+		}
+	})
+
+	t.Run("unknown provider errors", func(t *testing.T) {
+		_ = os.Remove(filepath.Join(dir, "opencode-go.json"))
+		_ = os.Remove(filepath.Join(dir, "cloudflare.json"))
+		cmd := listCmd()
+		cmd.SetOut(io.Discard)
+		cmd.SetErr(io.Discard)
+		cmd.SetArgs([]string{"--provider", "bogus"})
+		if err := cmd.Execute(); err == nil {
+			t.Fatal("expected error for unknown provider")
+		}
+	})
+
+	t.Run("no config errors", func(t *testing.T) {
+		_ = os.Remove(filepath.Join(dir, "opencode-go.json"))
+		_ = os.Remove(filepath.Join(dir, "cloudflare.json"))
+		cmd := listCmd()
+		cmd.SetOut(io.Discard)
+		cmd.SetErr(io.Discard)
+		if err := cmd.Execute(); err == nil {
+			t.Fatal("expected no-config error")
+		}
+	})
+}
+
 func TestModelMetadataUsesRemoteFixtureWithoutLiveNetwork(t *testing.T) {
 	withModelFetchers(t, map[string]remoteModelInfo{
 		"kimi-k2.6": testRemoteModel("Kimi K2.6", 262144, "text", "image", "video"),
@@ -328,6 +420,197 @@ func TestCodexModelCatalogAllowsImagesForKnownVisionModels(t *testing.T) {
 	}
 }
 
+func TestLoadModelMappingsForProvider(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "model-mapping.json")
+	withTempModelMappingFile(t, path)
+
+	// no file: each provider gets a fresh empty section
+	for _, name := range []string{"opencode-go", "cloudflare"} {
+		m, err := loadModelMappingsForProvider(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := m["claude"]; !ok {
+			t.Fatalf("%s: claude section missing: %+v", name, m)
+		}
+	}
+
+	// write one section, read both — the other provider's section must be empty
+	if err := saveModelMappingsForProvider("opencode-go", map[string]map[string]string{
+		"claude": {"claude-opus": "minimax-m3"},
+		"codex":  {},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	oc, err := loadModelMappingsForProvider("opencode-go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if oc["claude"]["claude-opus"] != "minimax-m3" {
+		t.Fatalf("opencode-go claude-opus = %q", oc["claude"]["claude-opus"])
+	}
+	cf, err := loadModelMappingsForProvider("cloudflare")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cf["claude"]) != 0 {
+		t.Fatalf("cloudflare claude should be empty, got %+v", cf["claude"])
+	}
+
+	// unknown provider: empty section, no error
+	weird, err := loadModelMappingsForProvider("not-a-provider")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(weird) != 0 {
+		t.Fatalf("unknown provider should get empty section, got %+v", weird)
+	}
+}
+
+func TestSaveModelMappingsForProviderPreservesOthers(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "model-mapping.json")
+	withTempModelMappingFile(t, path)
+
+	// seed opencode-go
+	if err := saveModelMappingsForProvider("opencode-go", map[string]map[string]string{
+		"claude": {"claude-opus": "minimax-m3"},
+		"codex":  {"gpt-5": "deepseek-v4-pro"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// add cloudflare — must not wipe opencode-go
+	if err := saveModelMappingsForProvider("cloudflare", map[string]map[string]string{
+		"claude": {"claude-opus": "workers-ai/@cf/zai-org/glm-5.2"},
+		"codex":  {},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	oc, _ := loadModelMappingsForProvider("opencode-go")
+	if oc["claude"]["claude-opus"] != "minimax-m3" {
+		t.Fatalf("opencode-go claude-opus lost: %q", oc["claude"]["claude-opus"])
+	}
+	if oc["codex"]["gpt-5"] != "deepseek-v4-pro" {
+		t.Fatalf("opencode-go codex gpt-5 lost: %q", oc["codex"]["gpt-5"])
+	}
+	cf, _ := loadModelMappingsForProvider("cloudflare")
+	if cf["claude"]["claude-opus"] != "workers-ai/@cf/zai-org/glm-5.2" {
+		t.Fatalf("cloudflare claude-opus wrong: %q", cf["claude"]["claude-opus"])
+	}
+
+	// verify on disk: top-level keys are provider names, not tool names
+	b, _ := os.ReadFile(path)
+	var raw map[string]any
+	if err := json.Unmarshal(b, &raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := raw["opencode-go"]; !ok {
+		t.Fatalf("file should have opencode-go section, got: %s", string(b))
+	}
+	if _, ok := raw["cloudflare"]; !ok {
+		t.Fatalf("file should have cloudflare section, got: %s", string(b))
+	}
+	if _, ok := raw["claude"]; ok {
+		t.Fatalf("file should NOT have top-level claude (old format leak): %s", string(b))
+	}
+}
+
+func TestOneShotMappingFormatWarning(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "model-mapping.json")
+	withTempModelMappingFile(t, path)
+	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
+	// reset the in-process guard so the warning fires fresh for this test
+	oldWarned := oldMappingFormatWarned
+	oldMappingFormatWarned = false
+	t.Cleanup(func() { oldMappingFormatWarned = oldWarned })
+
+	// write an old-format file
+	old := `{"claude":{"claude-opus":"minimax-m3"},"codex":{}}`
+	if err := os.WriteFile(path, []byte(old), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// capture stderr
+	capturePath := filepath.Join(dir, "stderr.log")
+	f, err := os.Create(capturePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldStderr := os.Stderr
+	os.Stderr = f
+	t.Cleanup(func() {
+		os.Stderr = oldStderr
+		f.Close()
+	})
+
+	// first load: warning fires, sentinel is created
+	all, err := loadAllModelMappings()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(all) != 0 {
+		t.Fatalf("old format should produce empty result, got %+v", all)
+	}
+	_ = f.Sync()
+	captured, _ := os.ReadFile(capturePath)
+	if !strings.Contains(string(captured), "old tool-scoped format") {
+		t.Fatalf("expected warning on first load, got: %q", string(captured))
+	}
+	if _, err := os.Stat(filepath.Join(dir, "model-mapping.migrated")); err != nil {
+		t.Fatalf("sentinel file should be created: %v", err)
+	}
+
+	// truncate the capture file for the second load
+	_ = f.Truncate(0)
+	_, _ = f.Seek(0, 0)
+
+	// second load: warning is silent (sentinel exists)
+	oldMappingFormatWarned = false // simulate a fresh process
+	_, _ = loadAllModelMappings()
+	_ = f.Sync()
+	captured, _ = os.ReadFile(capturePath)
+	if len(captured) != 0 {
+		t.Fatalf("second load should be silent, got: %q", string(captured))
+	}
+}
+
+func TestMappingSetUsesPerProviderFormat(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
+	t.Setenv("OCGO_PROVIDER", "opencode-go")
+	if err := os.WriteFile(filepath.Join(dir, "opencode-go.json"), []byte(`{"upstream_api_key":"k"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	// stub the model list so `set` validates the target
+	withModelFetchers(t, nil, []string{"minimax-m3"})
+
+	path := filepath.Join(dir, "model-mapping.json")
+	withTempModelMappingFile(t, path)
+
+	cmd := mappingCmd()
+	cmd.SetArgs([]string{"claude", "set", "claude-opus", "minimax-m3"})
+	cmd.SetOut(io.Discard)
+	cmd.SetErr(io.Discard)
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("mapping set: %v", err)
+	}
+
+	// the on-disk file should have a top-level "opencode-go" key
+	b, _ := os.ReadFile(path)
+	if !strings.Contains(string(b), `"opencode-go"`) {
+		t.Fatalf("mapping file should have opencode-go section, got: %s", string(b))
+	}
+	oc, _ := loadModelMappingsForProvider("opencode-go")
+	if oc["claude"]["claude-opus"] != "minimax-m3" {
+		t.Fatalf("opencode-go mapping not written: %+v", oc["claude"])
+	}
+	// cloudflare section should not exist (or be empty)
+	cf, _ := loadModelMappingsForProvider("cloudflare")
+	if v, ok := cf["claude"]["claude-opus"]; ok && v != "" {
+		t.Fatalf("cloudflare section should not have the opencode-go mapping, got: %+v", cf)
+	}
+}
+
 func TestAnthropicEndpointModels(t *testing.T) {
 	// empty cfg: no overrides, falls back to modelMetadata heuristic
 	cfg := ProviderConfig{}
@@ -344,8 +627,8 @@ func TestAnthropicEndpointModels(t *testing.T) {
 }
 
 func TestChatToAnthropicForCodexModel(t *testing.T) {
-	or := responsesToChat(ResponsesRequest{Model: "qwen3.7-max", Stream: true, Input: []byte(`[{"type":"message","role":"user","content":"hello"}]`), Tools: []ResponseTool{{Type: "function", Name: "shell", Description: "run", Parameters: []byte(`{"type":"object"}`)}}})
-	ar := chatToAnthropic(or)
+	or := responsesToChat(ResponsesRequest{Model: "qwen3.7-max", Stream: true, Input: []byte(`[{"type":"message","role":"user","content":"hello"}]`), Tools: []ResponseTool{{Type: "function", Name: "shell", Description: "run", Parameters: []byte(`{"type":"object"}`)}}}, testProviderCfg)
+	ar := chatToAnthropic(or, testProviderCfg)
 	if ar.Model != "qwen3.7-max" || !ar.Stream || ar.MaxTokens == 0 {
 		t.Fatalf("bad anthropic request metadata: %+v", ar)
 	}
@@ -363,11 +646,11 @@ func TestResponsesToChatMapsBuiltInWebToolsForAnthropicModels(t *testing.T) {
 		Input:  []byte(`[{"type":"message","role":"user","content":"search the web"}]`),
 		Tools:  []ResponseTool{{Type: "web_search_preview"}, {Type: "web_search"}, {Type: "web_extractor"}, {Type: "function", Name: "shell", Parameters: []byte(`{"type":"object"}`)}},
 		Stream: true,
-	})
+	}, testProviderCfg)
 	if len(or.AnthropicTools) != 2 {
 		t.Fatalf("expected web search and fetch anthropic tools, got %+v", or.AnthropicTools)
 	}
-	ar := chatToAnthropic(or)
+	ar := chatToAnthropic(or, testProviderCfg)
 	if len(ar.Tools) != 3 {
 		t.Fatalf("expected 2 built-in tools plus shell, got %+v", ar.Tools)
 	}
@@ -385,12 +668,12 @@ func TestResponsesToChatMapsBuiltInWebToolsForAnthropicModels(t *testing.T) {
 func TestResponsesToChatSkipsEmptyToolNamesAndDefaultsParameters(t *testing.T) {
 	or := responsesToChat(ResponsesRequest{
 		Model: "minimax-m2.7",
-		Input: []byte(`[{"type":"message","role":"user","content":"hello"}]`),
+		Input: []byte(`"hello"`),
 		Tools: []ResponseTool{
 			{Type: "function", Name: ""},
 			{Type: "function", Name: "shell"},
 		},
-	})
+	}, testProviderCfg)
 	if len(or.Tools) != 1 {
 		t.Fatalf("expected one valid tool, got %+v", or.Tools)
 	}
@@ -400,7 +683,7 @@ func TestResponsesToChatSkipsEmptyToolNamesAndDefaultsParameters(t *testing.T) {
 	if string(or.Tools[0].Function.Parameters) != `{"type":"object","properties":{}}` {
 		t.Fatalf("bad default params: %s", string(or.Tools[0].Function.Parameters))
 	}
-	ar := chatToAnthropic(or)
+	ar := chatToAnthropic(or, testProviderCfg)
 	if len(ar.Tools) != 1 || ar.Tools[0].Name != "shell" || string(ar.Tools[0].InputSchema) != `{"type":"object","properties":{}}` {
 		t.Fatalf("bad anthropic tools: %+v", ar.Tools)
 	}
@@ -420,7 +703,7 @@ func TestNormalizeAnthropicRequestForStrictUpstream(t *testing.T) {
 			{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"ok","cache_control":{"type":"ephemeral"}}]}
 		]`)}},
 	}
-	normalizeAnthropicRequestForUpstream(&ar)
+	normalizeAnthropicRequestForUpstream(&ar, testProviderCfg)
 	body, err := json.Marshal(ar)
 	if err != nil {
 		t.Fatal(err)
@@ -449,7 +732,7 @@ func TestNormalizeAnthropicToolResultTruncatesLargeFetchContent(t *testing.T) {
 		}})}},
 	}
 
-	normalizeAnthropicRequestForUpstream(&ar)
+	normalizeAnthropicRequestForUpstream(&ar, testProviderCfg)
 	body, err := json.Marshal(ar)
 	if err != nil {
 		t.Fatal(err)
@@ -520,7 +803,7 @@ func TestNormalizeQwenAnthropicRequestThinkingVariants(t *testing.T) {
 				{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"pwd","cache_control":{"type":"ephemeral"}}}
 			]`)}}
 
-			normalizeAnthropicRequestForUpstream(&ar)
+			normalizeAnthropicRequestForUpstream(&ar, testProviderCfg)
 			body, err := json.Marshal(ar)
 			if err != nil {
 				t.Fatal(err)
@@ -678,8 +961,8 @@ func TestResponsesInputPreservesImages(t *testing.T) {
 }
 
 func TestResponsesImageKeepsKimiModel(t *testing.T) {
-	req := ResponsesRequest{Model: "kimi-k2.6", Input: []byte(`[{"type":"message","role":"user","content":[{"type":"input_text","text":"describe this"},{"type":"input_image","image_url":"data:image/png;base64,abc"}]}]`)}
-	out := responsesToChat(req)
+	req := ResponsesRequest{Model: "kimi-k2.6", Input: []byte(`[{"type":"message","role":"user","content":[{"type":"input_text","text":"describe this"},{"type":"input_image","image_url":"data:image/png;base64=abc"}]}]`)}
+	out := responsesToChat(req, testProviderCfg)
 	if out.Model != "kimi-k2.6" {
 		t.Fatalf("image request should keep Kimi model, got %q", out.Model)
 	}
@@ -689,15 +972,15 @@ func TestResponsesImageKeepsKimiModel(t *testing.T) {
 }
 
 func TestResponsesImageRejectsUnsupportedModel(t *testing.T) {
-	req := ResponsesRequest{Model: "deepseek-v4-pro", Input: []byte(`[{"type":"message","role":"user","content":[{"type":"input_text","text":"describe this"},{"type":"input_image","image_url":"data:image/png;base64,abc"}]}]`)}
-	out := responsesToChat(req)
+	req := ResponsesRequest{Model: "deepseek-v4-pro", Input: []byte(`[{"type":"message","role":"user","content":[{"type":"input_text","text":"describe this"},{"type":"input_image","image_url":"data:image/png;base64=abc"}]}]`)}
+	out := responsesToChat(req, testProviderCfg)
 	if err := validateImageSupport(out); err == nil || !strings.Contains(err.Error(), "deepseek-v4-pro") {
 		t.Fatalf("DeepSeek image request should be rejected, got %v", err)
 	}
 }
 
 func TestRawChatImageKeepsKimiAndStripsDetail(t *testing.T) {
-	body, err := prepareChatBody([]byte(`{"model":"kimi-k2.6","messages":[{"role":"user","content":[{"type":"text","text":"describe this"},{"type":"image_url","image_url":{"url":"data:image/png;base64,abc","detail":"high"}}]}]}`))
+	body, err := prepareChatBody([]byte(`{"model":"kimi-k2.6","messages":[{"role":"user","content":[{"type":"text","text":"describe this"},{"type":"image_url","image_url":{"url":"data:image/png;base64,abc","detail":"high"}}]}]}`), testProviderCfg)
 	if err != nil {
 		t.Fatalf("Kimi image request should validate: %v", err)
 	}
@@ -710,14 +993,14 @@ func TestRawChatImageKeepsKimiAndStripsDetail(t *testing.T) {
 }
 
 func TestRawChatImageRejectsUnsupportedModel(t *testing.T) {
-	_, err := prepareChatBody([]byte(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":[{"type":"text","text":"describe this"},{"type":"image_url","image_url":{"url":"data:image/png;base64,abc"}}]}]}`))
+	_, err := prepareChatBody([]byte(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":[{"type":"text","text":"describe this"},{"type":"image_url","image_url":{"url":"data:image/png;base64,abc"}}]}]}`), testProviderCfg)
 	if err == nil || !strings.Contains(err.Error(), "deepseek-v4-pro") {
 		t.Fatalf("DeepSeek image request should be rejected, got %v", err)
 	}
 }
 
 func TestRawChatStreamRequestsUsage(t *testing.T) {
-	body, err := prepareChatBody([]byte(`{"model":"kimi-k2.6","stream":true,"stream_options":{"foo":"bar"},"messages":[{"role":"user","content":"hello"}]}`))
+	body, err := prepareChatBody([]byte(`{"model":"kimi-k2.6","stream":true,"stream_options":{"foo":"bar"},"messages":[{"role":"user","content":"hello"}]}`), testProviderCfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -756,7 +1039,7 @@ func TestNormalizeReasoningEffort(t *testing.T) {
 }
 
 func TestRawChatReasoningEffortPassThrough(t *testing.T) {
-	body, err := prepareChatBody([]byte(`{"model":"glm-5.1","reasoning":{"effort":"xhigh"},"thinking":{"type":"enabled"},"output_config":{"reasoning":{"depth":2}},"messages":[{"role":"user","content":"hello"}]}`))
+	body, err := prepareChatBody([]byte(`{"model":"glm-5.1","reasoning":{"effort":"xhigh"},"thinking":{"type":"enabled"},"output_config":{"reasoning":{"depth":2}},"messages":[{"role":"user","content":"hello"}]}`), testProviderCfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -792,26 +1075,26 @@ func TestReasoningEffortExtraction(t *testing.T) {
 }
 
 func TestConvertedStreamingRequestsAskForUsage(t *testing.T) {
-	anthropic := convertRequest(AnthropicRequest{Model: "kimi-k2.6", Stream: true, Messages: []AMessage{{Role: "user", Content: []byte(`hello`)}}})
+	anthropic := convertRequest(AnthropicRequest{Model: "kimi-k2.6", Stream: true, Messages: []AMessage{{Role: "user", Content: []byte(`hello`)}}}, testProviderCfg)
 	if anthropic.StreamOptions == nil || !anthropic.StreamOptions.IncludeUsage {
 		t.Fatalf("anthropic conversion should request stream usage: %+v", anthropic.StreamOptions)
 	}
-	responses := responsesToChat(ResponsesRequest{Model: "kimi-k2.6", Stream: true, Input: []byte(`"hello"`)})
+	responses := responsesToChat(ResponsesRequest{Model: "kimi-k2.6", Stream: true, Input: []byte(`"hello"`)}, testProviderCfg)
 	if responses.StreamOptions == nil || !responses.StreamOptions.IncludeUsage {
 		t.Fatalf("responses conversion should request stream usage: %+v", responses.StreamOptions)
 	}
-	plain := responsesToChat(ResponsesRequest{Model: "kimi-k2.6", Input: []byte(`"hello"`)})
+	plain := responsesToChat(ResponsesRequest{Model: "kimi-k2.6", Input: []byte(`"hello"`)}, testProviderCfg)
 	if plain.StreamOptions != nil {
 		t.Fatalf("non-streaming conversion should not set stream options: %+v", plain.StreamOptions)
 	}
 }
 
 func TestConvertedRequestsForwardReasoningEffort(t *testing.T) {
-	anthropic := convertRequest(AnthropicRequest{Model: "glm-5.1", Reasoning: []byte(`{"effort":"high"}`), Messages: []AMessage{{Role: "user", Content: []byte(`[{"type":"text","text":"hello"}]`)}}})
+	anthropic := convertRequest(AnthropicRequest{Model: "glm-5.1", Reasoning: []byte(`{"effort":"high"}`), Messages: []AMessage{{Role: "user", Content: []byte(`[{"type":"text","text":"hello"}]`)}}}, testProviderCfg)
 	if anthropic.ReasoningEffort != "high" {
 		t.Fatalf("anthropic reasoning effort = %q, want high", anthropic.ReasoningEffort)
 	}
-	responses := responsesToChat(ResponsesRequest{Model: "glm-5.1", OutputConfig: []byte(`{"reasoning":{"depth":2}}`), Input: []byte(`[{"type":"message","role":"user","content":"hello"}]`)})
+	responses := responsesToChat(ResponsesRequest{Model: "glm-5.1", OutputConfig: []byte(`{"reasoning":{"depth":2}}`), Input: []byte(`[{"type":"message","role":"user","content":"hello"}]`)}, testProviderCfg)
 	if responses.ReasoningEffort != "medium" {
 		t.Fatalf("responses reasoning effort = %q, want medium", responses.ReasoningEffort)
 	}
@@ -835,7 +1118,7 @@ func TestAnthropicContentPreservesImages(t *testing.T) {
 }
 
 func TestAnthropicImageKeepsKimiModel(t *testing.T) {
-	out := convertRequest(AnthropicRequest{Model: "kimi-k2.6", Messages: []AMessage{{Role: "user", Content: []byte(`[{"type":"text","text":"what is this?"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}]`)}}})
+	out := convertRequest(AnthropicRequest{Model: "kimi-k2.6", Messages: []AMessage{{Role: "user", Content: []byte(`[{"type":"text","text":"what is this?"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}]`)}}}, testProviderCfg)
 	if out.Model != "kimi-k2.6" {
 		t.Fatalf("image request should keep Kimi model, got %q", out.Model)
 	}
@@ -845,7 +1128,7 @@ func TestAnthropicImageKeepsKimiModel(t *testing.T) {
 }
 
 func TestAnthropicImageRejectsUnsupportedModel(t *testing.T) {
-	out := convertRequest(AnthropicRequest{Model: "deepseek-v4-pro", Messages: []AMessage{{Role: "user", Content: []byte(`[{"type":"text","text":"what is this?"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}]`)}}})
+	out := convertRequest(AnthropicRequest{Model: "deepseek-v4-pro", Messages: []AMessage{{Role: "user", Content: []byte(`[{"type":"text","text":"what is this?"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}]`)}}}, testProviderCfg)
 	if err := validateImageSupport(out); err == nil || !strings.Contains(err.Error(), "deepseek-v4-pro") {
 		t.Fatalf("DeepSeek image request should be rejected, got %v", err)
 	}
