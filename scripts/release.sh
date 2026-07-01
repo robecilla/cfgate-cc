@@ -36,7 +36,7 @@ fi
 
 # Skip the interactive auth check in ci: GH_TOKEN / GITHUB_TOKEN authenticate gh
 # without a logged-in user. local devs get the helpful "run gh auth login" message.
-if [[ -z "${gh_token:-${GITHUB_TOKEN:-}}" ]]; then
+if [[ -z "${GH_TOKEN:-${GITHUB_TOKEN:-}}" ]]; then
   if ! gh auth status >/dev/null 2>&1; then
     echo "GitHub CLI is not authenticated. Run: gh auth login"
     exit 1
