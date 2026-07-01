@@ -2483,6 +2483,11 @@ func TestDebugLoggingStreamSSE(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// drain the response so the proxy's streamReader hits eof and writes
+	// the [messages] stream end line before we read the log. Close() on a
+	// streaming body returns as soon as headers are in, which races the
+	// server-side log write and flakes on fast runners.
+	_, _ = io.ReadAll(resp.Body)
 	resp.Body.Close()
 
 	logBytes, err := os.ReadFile(logPath)
