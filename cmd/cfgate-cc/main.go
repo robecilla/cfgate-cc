@@ -103,6 +103,10 @@ func newLazyFetcher[T any](fetch func() (T, error)) *lazyFetcher[T] {
 	return &lazyFetcher[T]{fetch: fetch}
 }
 
+// ponytail: data is preserved across failed refreshes so the list command
+// can show the last known good model list when models.dev is unreachable.
+// stale cache has no TTL — add an explicit refresh subcommand or a max-age
+// field here if staleness ever becomes a real complaint.
 func (f *lazyFetcher[T]) get() (T, error) {
 	f.mu.RLock()
 	if f.fetched {
@@ -111,25 +115,26 @@ func (f *lazyFetcher[T]) get() (T, error) {
 		return data, err
 	}
 	f.mu.RUnlock()
+	return f.forceFetch()
+}
 
+// forceFetch always runs the fetch under the write lock, commits data
+// only on success, and updates err either way. used by get() on first
+// access and by refresh() to re-attempt without dropping a cached value.
+func (f *lazyFetcher[T]) forceFetch() (T, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.fetched {
-		return f.data, f.err
-	}
-	f.data, f.err = f.fetch()
 	f.fetched = true
+	newData, err := f.fetch()
+	if err == nil {
+		f.data = newData
+	}
+	f.err = err
 	return f.data, f.err
 }
 
 func (f *lazyFetcher[T]) refresh() {
-	f.mu.Lock()
-	var zero T
-	f.data = zero
-	f.err = nil
-	f.fetched = false
-	f.mu.Unlock()
-	_, _ = f.get()
+	_, _ = f.forceFetch()
 }
 
 var (
@@ -453,8 +458,16 @@ func listCmd() *cobra.Command {
 		switch providerName {
 		case "opencode-go":
 			refreshAllModelsForProvider(providerName)
+			ids, usedCache, kerr := knownModelIDs()
+			if kerr != nil && len(ids) == 0 {
+				return fmt.Errorf("list: cannot reach models.dev and no cached model list available: %w", kerr)
+			}
+			if usedCache {
+				fmt.Fprintf(cmd.ErrOrStderr(),
+					"warning: models.dev fetch failed (%v); showing the last successfully cached model list\n", kerr)
+			}
 			fmt.Fprintf(out, "Upstream models (provider %s):\n", providerName)
-			for _, m := range knownModelIDs() {
+			for _, m := range ids {
 				fmt.Fprintf(out, "  %s\n", m)
 			}
 			return nil
@@ -480,25 +493,38 @@ func listCmd() *cobra.Command {
 	return cmd
 }
 
-var fallbackModelIDs = []string{"glm-5.1", "glm-5", "kimi-k2.6", "kimi-k2.5", "mimo-v2.5-pro", "mimo-v2.5", "mimo-v2-pro", "mimo-v2-omni", "minimax-m3", "minimax-m2.7", "minimax-m2.5", "deepseek-v4-pro", "deepseek-v4-flash", "qwen3.7-max", "qwen3.6-plus", "qwen3.5-plus"}
-
-func knownModelIDs() []string {
-	if ids, err := getOfficialModels(); err == nil && len(ids) > 0 {
-		out := append([]string(nil), ids...)
+// knownModelIDs returns the opencode-go model ids. usedCache is true when
+// the latest remote fetch errored and we returned the previously cached
+// list. caller should warn to stderr in that case. if no cached value
+// exists and the fetch failed, the returned slice is nil and err is set.
+func knownModelIDs() (ids []string, usedCache bool, err error) {
+	if off, oerr := getOfficialModels(); oerr == nil && len(off) > 0 {
+		out := append([]string(nil), off...)
 		sort.Strings(out)
-		return out
+		return out, false, nil
 	}
-	if models, err := getRemoteModels(); err == nil && len(models) > 0 {
-		out := make([]string, 0, len(models))
-		for id := range models {
+	remote, rerr := getRemoteModels()
+	if rerr == nil && len(remote) > 0 {
+		out := make([]string, 0, len(remote))
+		for id := range remote {
 			if strings.TrimSpace(id) != "" {
 				out = append(out, id)
 			}
 		}
 		sort.Strings(out)
-		return out
+		return out, false, nil
 	}
-	return append([]string(nil), fallbackModelIDs...)
+	if len(remote) > 0 {
+		out := make([]string, 0, len(remote))
+		for id := range remote {
+			if strings.TrimSpace(id) != "" {
+				out = append(out, id)
+			}
+		}
+		sort.Strings(out)
+		return out, true, rerr
+	}
+	return nil, false, rerr
 }
 
 type openCodeModelMetadata struct {
@@ -1090,7 +1116,8 @@ func printLaunchMapping(tool string, mapping map[string]string) {
 
 func knownOpenCodeModel(model string) bool {
 	model = modelID(model)
-	for _, id := range knownModelIDs() {
+	ids, _, _ := knownModelIDs()
+	for _, id := range ids {
 		if id == model {
 			return true
 		}
@@ -1107,7 +1134,8 @@ func knownModelForProvider(name, model string) bool {
 	id := modelID(model)
 	switch name {
 	case "opencode-go":
-		for _, candidate := range knownModelIDs() {
+		ids, _, _ := knownModelIDs()
+		for _, candidate := range ids {
 			if candidate == id {
 				return true
 			}
@@ -1140,7 +1168,11 @@ func providerKnownModelIDs(name string, p ProviderConfig) ([]string, error) {
 	switch name {
 	case "opencode-go":
 		refreshAllModels()
-		return knownModelIDs(), nil
+		// ponytail: catalog silently uses stale cache on fetch failure; the
+		// user-facing list command is where the warning surfaces. add error
+		// surfacing here if the codex-side catalog ever needs to differentiate.
+		ids, _, _ := knownModelIDs()
+		return ids, nil
 	case "cloudflare":
 		return cloudflareModelIDs(p)
 	default:
@@ -3967,7 +3999,8 @@ func writeCodexModelCatalog(path string, p ProviderConfig) error {
 	sort.Strings(keys)
 	for i, source := range keys {
 		target := mappings["codex"][source]
-		addModel(source, target, "cfgate-cc mapping to "+target, len(knownModelIDs())+i)
+		knownIDs, _, _ := knownModelIDs()
+		addModel(source, target, "cfgate-cc mapping to "+target, len(knownIDs)+i)
 	}
 	b, err := json.MarshalIndent(map[string]any{"models": models}, "", "  ")
 	if err != nil {
