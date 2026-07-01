@@ -401,20 +401,20 @@ func TestListProviderDispatch(t *testing.T) {
 		}
 	})
 
-	t.Run("cloudflare hits live /v1/models", func(t *testing.T) {
+	t.Run("cloudflare hits live /ai/models/search", func(t *testing.T) {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !strings.HasSuffix(r.URL.Path, "/models") {
+			if !strings.HasSuffix(r.URL.Path, "/ai/models/search") {
 				http.NotFound(w, r)
 				return
 			}
 			if r.Header.Get("Authorization") == "" {
-				t.Errorf("missing Authorization on cloudflare /v1/models call")
+				t.Errorf("missing Authorization on cloudflare /ai/models/search call")
 			}
 			w.Header().Set("Content-Type", "application/json")
-			fmt.Fprintln(w, `{"data":[{"id":"@cf/meta/llama-3.1-8b-instruct"},{"id":"workers-ai/@cf/zai-org/glm-5.2"}]}`)
+			fmt.Fprintln(w, `{"success":true,"result":[{"id":"@cf/meta/llama-3.1-8b-instruct","name":"@cf/meta/llama-3.1-8b-instruct"},{"id":"workers-ai/@cf/zai-org/glm-5.2","name":"workers-ai/@cf/zai-org/glm-5.2"}]}`)
 		}))
 		defer srv.Close()
-		if err := os.WriteFile(filepath.Join(dir, "cloudflare.json"), []byte(`{"upstream_base_url":"`+srv.URL+`","upstream_api_key":"tok","upstream_auth":"bearer"}`), 0600); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, "cloudflare.json"), []byte(`{"upstream_base_url":"`+srv.URL+`/ai/v1","upstream_api_key":"tok","upstream_auth":"bearer"}`), 0600); err != nil {
 			t.Fatal(err)
 		}
 		defer os.Remove(filepath.Join(dir, "cloudflare.json"))
