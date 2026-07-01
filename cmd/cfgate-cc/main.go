@@ -519,11 +519,16 @@ func listCmd() *cobra.Command {
 // list. caller should warn to stderr in that case. if no cached value
 // exists and the fetch failed, the returned slice is nil and err is set.
 func knownModelIDs() (ids []string, usedCache bool, err error) {
-	if off, oerr := getOfficialModels(); oerr == nil && len(off) > 0 {
+	off, oerr := getOfficialModels()
+	if oerr == nil && len(off) > 0 {
 		out := append([]string(nil), off...)
 		sort.Strings(out)
 		return out, false, nil
 	}
+	// ponytail: stale-cache branch mirrors the remote path below — forceFetch
+	// preserves f.data on failed refreshes, so a populated officialModels
+	// cache survives a flaky opencode.ai call. only mirror remote when remote
+	// itself didn't make it further; otherwise the fresh remote list wins.
 	remote, rerr := getRemoteModels()
 	if rerr == nil && len(remote) > 0 {
 		out := make([]string, 0, len(remote))
@@ -545,7 +550,12 @@ func knownModelIDs() (ids []string, usedCache bool, err error) {
 		sort.Strings(out)
 		return out, true, rerr
 	}
-	return nil, false, rerr
+	if len(off) > 0 {
+		out := append([]string(nil), off...)
+		sort.Strings(out)
+		return out, true, oerr
+	}
+	return nil, false, oerr
 }
 
 type openCodeModelMetadata struct {
