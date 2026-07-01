@@ -53,6 +53,16 @@ if ! git diff --quiet || ! git diff --cached --quiet; then
   exit 1
 fi
 
+# Defensive: if this tag already has a published release, do nothing.
+# catches re-runs of the auto-release workflow where the commit range
+# produces a version we already shipped (e.g. a tag pointing at HEAD
+# itself, or a workflow firing twice on the same merge).
+if gh release view "$TAG" --repo "$REPO" --json isDraft 2>/dev/null \
+    | grep -q '"isDraft":false'; then
+  echo "tag $TAG already published; nothing to do."
+  exit 0
+fi
+
 if ! git rev-parse "$TAG" >/dev/null 2>&1; then
   git tag -a "$TAG" -m "$TAG"
 fi

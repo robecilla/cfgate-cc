@@ -35,6 +35,11 @@ jobs:
 
       - name: compute next version
         id: next
+        env:
+          # level_from_labels in next-version.sh calls `gh pr list` to read
+          # release:* labels from merged prs. needs GITHUB_REPOSITORY + auth.
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           NEXT="$(bash scripts/next-version.sh)"
           if [[ -z "$NEXT" ]]; then
