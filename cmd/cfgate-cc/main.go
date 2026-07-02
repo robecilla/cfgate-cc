@@ -1390,6 +1390,10 @@ func launchCmd() *cobra.Command {
 		if err != nil {
 			return err
 		}
+		p, err := loadActiveProvider(providerName)
+		if err != nil {
+			return err
+		}
 		serverCmd, err := startLaunchServer(base, providerName)
 		if err != nil {
 			return err
@@ -1407,7 +1411,12 @@ func launchCmd() *cobra.Command {
 		}
 		c := exec.Command(bin, claudeArgs...)
 		c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
-		c.Env = append(os.Environ(), "ANTHROPIC_BASE_URL="+base, "ANTHROPIC_AUTH_TOKEN=unused")
+		// ponytail: non-empty placeholder when no key is set; claude code's startup check rejects empty tokens ("login required"). the proxy's applyUpstreamAuth signs every upstream request from cfg.UpstreamAPIKey, so the child's value is decorative.
+		authToken := p.UpstreamAPIKey
+		if authToken == "" {
+			authToken = "cfgate-cc"
+		}
+		c.Env = append(os.Environ(), "ANTHROPIC_BASE_URL="+base, "ANTHROPIC_AUTH_TOKEN="+authToken)
 		mappings, err := loadModelMappingsForProvider(providerName)
 		if err != nil {
 			return err
