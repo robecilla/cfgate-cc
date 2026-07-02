@@ -226,7 +226,7 @@ cfgate-cc instances
 cfgate-cc --name cf stop
 ```
 
-with `--name`, all state lives at `<configDir>/instances/<name>/` and the port is auto-allocated (scanning `cfg.Port+1` to `cfg.Port+100` via `net.Listen("tcp", ":0")`) and persisted to the instance config so subsequent starts reuse it. the codex profile in `~/.codex/` is also namespaced per instance (`cfgate-cc-launch-<name>.config.toml`) so two instances don't clobber each other.
+with `--name`, all state lives at `<configDir>/instances/<name>/` and the port is auto-allocated (scanning `defaultPort+1` to `defaultPort+100` by trying to bind `127.0.0.1:<port>`) and persisted to a `port` file so subsequent starts reuse it. the codex profile in `~/.codex/` is also namespaced per instance (`cfgate-cc-launch-<name>.config.toml`) so two instances don't clobber each other.
 
 ```fish
 # shell aliases for parallel use
