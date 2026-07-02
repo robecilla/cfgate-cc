@@ -60,6 +60,9 @@ defined in `modelMetadata` (`cmd/cfgate-cc/main.go`) on
 | model             | minimal | low  | medium | high  | max    |
 |-------------------|---------|------|--------|-------|--------|
 | `qwen3.7-max`     | 0       | 2048 | 4096   | 8192  | 16384  |
+| `qwen3.7-plus`    | 0       | 2048 | 4096   | 8192  | 16384  |
+| `qwen3.6-plus`    | 0       | 2048 | 4096   | 8192  | 16384  |
+| `qwen3.5-plus`    | 0       | 2048 | 4096   | 8192  | 16384  |
 | `minimax-m2.5`    | 0       | 2048 | 4096   | 8192  | 16384  |
 | `minimax-m2.7`    | 0       | 4096 | 8192   | 16384 | 32768  |
 | `minimax-m3`      | 0       | 4096 | 8192   | 16384 | 32768  |
@@ -75,7 +78,7 @@ anthropic request to the underlying workers-ai model. same table, same
 helper — no special-casing.
 
 `0` budget for a level means "no thinking field for this level". a model
-that's missing from the table (e.g. `kimi-k2.6`, `qwen3.5-plus`) gets no
+that's missing from the table (e.g. `kimi-k2.6`, `mimo-v2-omni`) gets no
 thinking field at all — the request goes through the chat-completions path
 instead, with `reasoning_effort` forwarded raw.
 
@@ -112,13 +115,16 @@ alphabetically, which would put `budget_tokens` before `type`.
 
 ## chat-completions path (non-anthropic models)
 
-`kimi-k2.6`, `qwen3.5-plus`, `qwen3.6-plus`, and other non-anthropic-routed
+`kimi-k2.6`, `mimo-v2-omni`, `deepseek-v4-flash`, and other non-anthropic-routed
 models take the chat-completions path. `applyRawChatReasoningEffort` keeps
 only `reasoning_effort` on the body and drops `reasoning`, `thinking`,
-`effort`, `level`, `depth`, `output_config`. the upstream's chat-completions
-endpoint only takes the four values `low|medium|high` (and `minimal`),
-so `max`/`xhigh` get collapsed by `normalizeReasoningEffort` before the
-request goes out. no budget table involved — the upstream picks its own
+`effort`, `level`, `depth`, `output_config`. the proxy uses
+`resolveEffortLevel` (same as the anthropic path) so `max`/`xhigh` reach
+the upstream as `max` rather than collapsing to `high`. per models.dev,
+`deepseek-v4-flash`, `deepseek-v4-pro`, and `glm-5.2` explicitly advertise
+`max` in their `reasoning_options`; for other chat-completions models the
+upstream decides whether to accept it, and a rejected `max` falls back to
+`--effort high`. no budget table on this path — the upstream picks its own
 budget.
 
 cloudflare `@cf/...` workers-ai chat models follow the same path: the body
