@@ -204,6 +204,38 @@ set `CFGATE_CC_CONFIG_DIR` to redirect the config dir (defaults to `~/.config/cf
 CFGATE_CC_CONFIG_DIR=~/.config/cfgate-cc-staging cfgate-cc serve -b
 ```
 
+## running multiple instances
+
+`cfgate-cc` can run several instances in parallel, one per upstream provider. each named instance owns its own state directory, pid file, log, and port. they're isolated — killing one doesn't touch the others.
+
+use the `--name` flag (or `CFGATE_CC_NAME` env) on every command for that instance:
+
+```bash
+# set up one instance per provider
+cfgate-cc --name cf setup cloudflare --token ... --account ... --gateway ...
+cfgate-cc --name oc setup opencode-go --api-key ...
+
+# launch them in parallel
+cfgate-cc --name cf launch claude &
+cfgate-cc --name oc launch claude &
+
+# list running instances
+cfgate-cc instances
+
+# stop one without affecting the other
+cfgate-cc --name cf stop
+```
+
+with `--name`, all state lives at `<configDir>/instances/<name>/` and the port is auto-allocated (scanning `cfg.Port+1` to `cfg.Port+100` via `net.Listen("tcp", ":0")`) and persisted to the instance config so subsequent starts reuse it. the codex profile in `~/.codex/` is also namespaced per instance (`cfgate-cc-launch-<name>.config.toml`) so two instances don't clobber each other.
+
+```fish
+# shell aliases for parallel use
+alias claude-cf 'cfgate-cc --name cf launch claude -- $argv'
+alias claude-oc 'cfgate-cc --name oc launch claude -- $argv'
+```
+
+`--name` defaults to empty, which is the original single-tenant behavior. nothing about that path changes.
+
 ## features
 
 - routes claude code through any openai-compatible upstream
