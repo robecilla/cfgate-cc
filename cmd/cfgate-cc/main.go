@@ -1390,6 +1390,10 @@ func launchCmd() *cobra.Command {
 		if err != nil {
 			return err
 		}
+		p, err := loadActiveProvider(providerName)
+		if err != nil {
+			return err
+		}
 		serverCmd, err := startLaunchServer(base, providerName)
 		if err != nil {
 			return err
@@ -1407,7 +1411,12 @@ func launchCmd() *cobra.Command {
 		}
 		c := exec.Command(bin, claudeArgs...)
 		c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
-		c.Env = append(os.Environ(), "ANTHROPIC_BASE_URL="+base, "ANTHROPIC_AUTH_TOKEN=unused")
+		// ponytail: non-empty placeholder when no key is set; claude code's startup check rejects empty tokens ("login required"). the proxy's applyUpstreamAuth signs every upstream request from cfg.UpstreamAPIKey, so the child's value is decorative.
+		authToken := p.UpstreamAPIKey
+		if authToken == "" {
+			authToken = "cfgate-cc"
+		}
+		c.Env = append(os.Environ(), "ANTHROPIC_BASE_URL="+base, "ANTHROPIC_AUTH_TOKEN="+authToken)
 		mappings, err := loadModelMappingsForProvider(providerName)
 		if err != nil {
 			return err
@@ -1446,6 +1455,10 @@ func launchCmd() *cobra.Command {
 					"ANTHROPIC_SMALL_FAST_MODEL="+haiku,
 				)
 			}
+		}
+		// ponytail: writes .claude/settings.json so the supervisor and agent-view subagents also route through our proxy. the supervisor strips ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN from the shell env, so env vars on the child process aren't enough.
+		if err := writeClaudeSettings(base, authToken); err != nil {
+			fmt.Fprintf(os.Stderr, "cfgate-cc: warning: .claude/settings.json: %v\n", err)
 		}
 		printLaunchMapping("claude", mappings["claude"])
 		return c.Run()
@@ -4273,6 +4286,43 @@ func configDir() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".config", "cfgate-cc")
 }
+// writeClaudeSettings writes ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN into
+// the project's .claude/settings.json env block. the claude-code supervisor
+// (and thus agent-view background sessions) reads gateway endpoint vars from
+// settings.json, not from the shell, so the launch command's child-process env
+// doesn't reach subagents.
+func writeClaudeSettings(base, authToken string) error {
+	cwd, err := os.Getwd()
+	if err != nil {
+		return err
+	}
+	dir := filepath.Join(cwd, ".claude")
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return err
+	}
+	path := filepath.Join(dir, "settings.json")
+	raw, err := os.ReadFile(path)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	var s struct {
+		Env map[string]string `json:"env,omitempty"`
+	}
+	if len(raw) > 0 {
+		_ = json.Unmarshal(raw, &s)
+	}
+	if s.Env == nil {
+		s.Env = make(map[string]string)
+	}
+	s.Env["ANTHROPIC_BASE_URL"] = base
+	s.Env["ANTHROPIC_AUTH_TOKEN"] = authToken
+	raw, err = json.MarshalIndent(s, "", "  ")
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path, raw, 0644)
+}
+
 func configFile() string       { return instanceConfigFile(resolvedInstanceName) }
 func pidFile() string          { return instancePidFile(resolvedInstanceName) }
 func activeProviderFile() string { return instanceActiveProviderFile(resolvedInstanceName) }
