@@ -181,7 +181,7 @@ var (
 type ModelEndpointOverride struct {
 	Pattern           string `json:"pattern"`
 	Route             string `json:"route"`
-	ThinkingBudgetMax int    `json:"thinking_budget_max,omitempty"`
+	ThinkingBudgetMax *int   `json:"thinking_budget_max,omitempty"`
 }
 
 type Config struct {
@@ -1320,7 +1320,8 @@ func modelUsesAnthropicEndpoint(model string, cfg ProviderConfig) bool {
 // if any glob in cfg.EndpointOverrides matches. The bool reports whether a
 // glob matched at all — a 0 max is a valid override (escape hatch to disable
 // thinking for the matched model) and must not be conflated with "no
-// override".
+// override". A matched glob whose ThinkingBudgetMax is nil (a routing-only
+// entry) is not an override and returns ok=false.
 func modelThinkingBudgetMax(model string, cfg ProviderConfig) (int, bool) {
 	id := modelID(model)
 	for _, ov := range cfg.EndpointOverrides {
@@ -1328,8 +1329,8 @@ func modelThinkingBudgetMax(model string, cfg ProviderConfig) (int, bool) {
 			continue
 		}
 		matched, err := path.Match(ov.Pattern, id)
-		if err == nil && matched {
-			return ov.ThinkingBudgetMax, true
+		if err == nil && matched && ov.ThinkingBudgetMax != nil {
+			return *ov.ThinkingBudgetMax, true
 		}
 	}
 	return 0, false

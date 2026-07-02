@@ -20,14 +20,14 @@ table is for.
 claude code + codex send effort under one of these top-level fields on the
 `AnthropicRequest`:
 
-- `thinking` — `{type: enabled, budget_tokens: N}` or `{type: disabled}`
 - `reasoning` — `{effort: "high"}` (nested)
+- `thinking` — `{type: enabled, budget_tokens: N}` or `{type: disabled}`
+- `output_config` — nested, e.g. `{"reasoning": {"effort": "medium"}}` or
+  `{"reasoning": {"depth": 2}}`
 - `reasoning_effort` — bare string, e.g. `"high"`
 - `effort` — bare string, e.g. `"max"`
 - `level` — bare string or number, e.g. `"2"` or `4`
 - `depth` — nested object, e.g. `{"level": "high"}`
-- `output_config` — nested, e.g. `{"reasoning": {"effort": "medium"}}` or
-  `{"reasoning": {"depth": 2}}`
 
 `anthropicThinkingForRequest` walks them in that order and takes the first
 non-empty value. the walker is `reasoningEffortFromRaw` (reused from the

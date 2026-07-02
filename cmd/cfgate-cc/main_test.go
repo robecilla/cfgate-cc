@@ -1132,7 +1132,7 @@ func TestNormalizeKimiCodeAnthropicRequestThinkingVariants(t *testing.T) {
 }
 
 func TestAnthropicThinkingForRequest(t *testing.T) {
-	cfgWithMax := ProviderConfig{EndpointOverrides: []ModelEndpointOverride{{Pattern: "qwen3.7-max", ThinkingBudgetMax: 999}}}
+	cfgWithMax := ProviderConfig{EndpointOverrides: []ModelEndpointOverride{{Pattern: "qwen3.7-max", ThinkingBudgetMax: ptr(999)}}}
 	for _, tc := range []struct {
 		name    string
 		req     AnthropicRequest
@@ -1154,7 +1154,8 @@ func TestAnthropicThinkingForRequest(t *testing.T) {
 		{name: "unknown level returns nil", req: AnthropicRequest{Model: "qwen3.7-max", Effort: []byte(`"gibberish"`)}, wantNil: true},
 		{name: "model without budget returns nil", req: AnthropicRequest{Model: "kimi-k2.6", Effort: []byte(`"high"`)}, wantNil: true},
 		{name: "override thinking_budget_max wins", req: AnthropicRequest{Model: "qwen3.7-max", Effort: []byte(`"high"`)}, cfg: cfgWithMax, want: `"budget_tokens":999`},
-		{name: "override thinking_budget_max=0 falls back to no thinking", req: AnthropicRequest{Model: "qwen3.7-max", Effort: []byte(`"high"`)}, cfg: ProviderConfig{EndpointOverrides: []ModelEndpointOverride{{Pattern: "qwen3.7-max", ThinkingBudgetMax: 0}}}, wantNil: true},
+		{name: "override thinking_budget_max=0 falls back to no thinking", req: AnthropicRequest{Model: "qwen3.7-max", Effort: []byte(`"high"`)}, cfg: ProviderConfig{EndpointOverrides: []ModelEndpointOverride{{Pattern: "qwen3.7-max", ThinkingBudgetMax: ptr(0)}}}, wantNil: true},
+		{name: "routing-only override keeps table budget", req: AnthropicRequest{Model: "qwen3.7-max", Effort: []byte(`"high"`)}, cfg: ProviderConfig{EndpointOverrides: []ModelEndpointOverride{{Pattern: "qwen3.7-max", Route: "anthropic"}}}, want: `"budget_tokens":8192`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := tc.cfg
@@ -2724,3 +2725,5 @@ func TestDebugLoggingStreamSSE(t *testing.T) {
 		}
 	}
 }
+
+func ptr[T any](v T) *T { return &v }
