@@ -175,10 +175,13 @@ var (
 
 // ModelEndpointOverride lets a model id (matched as glob) pick its upstream
 // endpoint: "openai" (chat/completions) or "anthropic" (/messages). empty list
-// = everything routes to openai.
+// = everything routes to openai. ThinkingBudgetMax (optional) overrides every
+// per-model thinking budget entry for matching models — useful when a single
+// deployment needs a different cap than the in-code table.
 type ModelEndpointOverride struct {
-	Pattern string `json:"pattern"`
-	Route   string `json:"route"`
+	Pattern           string `json:"pattern"`
+	Route             string `json:"route"`
+	ThinkingBudgetMax int    `json:"thinking_budget_max,omitempty"`
 }
 
 type Config struct {
@@ -586,6 +589,10 @@ type openCodeModelMetadata struct {
 	DefaultReasoningLevel   any
 	ReasoningSummaries      bool
 	DefaultReasoningSummary string
+	// ThinkingBudget maps a normalized effort level (minimal|low|medium|high|max)
+	// to a budget_tokens value for the upstream /v1/messages thinking shape.
+	// zero / missing = model doesn't take a thinking field.
+	ThinkingBudget map[string]int
 }
 
 func modelMetadata(model string) openCodeModelMetadata {
@@ -633,11 +640,40 @@ func modelMetadata(model string) openCodeModelMetadata {
 		}
 		meta.UsesAnthropicEndpoint = true
 		meta.ParallelToolCalls = true
-	case "minimax-m2.7", "minimax-m2.5":
+		meta.ThinkingBudget = map[string]int{
+			"minimal": 0, "low": 4096, "medium": 8192, "high": 16384, "max": 32768,
+		}
+	case "minimax-m2.7":
 		meta.UsesAnthropicEndpoint = true
+		meta.ThinkingBudget = map[string]int{
+			"minimal": 0, "low": 4096, "medium": 8192, "high": 16384, "max": 32768,
+		}
+	case "minimax-m2.5":
+		meta.UsesAnthropicEndpoint = true
+		meta.ThinkingBudget = map[string]int{
+			"minimal": 0, "low": 2048, "medium": 4096, "high": 8192, "max": 16384,
+		}
 	case "qwen3.7-max":
 		meta.UsesAnthropicEndpoint = true
 		meta.SupportsSearchTool = true
+		meta.ThinkingBudget = map[string]int{
+			"minimal": 0, "low": 2048, "medium": 4096, "high": 8192, "max": 16384,
+		}
+	case "qwen3.7-plus", "qwen3.6-plus", "qwen3.5-plus":
+		// ponytail: same buckets as qwen3.7-max, unverified per-model values.
+		// models.dev flags these as reasoning-capable on /v1/messages; exact
+		// budget split isn't published. refine when upstream docs land.
+		meta.UsesAnthropicEndpoint = true
+		meta.ThinkingBudget = map[string]int{
+			"minimal": 0, "low": 2048, "medium": 4096, "high": 8192, "max": 16384,
+		}
+	case "glm-5.2", "kimi-k2.7-code":
+		// cloudflare workers-ai anthropic-compatible models. routed via
+		// /v1/messages, gateway header set by applyCloudflareGatewayHeader.
+		meta.UsesAnthropicEndpoint = true
+		meta.ThinkingBudget = map[string]int{
+			"minimal": 0, "low": 2048, "medium": 4096, "high": 8192, "max": 16384,
+		}
 	case "kimi-k2.6", "kimi-k2.5", "mimo-v2-omni":
 		if len(meta.InputModalities) == 1 && meta.InputModalities[0] == "text" {
 			meta.InputModalities = []string{"text", "image"}
@@ -1280,6 +1316,25 @@ func modelUsesAnthropicEndpoint(model string, cfg ProviderConfig) bool {
 	return modelMetadata(model).UsesAnthropicEndpoint
 }
 
+// modelThinkingBudgetMax returns the override max thinking budget for a model
+// if any glob in cfg.EndpointOverrides matches. The bool reports whether a
+// glob matched at all — a 0 max is a valid override (escape hatch to disable
+// thinking for the matched model) and must not be conflated with "no
+// override".
+func modelThinkingBudgetMax(model string, cfg ProviderConfig) (int, bool) {
+	id := modelID(model)
+	for _, ov := range cfg.EndpointOverrides {
+		if ov.Pattern == "" {
+			continue
+		}
+		matched, err := path.Match(ov.Pattern, id)
+		if err == nil && matched {
+			return ov.ThinkingBudgetMax, true
+		}
+	}
+	return 0, false
+}
+
 func modelSupportsImages(model string) bool {
 	for _, modality := range modelMetadata(model).InputModalities {
 		if modality == "image" {
@@ -1915,9 +1970,10 @@ func normalizeAnthropicRequestForUpstream(ar *AnthropicRequest, p ProviderConfig
 	// OpenCode Go's Anthropic-compatible endpoint is stricter than Anthropic's
 	// Claude endpoint for some model families (notably qwen3.7-max). Claude Code
 	// can send Anthropic-specific prompt-caching and extended-thinking fields that
-	// make those upstreams return "Request body format invalid". Keep the core
-	// Messages API shape and strip the extensions before forwarding.
-	ar.Thinking = nil
+	// make those upstreams return "Request body format invalid". Translate the
+	// user-facing effort/reasoning/thinking fields into the upstream's
+	// {type: enabled, budget_tokens: N} thinking shape and drop the rest.
+	ar.Thinking = anthropicThinkingForRequest(ar, p)
 	ar.Reasoning = nil
 	ar.ReasoningEffort = nil
 	ar.Effort = nil
@@ -1928,6 +1984,49 @@ func normalizeAnthropicRequestForUpstream(ar *AnthropicRequest, p ProviderConfig
 	for i := range ar.Messages {
 		ar.Messages[i].Content = normalizeAnthropicContent(ar.Messages[i].Content)
 	}
+}
+
+// anthropicThinkingForRequest translates the various user-facing effort /
+// reasoning / thinking knobs into the upstream's
+// {type: enabled, budget_tokens: N} shape, looked up per-model. Returns nil
+// when the user didn't request thinking, the model has no budget for the
+// resolved level, or the override cap is 0 (escape hatch back to the old
+// "no thinking field" behavior).
+func anthropicThinkingForRequest(ar *AnthropicRequest, p ProviderConfig) json.RawMessage {
+	// walk the candidates directly with the raw walker — going through
+	// downstreamReasoningEffort would route the value through
+	// normalizeReasoningEffort, which collapses "max" to "high" and would
+	// lose the max bucket from the per-model budget table.
+	var effort string
+	for _, raw := range []json.RawMessage{ar.Reasoning, ar.Thinking, ar.OutputConfig, ar.ReasoningEffort, ar.Effort, ar.Level, ar.Depth} {
+		if e := reasoningEffortFromRaw(raw); e != "" {
+			effort = e
+			break
+		}
+	}
+	level := resolveEffortLevel(effort)
+	if level == "" || level == "minimal" {
+		return nil
+	}
+	budget := modelMetadata(ar.Model).ThinkingBudget[level]
+	if max, ok := modelThinkingBudgetMax(ar.Model, p); ok {
+		// override always wins, even when 0 — that's the escape hatch to
+		// disable thinking for a model that the user requested it on.
+		budget = max
+	}
+	if budget <= 0 {
+		return nil
+	}
+	// struct not map: json.Marshal on map[string]any sorts keys alphabetically,
+	// which would reorder the upstream's expected {type, budget_tokens} shape.
+	out, err := json.Marshal(struct {
+		Type        string `json:"type"`
+		BudgetTokens int   `json:"budget_tokens"`
+	}{Type: "enabled", BudgetTokens: budget})
+	if err != nil {
+		return nil
+	}
+	return out
 }
 
 func normalizeAnthropicSystem(raw json.RawMessage) json.RawMessage {
@@ -2145,7 +2244,7 @@ func applyRawChatReasoningEffort(req map[string]any) bool {
 func rawChatReasoningEffort(req map[string]any) string {
 	for _, key := range []string{"reasoning_effort", "reasoning", "thinking", "output_config", "effort", "level", "depth"} {
 		if effort := reasoningEffortFromAny(req[key]); effort != "" {
-			return normalizeReasoningEffort(effort)
+			return resolveEffortLevel(effort)
 		}
 	}
 	return ""
@@ -2154,7 +2253,7 @@ func rawChatReasoningEffort(req map[string]any) string {
 func downstreamReasoningEffort(values ...json.RawMessage) string {
 	for _, raw := range values {
 		if effort := reasoningEffortFromRaw(raw); effort != "" {
-			return normalizeReasoningEffort(effort)
+			return resolveEffortLevel(effort)
 		}
 	}
 	return ""
@@ -2212,6 +2311,27 @@ func normalizeReasoningEffort(effort string) string {
 		return "medium"
 	case "3", "4", "high", "xhigh", "max", "maximum", "deep", "true", "enabled":
 		return "high"
+	default:
+		return strings.TrimSpace(effort)
+	}
+}
+
+// resolveEffortLevel is normalizeReasoningEffort's stricter sibling: it keeps
+// "max" (and its aliases) as a distinct bucket so per-model thinking budgets
+// and reasoning_effort payloads can carry it. Used by both the Anthropic
+// thinking-block path and the chat-completions /v1/chat/completions path.
+func resolveEffortLevel(effort string) string {
+	switch strings.ToLower(strings.TrimSpace(effort)) {
+	case "0", "minimal", "min", "none", "off", "disabled", "false":
+		return "minimal"
+	case "1", "low", "light":
+		return "low"
+	case "2", "medium", "med", "normal", "default":
+		return "medium"
+	case "3", "high", "deep", "true", "enabled":
+		return "high"
+	case "4", "xhigh", "max", "maximum":
+		return "max"
 	default:
 		return strings.TrimSpace(effort)
 	}

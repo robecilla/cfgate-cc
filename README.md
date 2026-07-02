@@ -117,6 +117,21 @@ cfgate-cc mapping --provider opencode-go claude unset claude-opus   # aliases: r
 cfgate-cc mapping open       # open the mapping file in $EDITOR
 ```
 
+### thinking / effort passthrough
+
+anthropic-routed models (qwen3.7-max, the minimax family, and the cloudflare workers-ai glm-5.2 / kimi-k2.7-code) take a `{type: enabled, budget_tokens: N}` thinking field on the upstream `/v1/messages` request. `cfgate-cc` translates the user-facing effort / reasoning / thinking knobs claude and codex send into that shape, looking up the per-model budget from an in-code table:
+
+| model             | low  | medium | high  | max    |
+|-------------------|------|--------|-------|--------|
+| `qwen3.7-max`     | 2048 | 4096   | 8192  | 16384  |
+| `minimax-m2.5`    | 2048 | 4096   | 8192  | 16384  |
+| `minimax-m2.7`    | 4096 | 8192   | 16384 | 32768  |
+| `minimax-m3`      | 4096 | 8192   | 16384 | 32768  |
+| `glm-5.2`         | 2048 | 4096   | 8192  | 16384  |
+| `kimi-k2.7-code`  | 2048 | 4096   | 8192  | 16384  |
+
+`max` is its own bucket — `xhigh` and `4` map to it. `minimal` (and unset) leaves the thinking field off entirely. override a model (or a glob) with a hard cap by adding `thinking_budget_max` to an `endpoint_overrides` entry in the provider config — the cap replaces the table value for the matched models. set it to `0` to disable thinking for a model even when the user requested it.
+
 ### migrating mappings from a pre-split config
 
 the mapping file used to be tool-scoped (`{"claude": {...}, "codex": {...}}`). it's now per-provider. on first read for a known provider, the legacy entries are lifted into that provider's section in place and the file is rewritten in the new shape — your existing mappings carry over, no manual `mapping set` re-run needed:
@@ -156,6 +171,8 @@ claude-cf "echo hi"
 ```
 
 the model id for cloudflare workers-ai accepts both `workers-ai/@cf/...` and bare `@cf/...` — the `workers-ai/` prefix is stripped automatically. the full list of available cloudflare ai gateway model ids lives in the [cloudflare ai models docs](https://developers.cloudflare.com/ai/models/index.md).
+
+`@cf/...` workers-ai models that are anthropic-shaped on the cloudflare side (`glm-5.2`, `kimi-k2.7-code`) auto-route to the gateway's `/ai/v1/messages` anthropic adapter — no `endpoint_overrides` glob needed. the same thinking translation described in [thinking / effort passthrough](#thinking--effort-passthrough) applies, and the gateway id rides on the `cf-aig-gateway-id` header. for third-party anthropic-shaped models on cloudflare (e.g. `anthropic/claude-sonnet-4`), add an `endpoint_overrides` entry with `route: "anthropic"` to opt in.
 
 ## opencode-go
 
