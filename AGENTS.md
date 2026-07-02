@@ -33,3 +33,17 @@ override hatch for every weird case.
 
 canonical logic lives in `scripts/next-version.sh` — if this doc and the
 script disagree, the script is right; update this file.
+
+## Agent skills
+
+### Issue tracker
+
+GitHub Issues via the `gh` cli. external PRs are not a triage surface. see `docs/agents/issue-tracker.md`.
+
+### Triage labels
+
+the five canonical role names (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix`) used verbatim. see `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+single-context: one `CONTEXT.md` + `docs/adr/` at the repo root. see `docs/agents/domain.md`.
