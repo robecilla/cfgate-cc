@@ -787,12 +787,12 @@ func TestMappingSetUsesPerProviderFormat(t *testing.T) {
 func TestAnthropicEndpointModels(t *testing.T) {
 	// empty cfg: no overrides, falls back to modelMetadata heuristic
 	cfg := ProviderConfig{}
-	for _, model := range []string{"qwen3.7-max", "minimax-m3", "minimax-m2.7", "opencode-go/qwen3.7-max", "opencode-go/minimax-m3"} {
+	for _, model := range []string{"qwen3.7-max", "qwen3.7-plus", "qwen3.6-plus", "qwen3.5-plus", "minimax-m3", "minimax-m2.7", "glm-5.2", "kimi-k2.7-code", "opencode-go/qwen3.7-max", "opencode-go/qwen3.7-plus", "opencode-go/minimax-m3", "opencode-go/glm-5.2", "opencode-go/kimi-k2.7-code"} {
 		if !modelUsesAnthropicEndpoint(model, cfg) {
 			t.Fatalf("%s should use Anthropic-compatible upstream", model)
 		}
 	}
-	for _, model := range []string{"kimi-k2.6", "qwen3.6-plus", "qwen3.5-plus"} {
+	for _, model := range []string{"kimi-k2.6"} {
 		if modelUsesAnthropicEndpoint(model, cfg) {
 			t.Fatalf("%s should use OpenAI-compatible upstream", model)
 		}
@@ -882,12 +882,24 @@ func TestNormalizeAnthropicRequestForStrictUpstream(t *testing.T) {
 		t.Fatal(err)
 	}
 	out := string(body)
-	for _, gone := range []string{"opencode-go/", "thinking", "reasoning", "output_config", "cache_control", "signature"} {
+	for _, gone := range []string{"opencode-go/", "reasoning", "output_config", "cache_control", "signature"} {
 		if strings.Contains(out, gone) {
 			t.Fatalf("strict upstream request still contains %q: %s", gone, out)
 		}
 	}
-	for _, want := range []string{`"model":"qwen3.7-max"`, `"system":"rules"`, `"type":"text"`, `"text":"hello"`, `"tool_use_id":"toolu_1"`, `"type":"web_search_20250305"`, `"name":"web_search"`, `"max_uses":8`, `"allowed_domains":["example.com"]`} {
+	for _, want := range []string{
+		`"model":"qwen3.7-max"`,
+		`"system":"rules"`,
+		`"type":"text"`,
+		`"text":"hello"`,
+		`"tool_use_id":"toolu_1"`,
+		`"type":"web_search_20250305"`,
+		`"name":"web_search"`,
+		`"max_uses":8`,
+		`"allowed_domains":["example.com"]`,
+		`"type":"enabled"`,
+		`"budget_tokens":8192`,
+	} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("missing %q in normalized request: %s", want, out)
 		}
@@ -925,14 +937,17 @@ func TestNormalizeQwenAnthropicRequestThinkingVariants(t *testing.T) {
 	zero := 0.0
 	topP := 0.8
 	for _, tc := range []struct {
-		name string
-		req  AnthropicRequest
+		name          string
+		req           AnthropicRequest
+		expectBudget  int // 0 = expect no thinking field
 	}{
 		{
 			name: "thinking enabled with budget",
 			req: AnthropicRequest{
 				Thinking: []byte(`{"type":"enabled","budget_tokens":2048}`),
 			},
+			// walker turns type:enabled into "high" → qwen high = 8192
+			expectBudget: 8192,
 		},
 		{
 			name: "thinking disabled with zero temperature",
@@ -940,6 +955,7 @@ func TestNormalizeQwenAnthropicRequestThinkingVariants(t *testing.T) {
 				Thinking:    []byte(`{"type":"disabled"}`),
 				Temperature: &zero,
 			},
+			expectBudget: 0,
 		},
 		{
 			name: "reasoning effort high",
@@ -947,12 +963,14 @@ func TestNormalizeQwenAnthropicRequestThinkingVariants(t *testing.T) {
 				ReasoningEffort: []byte(`"high"`),
 				TopP:            &topP,
 			},
+			expectBudget: 8192,
 		},
 		{
 			name: "nested output config reasoning",
 			req: AnthropicRequest{
 				OutputConfig: []byte(`{"reasoning":{"effort":"medium"}}`),
 			},
+			expectBudget: 4096,
 		},
 		{
 			name: "legacy effort level depth fields",
@@ -961,6 +979,8 @@ func TestNormalizeQwenAnthropicRequestThinkingVariants(t *testing.T) {
 				Level:  []byte(`2`),
 				Depth:  []byte(`{"level":"high"}`),
 			},
+			// walker hits effort first → low → 2048
+			expectBudget: 2048,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -982,9 +1002,24 @@ func TestNormalizeQwenAnthropicRequestThinkingVariants(t *testing.T) {
 				t.Fatal(err)
 			}
 			out := string(body)
-			for _, gone := range []string{"opencode-go/", "thinking", "reasoning", "reasoning_effort", "output_config", "effort", "level", "depth", "cache_control", "signature", "hidden chain of thought"} {
+			// "thinking" stays now — it's where the budget lands. everything
+			// else from the upstream-rejected list still has to go.
+			for _, gone := range []string{"opencode-go/", "reasoning", "reasoning_effort", "output_config", "effort", "level", "depth", "cache_control", "signature", "hidden chain of thought"} {
 				if strings.Contains(out, gone) {
 					t.Fatalf("normalized qwen request still contains %q: %s", gone, out)
+				}
+			}
+			if tc.expectBudget == 0 {
+				if strings.Contains(out, `"thinking"`) {
+					t.Fatalf("expected no thinking field, got: %s", out)
+				}
+			} else {
+				budgetWant := fmt.Sprintf(`"budget_tokens":%d`, tc.expectBudget)
+				if !strings.Contains(out, budgetWant) {
+					t.Fatalf("missing %q in normalized qwen request: %s", budgetWant, out)
+				}
+				if !strings.Contains(out, `"type":"enabled"`) {
+					t.Fatalf("missing thinking type=enabled in normalized qwen request: %s", out)
 				}
 			}
 			for _, want := range []string{`"model":"qwen3.7-max"`, `"stream":true`, `"max_tokens":1234`, `"system":"plain rules"`, `"name":"Bash"`, `"id":"toolu_1"`, `"command":"pwd"`, `"text":"hello qwen"`} {
@@ -1002,6 +1037,147 @@ func TestNormalizeQwenAnthropicRequestThinkingVariants(t *testing.T) {
 	}
 }
 
+// cloudflare workers-ai anthropic-compatible models share the same thinking
+// budget table as qwen. cover glm-5.2 and kimi-k2.7-code with the same set of
+// inputs the qwen test uses — confirms the cloudflare path picks the table up
+// from modelMetadata just like the opencode-go path does.
+func TestNormalizeGlm5AnthropicRequestThinkingVariants(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		req          AnthropicRequest
+		expectBudget int
+	}{
+		{name: "thinking enabled with budget", req: AnthropicRequest{Thinking: []byte(`{"type":"enabled","budget_tokens":2048}`)}, expectBudget: 8192},
+		{name: "reasoning effort high", req: AnthropicRequest{ReasoningEffort: []byte(`"high"`)}, expectBudget: 8192},
+		{name: "nested output config medium", req: AnthropicRequest{OutputConfig: []byte(`{"reasoning":{"effort":"medium"}}`)}, expectBudget: 4096},
+		{name: "legacy effort low", req: AnthropicRequest{Effort: []byte(`"low"`)}, expectBudget: 2048},
+		{name: "no effort set", req: AnthropicRequest{}, expectBudget: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ar := tc.req
+			ar.Model = "opencode-go/glm-5.2"
+			ar.Messages = []AMessage{{Role: "user", Content: []byte(`"hello glm"`)}}
+			normalizeAnthropicRequestForUpstream(&ar, testProviderCfg)
+			body, err := json.Marshal(ar)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out := string(body)
+			for _, gone := range []string{"opencode-go/", "reasoning", "reasoning_effort", "output_config", "effort", "level", "depth"} {
+				if strings.Contains(out, gone) {
+					t.Fatalf("normalized glm-5.2 request still contains %q: %s", gone, out)
+				}
+			}
+			if tc.expectBudget == 0 {
+				if strings.Contains(out, `"thinking"`) {
+					t.Fatalf("expected no thinking field, got: %s", out)
+				}
+				return
+			}
+			want := fmt.Sprintf(`"budget_tokens":%d`, tc.expectBudget)
+			if !strings.Contains(out, want) {
+				t.Fatalf("missing %q in normalized glm-5.2 request: %s", want, out)
+			}
+			if !strings.Contains(out, `"type":"enabled"`) {
+				t.Fatalf("missing thinking type=enabled in normalized glm-5.2 request: %s", out)
+			}
+		})
+	}
+}
+
+func TestNormalizeKimiCodeAnthropicRequestThinkingVariants(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		req          AnthropicRequest
+		expectBudget int
+	}{
+		{name: "max effort", req: AnthropicRequest{Effort: []byte(`"max"`)}, expectBudget: 16384},
+		{name: "xhigh collapses to max bucket", req: AnthropicRequest{Effort: []byte(`"xhigh"`)}, expectBudget: 16384},
+		{name: "numeric 4 → max", req: AnthropicRequest{Effort: []byte(`4`)}, expectBudget: 16384},
+		{name: "high", req: AnthropicRequest{ReasoningEffort: []byte(`"high"`)}, expectBudget: 8192},
+		{name: "medium", req: AnthropicRequest{OutputConfig: []byte(`{"reasoning":{"effort":"medium"}}`)}, expectBudget: 4096},
+		{name: "low", req: AnthropicRequest{Effort: []byte(`"low"`)}, expectBudget: 2048},
+		{name: "no effort set", req: AnthropicRequest{}, expectBudget: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ar := tc.req
+			ar.Model = "opencode-go/kimi-k2.7-code"
+			ar.Messages = []AMessage{{Role: "user", Content: []byte(`"hello kimi"`)}}
+			normalizeAnthropicRequestForUpstream(&ar, testProviderCfg)
+			body, err := json.Marshal(ar)
+			if err != nil {
+				t.Fatal(err)
+			}
+			out := string(body)
+			for _, gone := range []string{"opencode-go/", "reasoning", "reasoning_effort", "output_config", "effort", "level", "depth"} {
+				if strings.Contains(out, gone) {
+					t.Fatalf("normalized kimi-k2.7-code request still contains %q: %s", gone, out)
+				}
+			}
+			if tc.expectBudget == 0 {
+				if strings.Contains(out, `"thinking"`) {
+					t.Fatalf("expected no thinking field, got: %s", out)
+				}
+				return
+			}
+			want := fmt.Sprintf(`"budget_tokens":%d`, tc.expectBudget)
+			if !strings.Contains(out, want) {
+				t.Fatalf("missing %q in normalized kimi-k2.7-code request: %s", want, out)
+			}
+			if !strings.Contains(out, `"type":"enabled"`) {
+				t.Fatalf("missing thinking type=enabled in normalized kimi-k2.7-code request: %s", out)
+			}
+		})
+	}
+}
+
+func TestAnthropicThinkingForRequest(t *testing.T) {
+	cfgWithMax := ProviderConfig{EndpointOverrides: []ModelEndpointOverride{{Pattern: "qwen3.7-max", ThinkingBudgetMax: 999}}}
+	for _, tc := range []struct {
+		name    string
+		req     AnthropicRequest
+		cfg     ProviderConfig
+		want    string // expected budget substring; empty = expect nil
+		wantNil bool
+	}{
+		{name: "minimal returns nil", req: AnthropicRequest{Model: "qwen3.7-max", Effort: []byte(`"minimal"`)}, wantNil: true},
+		{name: "no effort returns nil", req: AnthropicRequest{Model: "qwen3.7-max"}, wantNil: true},
+		{name: "low qwen", req: AnthropicRequest{Model: "qwen3.7-max", Effort: []byte(`"low"`)}, want: `"budget_tokens":2048`},
+		{name: "max minimax-m3", req: AnthropicRequest{Model: "minimax-m3", Effort: []byte(`"max"`)}, want: `"budget_tokens":32768`},
+		{name: "low glm-5.2", req: AnthropicRequest{Model: "glm-5.2", Effort: []byte(`"low"`)}, want: `"budget_tokens":2048`},
+		{name: "max kimi-k2.7-code", req: AnthropicRequest{Model: "kimi-k2.7-code", Effort: []byte(`"max"`)}, want: `"budget_tokens":16384`},
+		{name: "xhigh kimi-k2.7-code → max bucket", req: AnthropicRequest{Model: "kimi-k2.7-code", Effort: []byte(`"xhigh"`)}, want: `"budget_tokens":16384`},
+		{name: "max qwen3.7-plus", req: AnthropicRequest{Model: "qwen3.7-plus", Effort: []byte(`"max"`)}, want: `"budget_tokens":16384`},
+		{name: "high qwen3.6-plus", req: AnthropicRequest{Model: "qwen3.6-plus", Effort: []byte(`"high"`)}, want: `"budget_tokens":8192`},
+		{name: "low qwen3.5-plus", req: AnthropicRequest{Model: "qwen3.5-plus", Effort: []byte(`"low"`)}, want: `"budget_tokens":2048`},
+		{name: "no budget qwen3.7-plus when minimal", req: AnthropicRequest{Model: "qwen3.7-plus", Effort: []byte(`"minimal"`)}, wantNil: true},
+		{name: "unknown level returns nil", req: AnthropicRequest{Model: "qwen3.7-max", Effort: []byte(`"gibberish"`)}, wantNil: true},
+		{name: "model without budget returns nil", req: AnthropicRequest{Model: "kimi-k2.6", Effort: []byte(`"high"`)}, wantNil: true},
+		{name: "override thinking_budget_max wins", req: AnthropicRequest{Model: "qwen3.7-max", Effort: []byte(`"high"`)}, cfg: cfgWithMax, want: `"budget_tokens":999`},
+		{name: "override thinking_budget_max=0 falls back to no thinking", req: AnthropicRequest{Model: "qwen3.7-max", Effort: []byte(`"high"`)}, cfg: ProviderConfig{EndpointOverrides: []ModelEndpointOverride{{Pattern: "qwen3.7-max", ThinkingBudgetMax: 0}}}, wantNil: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := tc.cfg
+			if cfg.Name == "" && len(cfg.EndpointOverrides) == 0 {
+				cfg = testProviderCfg
+			}
+			out := anthropicThinkingForRequest(&tc.req, cfg)
+			if tc.wantNil {
+				if out != nil {
+					t.Fatalf("expected nil, got %s", string(out))
+				}
+				return
+			}
+			if out == nil {
+				t.Fatalf("expected thinking with %q, got nil", tc.want)
+			}
+			if !strings.Contains(string(out), tc.want) {
+				t.Fatalf("thinking = %s, want substring %q", string(out), tc.want)
+			}
+		})
+	}
+}
+
 func TestForwardAnthropicSendsNormalizedBody(t *testing.T) {
 	var forwarded string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1013,7 +1189,7 @@ func TestForwardAnthropicSendsNormalizedBody(t *testing.T) {
 			t.Fatal(err)
 		}
 		forwarded = string(b)
-		for _, gone := range []string{"opencode-go/", "thinking", "reasoning", "cache_control", "signature"} {
+		for _, gone := range []string{"opencode-go/", "reasoning", "cache_control", "signature"} {
 			if strings.Contains(forwarded, gone) {
 				t.Fatalf("forwarded body still contains %q: %s", gone, forwarded)
 			}
@@ -1039,7 +1215,7 @@ func TestForwardAnthropicSendsNormalizedBody(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
 	}
-	for _, want := range []string{`"model":"qwen3.7-max"`, `"system":"rules"`, `"messages"`, `"text":"hello"`} {
+	for _, want := range []string{`"model":"qwen3.7-max"`, `"system":"rules"`, `"messages"`, `"text":"hello"`, `"thinking":{"type":"enabled","budget_tokens":8192}`} {
 		if !strings.Contains(forwarded, want) {
 			t.Fatalf("missing %q in forwarded body: %s", want, forwarded)
 		}
@@ -1220,13 +1396,37 @@ func TestRawChatReasoningEffortPassThrough(t *testing.T) {
 	if err := json.Unmarshal(body, &req); err != nil {
 		t.Fatal(err)
 	}
-	if req["reasoning_effort"] != "high" {
-		t.Fatalf("reasoning_effort = %v, want high in %s", req["reasoning_effort"], string(body))
+	if req["reasoning_effort"] != "max" {
+		t.Fatalf("reasoning_effort = %v, want max in %s", req["reasoning_effort"], string(body))
 	}
 	for _, key := range []string{"reasoning", "thinking", "effort", "level", "depth", "output_config"} {
 		if _, ok := req[key]; ok {
 			t.Fatalf("%s should be stripped from forwarded chat body: %s", key, string(body))
 		}
+	}
+}
+
+// TestReasoningEffortCollapsedForChatCompletions locks in that the cloudflare
+// @cf/... workers-ai chat path keeps reasoning_effort when the user set it —
+// it has to, because the gateway header is set by the request layer, not the
+// body normalizer, and the body still has to carry the effort to the upstream
+// chat-completions endpoint.
+func TestReasoningEffortCollapsedForChatCompletions(t *testing.T) {
+	cfg := ProviderConfig{Name: "cloudflare", Gateway: "test-gw"}
+	raw := []byte(`{"model":"@cf/meta/llama-3.1-8b-instruct","reasoning_effort":"low","messages":[{"role":"user","content":"hi"}]}`)
+	body, err := prepareChatBody(raw, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var req map[string]any
+	if err := json.Unmarshal(body, &req); err != nil {
+		t.Fatal(err)
+	}
+	if req["reasoning_effort"] != "low" {
+		t.Fatalf("reasoning_effort = %v, want low in %s", req["reasoning_effort"], string(body))
+	}
+	if req["model"] != "@cf/meta/llama-3.1-8b-instruct" {
+		t.Fatalf("model = %v, want unchanged @cf/... workers-ai id", req["model"])
 	}
 }
 
@@ -1240,9 +1440,27 @@ func TestReasoningEffortExtraction(t *testing.T) {
 		{raw: []byte(`{"level":"medium"}`), want: "medium"},
 		{raw: []byte(`{"type":"enabled"}`), want: "high"},
 		{raw: []byte(`{"reasoning":{"depth":1}}`), want: "low"},
+		{raw: []byte(`"max"`), want: "max"},
+		{raw: []byte(`"xhigh"`), want: "max"},
+		{raw: []byte(`4`), want: "max"},
 	} {
 		if got := downstreamReasoningEffort(tc.raw); got != tc.want {
 			t.Fatalf("downstreamReasoningEffort(%s) = %q, want %q", string(tc.raw), got, tc.want)
+		}
+	}
+}
+
+func TestRawChatReasoningEffortPreservesMax(t *testing.T) {
+	for _, tc := range []struct {
+		req map[string]any
+		key string
+	}{
+		{req: map[string]any{"effort": "max"}, key: "effort=max"},
+		{req: map[string]any{"level": "xhigh"}, key: "level=xhigh"},
+		{req: map[string]any{"reasoning": map[string]any{"effort": "4"}}, key: "reasoning.effort=4"},
+	} {
+		if got := rawChatReasoningEffort(tc.req); got != "max" {
+			t.Fatalf("rawChatReasoningEffort(%s) = %q, want max", tc.key, got)
 		}
 	}
 }
