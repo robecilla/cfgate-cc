@@ -4389,24 +4389,6 @@ func isPortFree(port int) bool {
 	return true
 }
 
-// saveInstanceConfig writes the instance's config.json with the
-// current Config (typically: just to persist the chosen port). ponytail:
-// only used by ensureInstancePort; lift into a public saveConfig if
-// other callers show up.
-func saveInstanceConfig(cfg Config) error {
-	if resolvedInstanceName == "" {
-		return nil
-	}
-	if err := os.MkdirAll(instanceDir(resolvedInstanceName), 0755); err != nil {
-		return err
-	}
-	b, err := json.MarshalIndent(cfg, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(instanceConfigFile(resolvedInstanceName), append(b, '\n'), 0600)
-}
-
 // resolveInstanceName reads --name (or CFGATE_CC_NAME) from the command
 // invocation. precedence: explicit --name flag > CFGATE_CC_NAME env > empty.
 // empty = back-compat, single-tenant mode. checks both Local and

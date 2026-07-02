@@ -2898,6 +2898,7 @@ func TestStartLaunchServer_DoesNotKillPeer(t *testing.T) {
 	t.Cleanup(func() { _ = bProc.Process.Kill(); _, _ = bProc.Process.Wait() })
 
 	resolvedInstanceName = "A"
+	t.Cleanup(func() { resolvedInstanceName = "" })
 	if err := os.MkdirAll(instanceDir("A"), 0755); err != nil {
 		t.Fatal(err)
 	}
