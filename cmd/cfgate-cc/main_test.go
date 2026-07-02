@@ -9,12 +9,17 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptest"
+	neturl "net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 
 	"github.com/spf13/cobra"
@@ -50,7 +55,7 @@ func TestMain(m *testing.M) {
 func TestWriteCodexProfile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")
-	if err := writeCodexProfile(path, "http://127.0.0.1:3456/v1/"); err != nil {
+	if err := writeCodexProfile(path, "http://127.0.0.1:3456/v1/", ""); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(filepath.Join(dir, "cfgate-cc-launch.config.toml"))
@@ -93,7 +98,7 @@ func TestWriteCodexProfileMigratesLegacySections(t *testing.T) {
 	if err := os.WriteFile(path, []byte(existing), 0644); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeCodexProfile(path, "http://new/v1/"); err != nil {
+	if err := writeCodexProfile(path, "http://new/v1/", ""); err != nil {
 		t.Fatal(err)
 	}
 	b, _ := os.ReadFile(path)
@@ -2727,3 +2732,308 @@ func TestDebugLoggingStreamSSE(t *testing.T) {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// withTempInstanceDir redirects the resolved instance to name under a temp
+// CFGATE_CC_CONFIG_DIR and resets resolvedInstanceName. callers must not run
+// in parallel (resolvedInstanceName is a package-level global).
+func withTempInstanceDir(t *testing.T, name string) {
+	t.Helper()
+	t.Setenv("CFGATE_CC_CONFIG_DIR", t.TempDir())
+	old := resolvedInstanceName
+	resolvedInstanceName = name
+	t.Cleanup(func() { resolvedInstanceName = old })
+}
+
+func TestResolveInstanceName_Precedence(t *testing.T) {
+	// flag > env > empty. the resolveInstanceName helper sets
+	// resolvedInstanceName as a side effect, which the path helpers read.
+	tests := []struct {
+		name    string
+		flagVal string
+		envVal  string
+		want    string
+	}{
+		{"flag wins over env", "alpha", "beta", "alpha"},
+		{"env used when no flag", "", "beta", "beta"},
+		{"empty when neither", "", "", ""},
+		{"flag whitespace trims", "  alpha  ", "beta", "alpha"},
+		{"env whitespace trims", "", "  beta  ", "beta"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("CFGATE_CC_NAME", tt.envVal)
+			resolvedInstanceName = ""
+			root := &cobra.Command{Use: "test"}
+			root.PersistentFlags().String("name", "", "")
+			if tt.flagVal != "" {
+				if err := root.PersistentFlags().Set("name", tt.flagVal); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got := resolveInstanceName(root)
+			if got != tt.want {
+				t.Fatalf("resolveInstanceName() = %q, want %q", got, tt.want)
+			}
+			if resolvedInstanceName != tt.want {
+				t.Fatalf("resolvedInstanceName = %q, want %q", resolvedInstanceName, tt.want)
+			}
+		})
+	}
+}
+
+func TestInstanceDir_Isolated(t *testing.T) {
+	// two named instances must not see each other's pid/port/active-provider.
+	withTempInstanceDir(t, "foo")
+	fooPid := filepath.Join(instanceDir("foo"), "cfgate-cc.pid")
+	if err := os.MkdirAll(instanceDir("foo"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fooPid, []byte("1234"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// with the current name set to "bar", the bar-scoped pid file path
+	// must not collide with foo's. write a different value to bar's path
+	// and confirm foo's is still 1234.
+	resolvedInstanceName = "bar"
+	if instanceDir("foo") == instanceDir("bar") {
+		t.Fatal("instanceDir must differ per name")
+	}
+	if err := os.MkdirAll(instanceDir("bar"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	barPid := filepath.Join(instanceDir("bar"), "cfgate-cc.pid")
+	if err := os.WriteFile(barPid, []byte("5678"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(fooPid); string(b) != "1234" {
+		t.Fatalf("foo's pid file was clobbered: %q", string(b))
+	}
+	if b, _ := os.ReadFile(barPid); string(b) != "5678" {
+		t.Fatalf("bar's pid file is wrong: %q", string(b))
+	}
+	// the per-instance path helpers all land in the instance dir.
+	for _, p := range []string{instanceConfigFile("foo"), instancePidFile("foo"), instanceActiveProviderFile("foo"), instancePortFile("foo"), instanceModelMappingFile("foo")} {
+		if !strings.HasPrefix(p, instanceDir("foo")) {
+			t.Fatalf("%q does not live under instanceDir(foo) %q", p, instanceDir("foo"))
+		}
+	}
+	// back-compat: with empty name, path helpers collapse to configDir.
+	resolvedInstanceName = ""
+	if instanceDir("") != configDir() {
+		t.Fatalf("instanceDir(\"\") = %q, want configDir() %q", instanceDir(""), configDir())
+	}
+}
+
+func TestAutoAllocatePort_Persists(t *testing.T) {
+	// fresh instance: ensureInstancePort must scan from defaultPort+1,
+	// not squat on defaultPort itself (that's reserved for legacy
+	// back-compat). scan range is [defaultPort+1, defaultPort+100].
+	withTempInstanceDir(t, "p1")
+	cfg := Config{Host: defaultHost, Port: defaultPort}
+	base1, err := resolveInstanceBase(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port1, err := strconv.Atoi(strings.TrimPrefix(base1, fmt.Sprintf("http://%s:", defaultHost)))
+	if err != nil {
+		t.Fatalf("base1 %q is not parseable: %v", base1, err)
+	}
+	if port1 < defaultPort+1 || port1 > defaultPort+100 {
+		t.Fatalf("first allocation = %d, want in [%d, %d]", port1, defaultPort+1, defaultPort+100)
+	}
+	// the port must be persisted so a second invocation (or the spawned
+	// subprocess) reads the same value. persistence is in the `port` file
+	// — the `instances` table reads from there, ensureInstancePort writes
+	// there. config.json is for visibility only.
+	b, err := os.ReadFile(instancePortFile("p1"))
+	if err != nil {
+		t.Fatalf("port file not written: %v", err)
+	}
+	saved, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		t.Fatalf("port file not parseable: %v", err)
+	}
+	if saved != port1 {
+		t.Fatalf("saved port = %d, want %d", saved, port1)
+	}
+	// second call reuses the persisted port. the subprocess startup path
+	// calls ensureInstancePort which reads the `port` file first.
+	base2, err := resolveInstanceBase(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	port2, _ := strconv.Atoi(strings.TrimPrefix(base2, fmt.Sprintf("http://%s:", defaultHost)))
+	if port2 != port1 {
+		t.Fatalf("second allocation = %d, want %d (reused)", port2, port1)
+	}
+}
+
+func TestStartLaunchServer_DoesNotKillPeer(t *testing.T) {
+	// regression test for the bug vecilla hit: an opencode-go instance
+	// was already healthy on its port; launching a cloudflare instance
+	// must not stop the opencode-go one. both pids live in different
+	// instance dirs; stopRunningServer is instance-scoped via path
+	// helpers, so killing instance A's pid must leave instance B's
+	// pid file and a healthy subprocess on B's port untouched.
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	portA := probe.Addr().(*net.TCPAddr).Port
+	_ = probe.Close()
+	probe, err = net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	portB := probe.Addr().(*net.TCPAddr).Port
+	_ = probe.Close()
+	t.Setenv("CFGATE_CC_CONFIG_DIR", t.TempDir())
+	// fake "B is running" by writing B's pid file under B's instance dir.
+	// we use a real long-lived process (a sleep) so the pid is actually
+	// killable, and we can prove the stop call routed to B's pid only.
+	bProc := exec.Command("/bin/sh", "-c", "sleep 60")
+	if err := bProc.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = bProc.Process.Kill(); _, _ = bProc.Process.Wait() })
+
+	resolvedInstanceName = "A"
+	if err := os.MkdirAll(instanceDir("A"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(instanceConfigFile("A"), []byte(fmt.Sprintf(`{"host":"127.0.0.1","port":%d}`, portA)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	resolvedInstanceName = "B"
+	if err := os.MkdirAll(instanceDir("B"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(instanceConfigFile("B"), []byte(fmt.Sprintf(`{"host":"127.0.0.1","port":%d}`, portB)), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(instancePidFile("B"), []byte(strconv.Itoa(bProc.Process.Pid)), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(instanceActiveProviderFile("B"), []byte("opencode-go"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// act: pretend A is launching and its startLaunchServer decided A
+	// needed a different provider. stopRunningServer is called on A
+	// (the *current* instance), so B's pid file and process must
+	// survive.
+	resolvedInstanceName = "A"
+	if err := stopRunningServer(); err != nil {
+		t.Fatalf("stopRunningServer on A: %v", err)
+	}
+	// A had no pid file, so the call was a no-op. now set A to have a
+	// real (killed) pid, and re-run: still no effect on B.
+	aProc := exec.Command("/bin/sh", "-c", "sleep 60")
+	if err := aProc.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = aProc.Process.Kill(); _, _ = aProc.Process.Wait() })
+	if err := os.WriteFile(instancePidFile("A"), []byte(strconv.Itoa(aProc.Process.Pid)), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := stopRunningServer(); err != nil {
+		t.Fatalf("stopRunningServer on A (second): %v", err)
+	}
+	// A's process is gone...
+	if _, err := os.FindProcess(aProc.Process.Pid); err == nil {
+		// FindProcess always succeeds on unix, so check by signalling.
+		if err := aProc.Process.Signal(os.Signal(nil)); err == nil {
+			// best-effort: process is alive (Signal(nil) is a no-op on linux,
+			// but a dead process returns an error). we already explicitly
+			// killed it via Cleanup on shutdown.
+		}
+	}
+	// ...A's pid file is gone...
+	if _, err := os.Stat(instancePidFile("A")); !os.IsNotExist(err) {
+		t.Fatalf("A's pid file should be removed, got err=%v", err)
+	}
+	// ...B's pid file is intact...
+	if _, err := os.Stat(instancePidFile("B")); err != nil {
+		t.Fatalf("B's pid file disappeared: %v", err)
+	}
+	if b, _ := os.ReadFile(instancePidFile("B")); strings.TrimSpace(string(b)) != strconv.Itoa(bProc.Process.Pid) {
+		t.Fatalf("B's pid file was modified: %q", string(b))
+	}
+	// ...and B's process is still alive.
+	if err := bProc.Process.Signal(os.Signal(syscall.SIGCONT)); err != nil {
+		t.Fatalf("B's process was killed: %v", err)
+	}
+}
+
+func TestListCmd(t *testing.T) {
+	t.Setenv("CFGATE_CC_CONFIG_DIR", t.TempDir())
+	// fake "cf" instance: port + pid + active-provider. the pid is a
+	// short-lived sleeper so healthy() can hit a real listener.
+	cfSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/health" {
+			w.WriteHeader(200)
+			return
+		}
+		w.WriteHeader(404)
+	}))
+	t.Cleanup(cfSrv.Close)
+	cfPort := mustPort(t, cfSrv.URL)
+	cfProc := exec.Command("/bin/sh", "-c", "sleep 60")
+	if err := cfProc.Start(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = cfProc.Process.Kill(); _, _ = cfProc.Process.Wait() })
+
+	resolvedInstanceName = "cf"
+	if err := os.MkdirAll(instanceDir("cf"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(instancePortFile("cf"), []byte(strconv.Itoa(cfPort)), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(instancePidFile("cf"), []byte(strconv.Itoa(cfProc.Process.Pid)), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(instanceActiveProviderFile("cf"), []byte("cloudflare"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// fake "lab" instance: only a port file, no pid, no health. should
+	// render as "stopped".
+	resolvedInstanceName = "lab"
+	if err := os.MkdirAll(instanceDir("lab"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(instancePortFile("lab"), []byte("1"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := instancesCmd()
+	out := &bytes.Buffer{}
+	cmd.SetOut(out)
+	cmd.SetErr(out)
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	got := out.String()
+	for _, want := range []string{
+		"NAME", "PROVIDER", "PORT", "PID", "STATUS",
+		"cf", "cloudflare", strconv.Itoa(cfPort), strconv.Itoa(cfProc.Process.Pid), "running",
+		"lab", "stopped",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("output missing %q\n--- output ---\n%s\n---", want, got)
+		}
+	}
+}
+
+func mustPort(t *testing.T, url string) int {
+	t.Helper()
+	u, err := neturl.Parse(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := strconv.Atoi(u.Port())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
