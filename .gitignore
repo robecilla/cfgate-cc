@@ -9,4 +9,6 @@ dist/
 
 # local claude code permissions, per-dev
 .claude/settings.local.json
+# generated at every cfgate-cc launch with proxy url + auth token
+.claude/settings.json
 .claude/worktrees/
