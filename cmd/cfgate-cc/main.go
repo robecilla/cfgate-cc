@@ -5,11 +5,14 @@ import (
 	"bytes"
 	"container/list"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -24,6 +27,7 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
 )
 
 const (
@@ -349,7 +353,11 @@ var reasoningContentCache = struct {
 
 func main() {
 	root := &cobra.Command{Use: appName, Short: "Proxy for Claude Code and Codex CLI with a pluggable openai/anthropic-compatible upstream (cloudflare ai gateway, opencode-go/zen, etc.)", Version: version}
-	root.AddCommand(setupCmd(), listCmd(), mappingCmd(), launchCmd(), serveCmd(), stopCmd(), statusCmd())
+	root.PersistentFlags().String("name", "", "Name this instance for multi-instance setups. defaults to $CFGATE_CC_NAME. empty = single-tenant mode")
+	root.AddCommand(setupCmd(), listCmd(), mappingCmd(), launchCmd(), serveCmd(), stopCmd(), statusCmd(), instancesCmd())
+	root.PersistentPreRun = func(cmd *cobra.Command, args []string) {
+		resolveInstanceName(cmd)
+	}
 	if err := root.Execute(); err != nil {
 		os.Exit(1)
 	}
@@ -841,8 +849,10 @@ func defaultModelMappings() map[string]map[string]string {
 }
 
 // modelMappingMigratedSentinel marks that the old tool-scoped format warning
-// has already been printed. file presence = warning already shown.
-var modelMappingMigratedSentinel = func() string { return filepath.Join(configDir(), "model-mapping.migrated") }
+// has already been printed. file presence = warning already shown. per-
+// instance: each named cfgate-cc is self-contained, so its migration state
+// lives in its own dir.
+var modelMappingMigratedSentinel = func() string { return instanceModelMappingMigratedSentinel(resolvedInstanceName) }
 
 // loadAllModelMappings reads the model-mapping file. the file shape is
 // per-provider at the top level: { "opencode-go": { "claude": {...} },
@@ -862,7 +872,15 @@ var modelMappingMigratedSentinel = func() string { return filepath.Join(configDi
 // knowing the active provider would just dump the entries somewhere
 // arbitrary.
 func loadAllModelMappings(providerName string) (map[string]map[string]map[string]string, error) {
-	b, err := os.ReadFile(modelMappingFile())
+	path := modelMappingFile()
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) && resolvedInstanceName != "" {
+		// ad-hoc (auto-named) instance: fall back to the base model-mapping
+		// so all ad-hoc launches for the same provider share one config.
+		// named instances always use their own (they may have customized it).
+		path = filepath.Join(configDir(), "model-mapping.json")
+		b, err = os.ReadFile(path)
+	}
 	if errors.Is(err, os.ErrNotExist) {
 		return map[string]map[string]map[string]string{}, nil
 	}
@@ -1364,7 +1382,14 @@ func launchCmd() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		base := fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port)
+		if resolvedInstanceName == "" {
+			resolvedInstanceName = autoInstanceName(providerName)
+			fmt.Fprintf(os.Stderr, "cfgate-cc: auto-named instance %q (use --name to pick your own; `cfgate-cc instances` to see all)\n", resolvedInstanceName)
+		}
+		base, err := resolveInstanceBase(cfg)
+		if err != nil {
+			return err
+		}
 		serverCmd, err := startLaunchServer(base, providerName)
 		if err != nil {
 			return err
@@ -1437,7 +1462,14 @@ func launchCmd() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		base := fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port)
+		if resolvedInstanceName == "" {
+			resolvedInstanceName = autoInstanceName(providerName)
+			fmt.Fprintf(os.Stderr, "cfgate-cc: auto-named instance %q (use --name to pick your own; `cfgate-cc instances` to see all)\n", resolvedInstanceName)
+		}
+		base, err := resolveInstanceBase(cfg)
+		if err != nil {
+			return err
+		}
 		p, err := loadActiveProvider(providerName)
 		if err != nil {
 			return err
@@ -1446,7 +1478,7 @@ func launchCmd() *cobra.Command {
 			return fmt.Errorf("failed to configure codex: %w", err)
 		}
 		if codexConfigOnly {
-			fmt.Printf("Configured Codex profile %q in %s\n", codexProfileName, codexProfileConfigFile())
+			fmt.Printf("Configured Codex profile %q in %s\n", codexProfileNameFor(resolvedInstanceName), codexProfileConfigFile())
 			return nil
 		}
 		if err := checkCodexVersion(); err != nil {
@@ -1459,7 +1491,7 @@ func launchCmd() *cobra.Command {
 		if serverCmd != nil {
 			defer stopManagedServer(serverCmd)
 		}
-		codexArgs := []string{"--profile", codexProfileName}
+		codexArgs := []string{"--profile", codexProfileNameFor(resolvedInstanceName)}
 		if model != "" {
 			codexArgs = append(codexArgs, "-m", model)
 		}
@@ -1490,12 +1522,19 @@ func serveCmd() *cobra.Command {
 		if err != nil {
 			return err
 		}
-		if background {
-			return startBackground(providerName)
-		}
 		cfg, err := loadConfig()
 		if err != nil {
 			return err
+		}
+		if background {
+			// ensure the instance has a port allocated and persisted to
+			// config.json before spawning the subprocess. the subprocess
+			// reads loadConfig() to learn its bind port, so we have to
+			// commit the port first.
+			if _, err := resolveInstanceBase(cfg); err != nil {
+				return err
+			}
+			return startBackground(providerName)
 		}
 		p, err := loadActiveProvider(providerName)
 		if err != nil {
@@ -1558,12 +1597,117 @@ func statusCmd() *cobra.Command {
 	}}
 }
 
+// instancesCmd lists all named cfgate-cc instances under configDir()/instances/*
+// and prints a table of name, provider, port, pid, and status. empty/no
+// instances dir = "no instances" with a hint to set up one with --name.
+func instancesCmd() *cobra.Command {
+	return &cobra.Command{
+		Use:   "instances",
+		Short: "List running and configured named instances",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			out := cmd.OutOrStdout()
+			dir := filepath.Join(configDir(), "instances")
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					fmt.Fprintln(out, "no instances configured (use --name <name> to set one up)")
+					return nil
+				}
+				return err
+			}
+			fmt.Fprintf(out, "%-12s %-14s %-6s %-7s %s\n", "NAME", "PROVIDER", "PORT", "PID", "STATUS")
+			for _, e := range entries {
+				if !e.IsDir() {
+					continue
+				}
+				name := e.Name()
+				instDir := instanceDir(name)
+				port := readInstancePort(instDir)
+				provider := readInstanceActiveProvider(instDir)
+				pid := readInstancePID(instDir)
+				status := "stopped"
+				if port > 0 && healthy(fmt.Sprintf("http://%s:%d", defaultHost, port)) {
+					status = "running"
+				}
+				pidStr := "-"
+				if pid > 0 {
+					pidStr = strconv.Itoa(pid)
+				}
+				portStr := "-"
+				if port > 0 {
+					portStr = strconv.Itoa(port)
+				}
+				provStr := "-"
+				if provider != "" {
+					provStr = provider
+				}
+				fmt.Fprintf(out, "%-12s %-14s %-6s %-7s %s\n", name, provStr, portStr, pidStr, status)
+			}
+			return nil
+		},
+	}
+}
+
+func readInstancePort(dir string) int {
+	b, err := os.ReadFile(filepath.Join(dir, "port"))
+	if err != nil {
+		return 0
+	}
+	p, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		return 0
+	}
+	return p
+}
+
+// saveInstancePort writes the chosen port to the instance's `port` file.
+// ponytail: single file is enough; config.json is human-readable and the
+// truth lives here, not there.
+func saveInstancePort(port int) error {
+	if err := os.MkdirAll(instanceDir(resolvedInstanceName), 0755); err != nil {
+		return err
+	}
+	return os.WriteFile(instancePortFile(resolvedInstanceName), []byte(strconv.Itoa(port)+"\n"), 0644)
+}
+
+func readInstanceActiveProvider(dir string) string {
+	b, err := os.ReadFile(filepath.Join(dir, "active-provider"))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(b))
+}
+
+func readInstancePID(dir string) int {
+	b, err := os.ReadFile(filepath.Join(dir, "cfgate-cc.pid"))
+	if err != nil {
+		return 0
+	}
+	p, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil {
+		return 0
+	}
+	return p
+}
+
 func runServer(cfg Config, p ProviderConfig) error {
-	if err := os.MkdirAll(configDir(), 0755); err == nil {
+	if err := os.MkdirAll(instanceDir(resolvedInstanceName), 0755); err == nil {
 		_ = os.WriteFile(pidFile(), []byte(fmt.Sprint(os.Getpid())), 0644)
 		_ = os.WriteFile(activeProviderFile(), []byte(p.Name), 0644)
 		defer os.Remove(pidFile())
 		defer os.Remove(activeProviderFile())
+	}
+	// resolve the actual bind port from the instance base. when launched
+	// by `serve -b` (background), the parent already wrote the port to
+	// the `port` file via ensureInstancePort; this read reuses it. when
+	// launched standalone (no parent), this allocates.
+	base, err := resolveInstanceBase(cfg)
+	if err != nil {
+		return err
+	}
+	bindHost, bindPort, err := parseBaseURL(base)
+	if err != nil {
+		return err
 	}
 	setupDebug()
 	mux := http.NewServeMux()
@@ -1572,9 +1716,25 @@ func runServer(cfg Config, p ProviderConfig) error {
 	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) { proxyMessages(w, r, p) })
 	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) { proxyChatCompletions(w, r, p) })
 	mux.HandleFunc("/v1/responses", func(w http.ResponseWriter, r *http.Request) { proxyResponses(w, r, p) })
-	addr := fmt.Sprintf("%s:%d", cfg.Host, cfg.Port)
+	addr := fmt.Sprintf("%s:%d", bindHost, bindPort)
 	fmt.Printf("cfgate-cc proxy listening on http://%s\n", addr)
 	return http.ListenAndServe(addr, mux)
+}
+
+// parseBaseURL extracts host+port from a http://host:port/ URL. ponytail:
+// 4 lines vs pulling in net/url for a known shape.
+func parseBaseURL(base string) (string, int, error) {
+	rest := strings.TrimPrefix(base, "http://")
+	rest = strings.TrimSuffix(rest, "/")
+	host, portStr, err := net.SplitHostPort(rest)
+	if err != nil {
+		return "", 0, err
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		return "", 0, err
+	}
+	return host, port, nil
 }
 
 func proxyMessages(w http.ResponseWriter, r *http.Request, cfg ProviderConfig) {
@@ -4064,19 +4224,30 @@ func startServerProcess(detached bool, providerName string) (*exec.Cmd, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := os.MkdirAll(configDir(), 0755); err != nil {
+	instDir := instanceDir(resolvedInstanceName)
+	if err := os.MkdirAll(instDir, 0755); err != nil {
 		return nil, err
 	}
 	args := []string{"serve"}
 	cmd := exec.Command(bin, args...)
+	env := os.Environ()
 	if providerName != "" {
 		// pass the resolved name to the subprocess so its resolveProvider
 		// sees the same value. env-wins over single-configured inside the
 		// subprocess, so this is the one place the user's --provider flag
 		// has to cross the process boundary.
-		cmd.Env = append(os.Environ(), "CFGATE_CC_PROVIDER="+providerName)
+		env = append(env, "CFGATE_CC_PROVIDER="+providerName)
 	}
-	logf, err := os.OpenFile(filepath.Join(configDir(), "cfgate-cc.log"), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if resolvedInstanceName != "" {
+		// propagate --name to the subprocess so its path helpers and
+		// logfile land in the same instance dir as the parent.
+		env = append(env, "CFGATE_CC_NAME="+resolvedInstanceName)
+	}
+	cmd.Env = env
+	if err := os.MkdirAll(instanceDir(resolvedInstanceName), 0755); err != nil {
+		return nil, err
+	}
+	logf, err := os.OpenFile(instanceLogFile(resolvedInstanceName), os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return nil, err
 	}
@@ -4102,11 +4273,186 @@ func configDir() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".config", "cfgate-cc")
 }
-func configFile() string       { return filepath.Join(configDir(), "config.json") }
-func pidFile() string          { return filepath.Join(configDir(), "cfgate-cc.pid") }
-func activeProviderFile() string { return filepath.Join(configDir(), "active-provider") }
+func configFile() string       { return instanceConfigFile(resolvedInstanceName) }
+func pidFile() string          { return instancePidFile(resolvedInstanceName) }
+func activeProviderFile() string { return instanceActiveProviderFile(resolvedInstanceName) }
 
-var modelMappingFile = func() string { return filepath.Join(configDir(), "model-mapping.json") }
+var modelMappingFile = func() string { return instanceModelMappingFile(resolvedInstanceName) }
+
+// resolvedInstanceName is the --name / CFGATE_CC_NAME value for the current
+// command invocation. resolved once at command entry by resolveInstanceName
+// and read by all path helpers so a named instance's state never bleeds
+// into the global config dir. empty = back-compat mode, all state under
+// configDir() directly.
+var resolvedInstanceName string
+
+// instanceDir returns the per-instance state directory. empty name
+// returns configDir() itself so callers can use one ternary: when name
+// is set, state lives at <configDir>/instances/<name>/; when not, state
+// lives at configDir() as today. ponytail: no separate global-vs-instance
+// code paths — the instance dir collapses to configDir() in legacy mode.
+func instanceDir(name string) string {
+	if name == "" {
+		return configDir()
+	}
+	return filepath.Join(configDir(), "instances", name)
+}
+
+func instanceConfigFile(name string) string {
+	return filepath.Join(instanceDir(name), "config.json")
+}
+func instancePidFile(name string) string {
+	return filepath.Join(instanceDir(name), "cfgate-cc.pid")
+}
+func instanceActiveProviderFile(name string) string {
+	return filepath.Join(instanceDir(name), "active-provider")
+}
+func instanceLogFile(name string) string {
+	return filepath.Join(instanceDir(name), "cfgate-cc.log")
+}
+func instancePortFile(name string) string {
+	return filepath.Join(instanceDir(name), "port")
+}
+func instanceModelMappingFile(name string) string {
+	return filepath.Join(instanceDir(name), "model-mapping.json")
+}
+func instanceModelMappingMigratedSentinel(name string) string {
+	return filepath.Join(instanceDir(name), "model-mapping.migrated")
+}
+func instanceProviderConfigFile(name, provider string) string {
+	return filepath.Join(instanceDir(name), provider+".json")
+}
+
+// resolveInstanceBase returns the http base URL for the current instance.
+// in back-compat mode (no --name) the base is built from cfg.Host/cfg.Port
+// exactly as today. with --name, the port is allocated on first call: if
+// the instance config has a port, use it; otherwise scan starting at
+// cfg.Port+1 for a free port, write the chosen port back to the instance
+// config so the spawned subprocess reads the same value, and return the
+// URL. the port is committed BEFORE the subprocess starts so the kernel
+// port-bind is the only thing racing the next instance.
+//
+// ponytail: port scan uses net.Listen("tcp", ":0") — go's stdlib idiom
+// for "ask the kernel for a free port". no new dep. closes the listener
+// immediately so the port is free for the subprocess to bind. if 100
+// consecutive ports are taken, surface that as an error instead of
+// silently grabbing something weird.
+func resolveInstanceBase(cfg Config) (string, error) {
+	if resolvedInstanceName == "" {
+		return fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port), nil
+	}
+	port, err := ensureInstancePort(cfg)
+	if err != nil {
+		return "", err
+	}
+	return fmt.Sprintf("http://%s:%d", cfg.Host, port), nil
+}
+
+func ensureInstancePort(cfg Config) (int, error) {
+	// ponytail: persisted port lives in `port`, not config.json. if it's
+	// there, trust it — even if the kernel says it's busy (a healthy
+	// server is bound to it, which is exactly the case we want). never
+	// re-scan and overwrite: that loses the original port and points
+	// the next caller at a port with no server on it.
+	if p := readInstancePort(instanceDir(resolvedInstanceName)); p > 0 {
+		return p, nil
+	}
+	// no persisted port (fresh instance): scan from defaultPort+1.
+	// never squat on the legacy base port — that's reserved for
+	// back-compat (no --name) mode.
+	for p := defaultPort + 1; p <= defaultPort+100; p++ {
+		if isPortFree(p) {
+			if err := saveInstancePort(p); err != nil {
+				return 0, err
+			}
+			return p, nil
+		}
+	}
+	return 0, fmt.Errorf("no free port found in %d..%d", defaultPort+1, defaultPort+100)
+}
+
+// isPortFree reports whether the kernel can bind a tcp listener on port.
+// ponytail: bind to 127.0.0.1:<port> specifically — macOS lets [::]:port
+// and 127.0.0.1:port coexist (separate IPv4/IPv6 sockets), so the more
+// obvious ":port" form reports a free port when a v4 loopback listener
+// is already there. cfgate-cc serves on 127.0.0.1, so we test the same
+// address family.
+func isPortFree(port int) bool {
+	if port <= 0 {
+		return false
+	}
+	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return false
+	}
+	_ = l.Close()
+	return true
+}
+
+// resolveInstanceName reads --name (or CFGATE_CC_NAME) from the command
+// invocation. precedence: explicit --name flag > CFGATE_CC_NAME env > empty.
+// empty = back-compat, single-tenant mode. checks both Local and
+// Persistent flags because --name is a PersistentFlag on the root, and
+// cobra's cmd.Flags() returns only Local. falls back to env-only when
+// cmd is nil (e.g. inside a subprocess that re-resolves before serving).
+// stored in resolvedInstanceName so path helpers don't need to thread
+// the value through every signature.
+func resolveInstanceName(cmd *cobra.Command) string {
+	if cmd != nil {
+		for _, set := range []*pflag.FlagSet{cmd.Flags(), cmd.PersistentFlags()} {
+			if f := set.Lookup("name"); f != nil {
+				if v := strings.TrimSpace(f.Value.String()); v != "" {
+					resolvedInstanceName = v
+					return v
+				}
+			}
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("CFGATE_CC_NAME")); v != "" {
+		resolvedInstanceName = v
+		return v
+	}
+	resolvedInstanceName = ""
+	return ""
+}
+
+// autoInstanceName returns a unique-per-launch name like "oc-a3f2" for
+// ad-hoc `launch` invocations that didn't pass --name. ponytail: 2 random
+// bytes (16 bits) is enough for the "two tabs" use case — collision
+// probability is ~1/65k per pair. if you spin up thousands of ad-hoc
+// instances, the math changes; bump the byte count or check for
+// collisions before then.
+func autoInstanceName(provider string) string {
+	var b [2]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand failing is a broken OS. fall back to a pid-based
+		// suffix so we still get a unique name; never return "".
+		return fmt.Sprintf("%s-x%x", provider, os.Getpid())
+	}
+	return fmt.Sprintf("%s-%s", provider, hex.EncodeToString(b[:]))
+}
+
+// codexProfileFilename picks the per-instance codex profile filename. empty
+// name = the default profile name, shared with single-tenant installs.
+// named instance = "<base>-<name>.config.toml" so two instances can each
+// own a profile in ~/.codex/ without clobbering each other.
+func codexProfileFilename(name string) string {
+	if name == "" {
+		return codexProfileName + ".config.toml"
+	}
+	return codexProfileName + "-" + name + ".config.toml"
+}
+
+// codexProfileNameFor returns the codex profile name (used in --profile
+// and in [profiles.<name>] / [model_providers.<name>] section headings).
+// per-instance: two named cfgate-ccs each get a distinct profile name in
+// the shared ~/.codex/config.toml. empty = the original single-tenant name.
+func codexProfileNameFor(name string) string {
+	if name == "" {
+		return codexProfileName
+	}
+	return codexProfileName + "-" + name
+}
 
 func codexConfigFile() string {
 	home, _ := os.UserHomeDir()
@@ -4115,12 +4461,19 @@ func codexConfigFile() string {
 
 func codexProfileConfigFile() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".codex", codexProfileName+".config.toml")
+	return filepath.Join(home, ".codex", codexProfileFilename(resolvedInstanceName))
 }
 
 func codexModelCatalogFile() string {
+	return codexModelCatalogFileFor(resolvedInstanceName)
+}
+
+func codexModelCatalogFileFor(name string) string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".codex", "cfgate-cc-models.json")
+	if name == "" {
+		return filepath.Join(home, ".codex", "cfgate-cc-models.json")
+	}
+	return filepath.Join(home, ".codex", "cfgate-cc-models-"+name+".json")
 }
 
 func ensureCodexConfig(base string, p ProviderConfig) error {
@@ -4131,21 +4484,22 @@ func ensureCodexConfig(base string, p ProviderConfig) error {
 	if err := writeCodexModelCatalog(codexModelCatalogFile(), p); err != nil {
 		return err
 	}
-	return writeCodexProfile(path, strings.TrimRight(base, "/")+"/v1/")
+	return writeCodexProfile(path, strings.TrimRight(base, "/")+"/v1/", resolvedInstanceName)
 }
 
-func writeCodexProfile(path, baseURL string) error {
-	profilePath := filepath.Join(filepath.Dir(path), codexProfileName+".config.toml")
-	catalogPath := codexModelCatalogFile()
+func writeCodexProfile(path, baseURL, instanceName string) error {
+	profilePath := filepath.Join(filepath.Dir(path), codexProfileFilename(instanceName))
+	catalogPath := filepath.Join(filepath.Dir(path), filepath.Base(codexModelCatalogFileFor(instanceName)))
+	profileName := codexProfileNameFor(instanceName)
 	profileText := strings.Join([]string{
 		fmt.Sprintf("openai_base_url = %q", baseURL),
 		`forced_login_method = "api"`,
-		fmt.Sprintf("model_provider = %q", codexProfileName),
+		fmt.Sprintf("model_provider = %q", profileName),
 		fmt.Sprintf("model_catalog_json = %q", catalogPath),
 		`model_reasoning_effort = "minimal"`,
 		`model_reasoning_summary = "none"`,
 		"",
-		fmt.Sprintf("[model_providers.%s]", codexProfileName),
+		fmt.Sprintf("[model_providers.%s]", profileName),
 		`name = "Upstream",`,
 		fmt.Sprintf("base_url = %q", baseURL),
 		`wire_api = "responses"`,
@@ -4161,11 +4515,12 @@ func writeCodexProfile(path, baseURL string) error {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
-	cleaned := stripLegacyCodexProfile(text)
+	cleaned := stripLegacyCodexProfile(text, instanceName)
 	return os.WriteFile(path, []byte(cleaned), 0644)
 }
 
-func stripLegacyCodexProfile(text string) string {
+func stripLegacyCodexProfile(text, instanceName string) string {
+	target := codexProfileNameFor(instanceName)
 	var out []string
 	inRemovedSection := false
 	currentSection := ""
@@ -4173,7 +4528,7 @@ func stripLegacyCodexProfile(text string) string {
 		trimmed := strings.TrimSpace(line)
 		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
 			currentSection = trimmed
-			inRemovedSection = isLegacyCodexProfileSection(currentSection)
+			inRemovedSection = isLegacyCodexProfileSection(currentSection, target)
 			if inRemovedSection {
 				continue
 			}
@@ -4185,7 +4540,7 @@ func stripLegacyCodexProfile(text string) string {
 			parts := strings.SplitN(trimmed, "=", 2)
 			if len(parts) == 2 && strings.TrimSpace(parts[0]) == "profile" {
 				val := strings.Trim(strings.TrimSpace(parts[1]), `"'`)
-				if val == codexProfileName {
+				if val == target {
 					continue
 				}
 			}
@@ -4195,11 +4550,13 @@ func stripLegacyCodexProfile(text string) string {
 	return strings.TrimLeft(strings.Join(out, "\n"), "\n")
 }
 
-func isLegacyCodexProfileSection(section string) bool {
+func isLegacyCodexProfileSection(section, target string) bool {
 	// strip stale sections for the cfgate-cc profile name in case a user
 	// is upgrading and the prior install wrote the old name into their
-	// ~/.codex/config.toml.
-	name := codexProfileName
+	// ~/.codex/config.toml. for named instances, target is the per-
+	// instance profile name; we only strip sections matching this run's
+	// profile so peer instances' profiles in the same config.toml stay.
+	name := target
 	profiles := fmt.Sprintf("[profiles.%s", name)
 	providers := fmt.Sprintf("[model_providers.%s", name)
 	if section == fmt.Sprintf("[profiles.%s]", name) ||
@@ -4360,12 +4717,20 @@ func loadConfig() (Config, error) {
 // providerConfigFile returns the path to the per-provider config file.
 // ponytail: filename pattern fixed; do not derive from a user input.
 func providerConfigFile(name string) string {
-	return filepath.Join(configDir(), name+".json")
+	return instanceProviderConfigFile(resolvedInstanceName, name)
 }
 
 func loadProviderConfig(name string) (ProviderConfig, error) {
 	var p ProviderConfig
-	b, err := os.ReadFile(providerConfigFile(name))
+	path := providerConfigFile(name)
+	b, err := os.ReadFile(path)
+	if errors.Is(err, os.ErrNotExist) && resolvedInstanceName != "" {
+		// ad-hoc (auto-named) instance: the provider config lives in the
+		// base configDir, not in the per-instance dir. fall back so the
+		// `launch` flow works without requiring `setup --name <name>`.
+		path = filepath.Join(configDir(), name+".json")
+		b, err = os.ReadFile(path)
+	}
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return p, nil
@@ -4373,7 +4738,7 @@ func loadProviderConfig(name string) (ProviderConfig, error) {
 		return p, err
 	}
 	if err := json.Unmarshal(b, &p); err != nil {
-		return p, fmt.Errorf("parse %s: %w", providerConfigFile(name), err)
+		return p, fmt.Errorf("parse %s: %w", path, err)
 	}
 	return p, nil
 }
@@ -4382,7 +4747,7 @@ func saveProviderConfig(name string, p ProviderConfig) error {
 	if !isKnownProvider(name) {
 		return fmt.Errorf("unknown provider %q", name)
 	}
-	if err := os.MkdirAll(configDir(), 0755); err != nil {
+	if err := os.MkdirAll(instanceDir(resolvedInstanceName), 0755); err != nil {
 		return err
 	}
 	b, _ := json.MarshalIndent(p, "", "  ")
@@ -4398,10 +4763,24 @@ func saveProviderConfig(name string, p ProviderConfig) error {
 func listConfiguredProviders() ([]string, error) {
 	var out []string
 	for _, name := range knownProviders {
-		if _, err := os.Stat(providerConfigFile(name)); err == nil {
+		// ad-hoc instance: the per-instance dir won't have the provider
+		// config; the base configDir does. check both, instance first so
+		// a per-instance config can shadow the base.
+		candidates := []string{providerConfigFile(name)}
+		if resolvedInstanceName != "" {
+			candidates = append(candidates, filepath.Join(configDir(), name+".json"))
+		}
+		found := false
+		for _, p := range candidates {
+			if _, err := os.Stat(p); err == nil {
+				found = true
+				break
+			} else if !errors.Is(err, os.ErrNotExist) {
+				return nil, err
+			}
+		}
+		if found {
 			out = append(out, name)
-		} else if !errors.Is(err, os.ErrNotExist) {
-			return nil, err
 		}
 	}
 	return out, nil
