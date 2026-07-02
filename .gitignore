@@ -6,3 +6,7 @@ dist/
 .tmp/
 /oc-go-cc
 /cfgate-cc
+
+# local claude code permissions, per-dev
+.claude/settings.local.json
+.claude/worktrees/
