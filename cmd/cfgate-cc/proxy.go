@@ -65,10 +65,21 @@ var messagesEndpoint = Endpoint{
 			return nil, "", "", false, false, false, err
 		}
 		ar.Model = modelID(ar.Model)
-		ensureAnthropicRequestDefaults(&ar, cfg)
-		body, _ := json.Marshal(ar)
+		if modelUsesAnthropicEndpoint(ar.Model, cfg) {
+			// ponytail: ensureAnthropicRequestDefaults only fires on
+			// the anthropic branch in the original handler. kept here
+			// to match.
+			ensureAnthropicRequestDefaults(&ar, cfg)
+			body, _ := json.Marshal(ar)
+			return body, ar.Model, "", ar.Stream, false, true, nil
+		}
+		or := convertRequest(ar, cfg)
+		if err := validateImageSupport(or); err != nil {
+			return nil, "", "", false, false, false, err
+		}
+		body, _ := json.Marshal(or)
 		body, wireModel := cloudflarePrepareBody(body, cfg)
-		return body, ar.Model, wireModel, ar.Stream, false, false, nil
+		return body, or.Model, wireModel, ar.Stream, false, false, nil
 	},
 	StaticAnthropic: nil, // messages OAI branch shapes back to anthropic — same path as StaticOAI.
 	StreamAnthropic: nil,

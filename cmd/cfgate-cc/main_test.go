@@ -3136,3 +3136,97 @@ func TestProxyChatRoutesAnthropicByEndpointOverride(t *testing.T) {
 		t.Errorf("OAI branch was hit; should have routed to anthropic")
 	}
 }
+
+// regression: the messages Parse always returned useAnthropic=false,
+// so /v1/messages requests never took forwardAnthropic. a model
+// routed to anthropic by an endpoint override (or by metadata) was
+// sent through openAIURL with anthropic-shape bytes. greptile flagged
+// it (P1).
+func TestProxyMessagesRoutesAnthropicByEndpointOverride(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		// the anthropic branch sends the body verbatim to the
+		// anthropic upstream; respond in anthropic shape.
+		if strings.Contains(string(body), `"messages":`) && !strings.Contains(string(body), `"choices":`) {
+			_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"anthropic-routed"}]}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":"x","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"oai-passthrough"},"finish_reason":"stop"}]}`))
+	}))
+	defer upstream.Close()
+
+	cfg := ProviderConfig{
+		Name:            "opencode-go",
+		UpstreamBaseURL: upstream.URL,
+		UpstreamAPIKey:  "k",
+		UpstreamAuth:    "bearer",
+		EndpointOverrides: []ModelEndpointOverride{
+			{Pattern: "forced-anthropic", Route: "anthropic"},
+		},
+	}
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { proxyDo(w, r, cfg, messagesEndpoint) }))
+	defer proxy.Close()
+
+	resp, err := http.Post(proxy.URL+"/v1/messages", "application/json",
+		strings.NewReader(`{"model":"forced-anthropic","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "anthropic-routed") {
+		t.Errorf("expected anthropic-routed response, got %s", body)
+	}
+	if strings.Contains(string(body), "oai-passthrough") {
+		t.Errorf("OAI branch was hit; should have routed to anthropic")
+	}
+}
+
+// regression: the messages Parse was sending anthropic-shape bytes to
+// the OAI upstream on the non-anthropic branch — convertRequest was
+// missing. any real OAI upstream would 400 on the inbound. caught
+// while fixing greptile P1; same flavor of regression.
+func TestProxyMessagesConvertsToOAIOnNonAnthropicBranch(t *testing.T) {
+	var forwarded string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		forwarded = string(b)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"id":"x","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`))
+	}))
+	defer upstream.Close()
+
+	cfg := ProviderConfig{Name: "opencode-go", UpstreamBaseURL: upstream.URL, UpstreamAPIKey: "k", UpstreamAuth: "bearer"}
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { proxyDo(w, r, cfg, messagesEndpoint) }))
+	defer proxy.Close()
+
+	resp, err := http.Post(proxy.URL+"/v1/messages", "application/json",
+		strings.NewReader(`{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	// OAI shape: messages carry flat-string content
+	//   `{"role":"user","content":"hi"}`.
+	// anthropic shape: messages carry content-block arrays
+	//   `{"role":"user","content":[{"type":"text","text":"hi"}]}`.
+	// if the proxy forwarded anthropic-shape bytes, the upstream would
+	// have received the block-array form and any real OAI provider
+	// would 400.
+	if !strings.Contains(forwarded, `"content":"hi"`) {
+		t.Errorf("upstream did not receive OAI-shape body (no flat-string content): %s", forwarded)
+	}
+	if strings.Contains(forwarded, `"content":[`) {
+		t.Errorf("upstream received anthropic-shape content blocks, not OAI strings: %s", forwarded)
+	}
+	// and the inbound anthropic-only "max_tokens" should survive the
+	// convertRequest pass-through to the OAI body.
+	if !strings.Contains(forwarded, `"max_tokens":1`) {
+		t.Errorf("upstream body missing max_tokens: %s", forwarded)
+	}
+}
