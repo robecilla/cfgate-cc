@@ -3038,3 +3038,101 @@ func mustPort(t *testing.T, url string) int {
 	}
 	return p
 }
+
+// regression: the original chat handler called copyHeaders on the
+// OAI-upstream 4xx path. the collapsed scaffold dropped that line, so
+// clients lost Content-Type, Retry-After, and provider request-id
+// headers on rate-limit and other error responses. greptile flagged
+// it (P2).
+func TestProxyChatPreservesUpstreamErrorHeaders(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("Retry-After", "5")
+		w.Header().Set("x-request-id", "req-abc-123")
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte(`{"error":{"message":"rate limited","type":"rate_limit_error"}}`))
+	}))
+	defer upstream.Close()
+
+	cfg := ProviderConfig{Name: "opencode-go", UpstreamBaseURL: upstream.URL, UpstreamAPIKey: "k", UpstreamAuth: "bearer"}
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { proxyDo(w, r, cfg, chatEndpoint) }))
+	defer proxy.Close()
+
+	resp, err := http.Post(proxy.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("status = %d, want 429", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Retry-After"); got != "5" {
+		t.Errorf("Retry-After = %q, want \"5\"", got)
+	}
+	if got := resp.Header.Get("x-request-id"); got != "req-abc-123" {
+		t.Errorf("x-request-id = %q, want \"req-abc-123\"", got)
+	}
+	if got := resp.Header.Get("Content-Type"); got == "" {
+		t.Errorf("Content-Type missing on 4xx passthrough")
+	}
+}
+
+// regression: the collapsed scaffold dispatched on the cloudflare
+// wire model, which is empty for non-cloudflare providers. a chat
+// request whose model an endpoint override routes to anthropic would
+// fall into the OAI branch (metadata for "" is the default = false)
+// and get sent as anthropic-shape bytes to the OAI upstream. greptile
+// flagged it (P1). Parse now signals the dispatch via useAnthropic
+// instead of letting the scaffold recompute it.
+//
+// the upstream discriminates: an anthropic-shape request gets an
+// anthropic-shape response, an OAI-shape request gets an OAI-shape
+// response. the OAI branch copies the body verbatim (chat passthrough
+// shaper = nil), so the literal OAI-shape text appears in the client
+// response. the anthropic branch runs writeChatCompletionsResponseFromAnthropic
+// which emits the literal "anthropic-routed" text in a chat-completion
+// envelope. either branch is a 200, so we assert on body content.
+func TestProxyChatRoutesAnthropicByEndpointOverride(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(string(body), `"messages":`) && !strings.Contains(string(body), `"choices":`) {
+			// anthropic-shape inbound → respond in anthropic shape
+			_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant","content":[{"type":"text","text":"anthropic-routed"}]}`))
+			return
+		}
+		// OAI-shape inbound → respond in OAI shape
+		_, _ = w.Write([]byte(`{"id":"x","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"oai-passthrough"},"finish_reason":"stop"}]}`))
+	}))
+	defer upstream.Close()
+
+	cfg := ProviderConfig{
+		Name:            "opencode-go",
+		UpstreamBaseURL: upstream.URL,
+		UpstreamAPIKey:  "k",
+		UpstreamAuth:    "bearer",
+		EndpointOverrides: []ModelEndpointOverride{
+			{Pattern: "forced-anthropic", Route: "anthropic"},
+		},
+	}
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { proxyDo(w, r, cfg, chatEndpoint) }))
+	defer proxy.Close()
+
+	resp, err := http.Post(proxy.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"forced-anthropic","messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), "anthropic-routed") {
+		t.Errorf("expected anthropic-routed response, got %s", body)
+	}
+	if strings.Contains(string(body), "oai-passthrough") {
+		t.Errorf("OAI branch was hit; should have routed to anthropic")
+	}
+}
