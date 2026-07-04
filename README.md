@@ -69,6 +69,8 @@ if you'd rather keep the env-var style, `CFGATE_CC_UPSTREAM_BASE_URL` / `CFGATE_
 | `upstream_auth_hdr` | `CFGATE_CC_UPSTREAM_AUTH_HDR` | header name when `upstream_auth=header` |
 | `upstream_extra_hdr` | `CFGATE_CC_UPSTREAM_EXTRA_HDR` | extra headers as json object |
 | `gateway` | — | cloudflare AI gateway id. sent as `cf-aig-gateway-id` only for workers-ai (`@cf/...`) models; third-party gateway models use the default gateway and don't need the header. |
+| `account` | — | cloudflare account id. auto-derived from `upstream_base_url` on first load. needed for the `/openai` native endpoint when `openai_native` is on. |
+| `openai_native` | — | `true` → gpt-* models route through cloudflare's native `/openai` provider endpoint (transparent pass-through to openai, with the gateway injecting the stored BYOK openai key). `false` (default) → everything goes through the `/ai/v1` compat adapter. toggle at setup time with `--openai-native`. |
 | `endpoint_overrides` | — | glob → route mapping, e.g. `[{ "pattern": "claude-*", "route": "anthropic" }]` |
 
 ## provider selection
@@ -173,6 +175,39 @@ claude-cf "echo hi"
 the model id for cloudflare workers-ai accepts both `workers-ai/@cf/...` and bare `@cf/...` — the `workers-ai/` prefix is stripped automatically. the full list of available cloudflare ai gateway model ids lives in the [cloudflare ai models docs](https://developers.cloudflare.com/ai/models/index.md).
 
 `@cf/...` workers-ai models that are anthropic-shaped on the cloudflare side (`glm-5.2`, `kimi-k2.7-code`) auto-route to the gateway's `/ai/v1/messages` anthropic adapter — no `endpoint_overrides` glob needed. the same thinking translation described in [thinking / effort passthrough](#thinking--effort-passthrough) applies, and the gateway id rides on the `cf-aig-gateway-id` header. for third-party anthropic-shaped models on cloudflare (e.g. `anthropic/claude-sonnet-4`), add an `endpoint_overrides` entry with `route: "anthropic"` to opt in.
+
+### gpt-5.x via the cloudflare /openai native endpoint
+
+the `/ai/v1` compat adapter sends `max_tokens`, which gpt-5.x rejects (it requires `max_completion_tokens`). for gpt-5.x, route through cloudflare's native `/openai` provider endpoint instead — a transparent pass-through to openai, with the gateway injecting the stored BYOK openai key. opt in at setup time with `--openai-native`:
+
+```bash
+# one-time setup
+cfgate-cc setup cloudflare --token <token> --account <account> --gateway <gateway> --openai-native
+
+# route claude's three family slots to gpt-5.x
+cfgate-cc mapping --provider cloudflare claude set claude-opus   gpt-5.5
+cfgate-cc mapping --provider cloudflare claude set claude-sonnet gpt-5.4
+cfgate-cc mapping --provider cloudflare claude set claude-haiku  gpt-5.4-mini
+
+# verify
+cfgate-cc list --provider cloudflare      # includes gpt-5.5, gpt-5.4, gpt-5.4-mini
+cfgate-cc launch claude --provider cloudflare --model claude-opus
+```
+
+the resulting `cloudflare.json` looks like:
+
+```json
+{
+  "upstream_base_url": "https://api.cloudflare.com/client/v4/accounts/<account>/ai/v1",
+  "upstream_api_key": "<token>",
+  "upstream_auth": "bearer",
+  "gateway": "<gateway>",
+  "account": "<account>",
+  "openai_native": true
+}
+```
+
+on the wire, gpt-5.x requests hit `https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/openai/chat/completions` with `Authorization: ""` (blank) and `cf-aig-authorization: Bearer <token>` — blank is intentional, the gateway passes any non-empty Authorization through verbatim, which would bypass the stored BYOK openai key. workers-ai (`@cf/...`) requests still hit the legacy `/ai/v1/chat/completions` URL with a bearer token and the gateway header. the two paths coexist in the same `serve` process; the model in flight decides the route.
 
 ## opencode-go
 
