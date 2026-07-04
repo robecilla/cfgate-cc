@@ -2579,7 +2579,7 @@ func TestDebugLoggingProxyMessages(t *testing.T) {
 	setupDebug()
 
 	cfg := ProviderConfig{Name: "opencode-go", UpstreamBaseURL: upstream.URL, UpstreamAPIKey: "secret-key", UpstreamAuth: "bearer"}
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { proxyMessages(w, r, cfg) }))
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { proxyDo(w, r, cfg, messagesEndpoint) }))
 	defer proxy.Close()
 
 	body := strings.NewReader(`{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`)
@@ -2699,7 +2699,7 @@ func TestDebugLoggingStreamSSE(t *testing.T) {
 	setupDebug()
 
 	cfg := ProviderConfig{Name: "opencode-go", UpstreamBaseURL: upstream.URL, UpstreamAPIKey: "k", UpstreamAuth: "bearer"}
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { proxyMessages(w, r, cfg) }))
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { proxyDo(w, r, cfg, messagesEndpoint) }))
 	defer proxy.Close()
 
 	body := strings.NewReader(`{"model":"m","max_tokens":1,"stream":true,"messages":[{"role":"user","content":"hi"}]}`)
