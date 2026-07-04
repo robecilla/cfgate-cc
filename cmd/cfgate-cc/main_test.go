@@ -3038,3 +3038,323 @@ func mustPort(t *testing.T, url string) int {
 	}
 	return p
 }
+
+func TestSetupCloudflareNativeWritesOpenAINative(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
+	t.Setenv("CLOUDFLARE_API_TOKEN", "")
+	t.Setenv("CLOUDFLARE_ACCOUNT_ID", "")
+	t.Setenv("CLOUDFLARE_GATEWAY_ID", "")
+
+	// peers in the suite mutate resolvedInstanceName without restoring it.
+	// reset here so providerConfigFile resolves to our temp dir, not some
+	// leftover instance's dir.
+	old := resolvedInstanceName
+	resolvedInstanceName = ""
+	t.Cleanup(func() { resolvedInstanceName = old })
+
+	cmd := setupCloudflareCmd()
+	cmd.SetArgs([]string{"--token", "tok-xyz", "--account", "acct-123", "--gateway", "gw-456", "--openai-native"})
+	cmd.SetIn(strings.NewReader(""))
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := os.ReadFile(filepath.Join(dir, "cloudflare.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p ProviderConfig
+	if err := json.Unmarshal(b, &p); err != nil {
+		t.Fatal(err)
+	}
+	if !p.OpenAINative {
+		t.Fatalf("openai_native should be true, got %+v", p)
+	}
+	if p.Account != "acct-123" {
+		t.Fatalf("account = %q, want acct-123", p.Account)
+	}
+	if p.Gateway != "gw-456" {
+		t.Fatalf("gateway = %q, want gw-456", p.Gateway)
+	}
+}
+
+func TestCloudflareNativeURLBuild(t *testing.T) {
+	cfg := ProviderConfig{Account: "acct-123", Gateway: "gw-456", OpenAINative: true}
+	got := openAINativeURL(cfg)
+	want := "https://gateway.ai.cloudflare.com/v1/acct-123/gw-456/openai/chat/completions"
+	if got != want {
+		t.Fatalf("openAINativeURL = %q, want %q", got, want)
+	}
+}
+
+func TestOpenAIURLForModel(t *testing.T) {
+	// native on, workers-ai → legacy /ai/v1 (gateway header path).
+	// native on, gpt-5 → /openai native. native off, gpt-5 → /ai/v1.
+	cfg := ProviderConfig{
+		Name:            "cloudflare",
+		UpstreamBaseURL: "https://api.cloudflare.com/client/v4/accounts/acct-123/ai/v1",
+		Account:         "acct-123",
+		Gateway:         "gw-456",
+		OpenAINative:    true,
+	}
+	if got := openAIURLForModel(cfg, "@cf/zai-org/glm-5.2"); got != cfg.UpstreamBaseURL+"/chat/completions" {
+		t.Errorf("workers-ai native cfg: got %q, want compat URL", got)
+	}
+	if got := openAIURLForModel(cfg, "gpt-5.4"); got != "https://gateway.ai.cloudflare.com/v1/acct-123/gw-456/openai/chat/completions" {
+		t.Errorf("gpt-5 native cfg: got %q, want native URL", got)
+	}
+	cfg.OpenAINative = false
+	if got := openAIURLForModel(cfg, "gpt-5.4"); got != cfg.UpstreamBaseURL+"/chat/completions" {
+		t.Errorf("gpt-5 non-native cfg: got %q, want compat URL", got)
+	}
+}
+
+func TestApplyUpstreamAuthForModel(t *testing.T) {
+	// opencode-go: bearer token always sent.
+	oc := ProviderConfig{Name: "opencode-go", UpstreamAPIKey: "oc-key", UpstreamAuth: "bearer"}
+	req, _ := http.NewRequest(http.MethodPost, "http://example", nil)
+	applyUpstreamAuthForModel(req, oc, "gpt-5.4")
+	if got := req.Header.Get("Authorization"); got != "Bearer oc-key" {
+		t.Fatalf("opencode-go Authorization = %q, want Bearer oc-key", got)
+	}
+	if got := req.Header.Get("cf-aig-authorization"); got != "" {
+		t.Fatalf("opencode-go should not set cf-aig-authorization, got %q", got)
+	}
+
+	// cloudflare workers-ai: bearer token, gateway header set elsewhere.
+	cf := ProviderConfig{Name: "cloudflare", UpstreamAPIKey: "cf-key", UpstreamAuth: "bearer"}
+	req, _ = http.NewRequest(http.MethodPost, "http://example", nil)
+	applyUpstreamAuthForModel(req, cf, "@cf/zai-org/glm-5.2")
+	if got := req.Header.Get("Authorization"); got != "Bearer cf-key" {
+		t.Fatalf("cloudflare workers-ai Authorization = %q, want Bearer cf-key", got)
+	}
+	if got := req.Header.Get("cf-aig-authorization"); got != "" {
+		t.Fatalf("cloudflare workers-ai should not set cf-aig-authorization, got %q", got)
+	}
+
+	// cloudflare gpt-5: blank Authorization, cf-aig-authorization set.
+	req, _ = http.NewRequest(http.MethodPost, "http://example", nil)
+	applyUpstreamAuthForModel(req, cf, "gpt-5.4")
+	if got := req.Header.Get("Authorization"); got != "" {
+		t.Fatalf("cloudflare gpt-5 Authorization = %q, want empty (BYOK bypass guard)", got)
+	}
+	if got := req.Header.Get("cf-aig-authorization"); got != "Bearer cf-key" {
+		t.Fatalf("cloudflare gpt-5 cf-aig-authorization = %q, want Bearer cf-key", got)
+	}
+}
+
+func TestUsesMaxCompletionTokens(t *testing.T) {
+	cases := []struct {
+		model string
+		want  bool
+	}{
+		{"gpt-5.5", true},
+		{"gpt-5.4", true},
+		{"gpt-5.4-mini", true},
+		{"gpt-5", true},
+		{"gpt-4o", false},
+		{"@cf/zai-org/glm-5.2", false},
+		{"kimi-k2.7-code", false},
+	}
+	for _, c := range cases {
+		if got := usesMaxCompletionTokens(c.model); got != c.want {
+			t.Errorf("usesMaxCompletionTokens(%q) = %v, want %v", c.model, got, c.want)
+		}
+	}
+}
+
+func TestConvertRequestEmitsMaxCompletionTokensForGPT5(t *testing.T) {
+	// Anthropic request for gpt-5.4 should emit max_completion_tokens, not
+	// max_tokens, and must not carry both.
+	ar := AnthropicRequest{Model: "gpt-5.4", MaxTokens: 4096, Messages: []AMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}}}
+	or := convertRequest(ar, ProviderConfig{Name: "cloudflare"})
+	if or.MaxCompletionTokens != 4096 {
+		t.Fatalf("MaxCompletionTokens = %d, want 4096", or.MaxCompletionTokens)
+	}
+	if or.MaxTokens != 0 {
+		t.Fatalf("MaxTokens = %d, want 0 (gpt-5.x rejects max_tokens)", or.MaxTokens)
+	}
+
+	// non-gpt-5 model: max_tokens kept.
+	ar2 := AnthropicRequest{Model: "kimi-k2.6", MaxTokens: 4096, Messages: []AMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}}}
+	or2 := convertRequest(ar2, ProviderConfig{Name: "cloudflare"})
+	if or2.MaxTokens != 4096 {
+		t.Fatalf("non-gpt-5 MaxTokens = %d, want 4096", or2.MaxTokens)
+	}
+	if or2.MaxCompletionTokens != 0 {
+		t.Fatalf("non-gpt-5 MaxCompletionTokens = %d, want 0", or2.MaxCompletionTokens)
+	}
+}
+
+func TestResponsesToChatEmitsMaxCompletionTokensForGPT5(t *testing.T) {
+	rr := ResponsesRequest{Model: "gpt-5.5", MaxTokens: 8192, Input: json.RawMessage(`[{"role":"user","content":"hi"}]`)}
+	or := responsesToChat(rr, ProviderConfig{Name: "cloudflare"})
+	if or.MaxCompletionTokens != 8192 {
+		t.Fatalf("MaxCompletionTokens = %d, want 8192", or.MaxCompletionTokens)
+	}
+	if or.MaxTokens != 0 {
+		t.Fatalf("MaxTokens = %d, want 0 for gpt-5.x", or.MaxTokens)
+	}
+}
+
+func TestPrepareChatBodyEmitsMaxCompletionTokensForGPT5(t *testing.T) {
+	// raw chat-completions body for a gpt-5 model: max_tokens must be moved
+	// to max_completion_tokens. applies after the codex mapping resolves
+	// the model name.
+	mappings := defaultModelMappings()
+	mappings["codex"] = map[string]string{"gpt-5.4-target": "gpt-5.4"}
+	prev := modelMappingFile
+	modelMappingFile = func() string { return filepath.Join(t.TempDir(), "model-mapping.json") }
+	b, _ := json.MarshalIndent(map[string]map[string]map[string]string{"cloudflare": mappings}, "", "  ")
+	if err := os.WriteFile(modelMappingFile(), b, 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { modelMappingFile = prev })
+
+	body := []byte(`{"model":"gpt-5.4-target","max_tokens":2048,"messages":[{"role":"user","content":"hi"}]}`)
+	out, err := prepareChatBody(body, ProviderConfig{Name: "cloudflare"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), `"max_completion_tokens":2048`) {
+		t.Fatalf("max_completion_tokens missing in: %s", out)
+	}
+	if strings.Contains(string(out), `"max_tokens"`) {
+		t.Fatalf("max_tokens should be removed for gpt-5.x, got: %s", out)
+	}
+
+	// non-gpt-5: max_tokens preserved.
+	body2 := []byte(`{"model":"kimi-k2.6","max_tokens":2048,"messages":[{"role":"user","content":"hi"}]}`)
+	out2, err := prepareChatBody(body2, ProviderConfig{Name: "cloudflare"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out2), `"max_tokens":2048`) {
+		t.Fatalf("non-gpt-5 max_tokens missing: %s", out2)
+	}
+	if strings.Contains(string(out2), `"max_completion_tokens"`) {
+		t.Fatalf("non-gpt-5 should not have max_completion_tokens: %s", out2)
+	}
+}
+
+func TestModelMetadataForGPT5(t *testing.T) {
+	cases := []struct {
+		model           string
+		wantCtx         int
+		wantImageInput  bool
+	}{
+		{"gpt-5.5", 1000000, true},
+		{"gpt-5.4", 1000000, true},
+		{"gpt-5.4-mini", 400000, true},
+	}
+	for _, c := range cases {
+		m := modelMetadata(c.model)
+		if m.ContextWindow != c.wantCtx {
+			t.Errorf("modelMetadata(%q).ContextWindow = %d, want %d", c.model, m.ContextWindow, c.wantCtx)
+		}
+		if m.MaxContextWindow != c.wantCtx {
+			t.Errorf("modelMetadata(%q).MaxContextWindow = %d, want %d", c.model, m.MaxContextWindow, c.wantCtx)
+		}
+		hasImage := false
+		for _, mod := range m.InputModalities {
+			if mod == "image" {
+				hasImage = true
+				break
+			}
+		}
+		if hasImage != c.wantImageInput {
+			t.Errorf("modelMetadata(%q) image modality = %v, want %v (input: %v)", c.model, hasImage, c.wantImageInput, m.InputModalities)
+		}
+		if m.UsesAnthropicEndpoint {
+			t.Errorf("modelMetadata(%q) should not use anthropic endpoint", c.model)
+		}
+	}
+}
+
+func TestMigrateCloudflareURLBackfillsAccount(t *testing.T) {
+	// pre-migration config that already has the REST API URL but is
+	// missing the Account field needed for the /openai native path.
+	dir := t.TempDir()
+	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// reset instance name; peers in the suite leak it (TestListCmd sets
+	// "cf" and "lab" without restoring), so without this reset the
+	// providerConfigFile resolver lands in a non-existent instance dir.
+	oldInst := resolvedInstanceName
+	resolvedInstanceName = ""
+	t.Cleanup(func() { resolvedInstanceName = oldInst })
+
+	old := `{"upstream_base_url":"https://api.cloudflare.com/client/v4/accounts/acct-777/ai/v1","upstream_api_key":"tok","upstream_auth":"bearer","gateway":"gw-1"}`
+	if err := os.WriteFile(filepath.Join(dir, "cloudflare.json"), []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	migrateCloudflareURLIfNeeded()
+
+	p, err := loadProviderConfig("cloudflare")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Account != "acct-777" {
+		t.Fatalf("Account = %q, want acct-777 (back-filled from UpstreamBaseURL)", p.Account)
+	}
+	if p.Gateway != "gw-1" {
+		t.Fatalf("Gateway = %q, want gw-1", p.Gateway)
+	}
+
+	// idempotent: a second pass leaves Account alone.
+	migrateCloudflareURLIfNeeded()
+	p, _ = loadProviderConfig("cloudflare")
+	if p.Account != "acct-777" {
+		t.Fatalf("Account changed on second pass: %q", p.Account)
+	}
+}
+
+func TestCloudflareModelIDsMergesNativeWhenEnabled(t *testing.T) {
+	// stand up a fake cloudflare compat server at /accounts/acct/ai/models/search
+	// and verify cloudflareModelIDs appends the native ids when OpenAINative
+	// is on. with OpenAINative off, only the compat id is returned.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/accounts/acct/ai/models/search", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true,"result":[{"id":"@cf/zai-org/glm-5.2","name":"@cf/zai-org/glm-5.2"}]}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	cfg := ProviderConfig{
+		Name:            "cloudflare",
+		UpstreamBaseURL: srv.URL + "/accounts/acct/ai/v1",
+		Account:         "acct",
+		Gateway:         "gw",
+		OpenAINative:    true,
+	}
+	ids, err := cloudflareModelIDs(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, id := range ids {
+		seen[id] = true
+	}
+	for _, want := range []string{"gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "@cf/zai-org/glm-5.2"} {
+		if !seen[want] {
+			t.Errorf("missing %q in cloudflare list: %v", want, ids)
+		}
+	}
+
+	// native off → only the compat result.
+	cfg.OpenAINative = false
+	ids2, err := cloudflareModelIDs(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids2 {
+		if strings.HasPrefix(id, "gpt-") {
+			t.Errorf("native off should not include gpt- ids, got %q", id)
+		}
+	}
+}

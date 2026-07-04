@@ -50,6 +50,26 @@ func openAIURL(cfg ProviderConfig) string {
 	return "https://opencode.ai/zen/go/v1/chat/completions"
 }
 
+// openAINativeURL builds the Cloudflare AI Gateway native /openai provider
+// URL — a transparent pass-through to OpenAI (the /ai/v1 compat adapter
+// sends max_tokens which gpt-5.x rejects). only valid when cfg.OpenAINative
+// is set and cfg.Account + cfg.Gateway are populated.
+func openAINativeURL(cfg ProviderConfig) string {
+	return fmt.Sprintf("https://gateway.ai.cloudflare.com/v1/%s/%s/openai/chat/completions", cfg.Account, cfg.Gateway)
+}
+
+// openAIURLForModel picks the right upstream URL for a model in flight.
+// workers-ai @cf/... models always use the legacy /ai/v1 path (the compat
+// adapter speaks the same chat/completions shape and routes to workers-ai
+// via cf-aig-gateway-id header). other models on a native-enabled config
+// use the /openai provider endpoint.
+func openAIURLForModel(cfg ProviderConfig, model string) string {
+	if cfg.OpenAINative && !strings.HasPrefix(modelID(model), "@cf/") {
+		return openAINativeURL(cfg)
+	}
+	return openAIURL(cfg)
+}
+
 // anthropicURL is the upstream anthropic-compatible /messages URL, used
 // only for models routed via endpoint_overrides with route=anthropic.
 func anthropicURL(cfg ProviderConfig) string {
@@ -207,6 +227,13 @@ type ProviderConfig struct {
 	UpstreamExtraHdr  map[string]string       `json:"upstream_extra_hdr"` // extra headers for upstream
 	EndpointOverrides []ModelEndpointOverride `json:"endpoint_overrides"` // per-model routing
 	Gateway           string                  `json:"gateway,omitempty"`  // cloudflare: cf-aig-gateway-id value
+	Account           string                  `json:"account,omitempty"`  // cloudflare account id; needed for the /openai native path, derived from UpstreamBaseURL for legacy configs
+	// OpenAINative: when true, GPT-style models route through Cloudflare's
+	// native /openai provider endpoint (transparent pass-through to OpenAI,
+	// not the /ai/v1 compat adapter). required for gpt-5.x because the compat
+	// adapter sends max_tokens which gpt-5.x rejects. workers-ai @cf/... models
+	// still use the legacy /ai/v1 path even when this is true.
+	OpenAINative bool `json:"openai_native,omitempty"`
 }
 
 // knownProviders is the fixed enum. add a new provider = add a setup
@@ -252,16 +279,17 @@ type ATool struct {
 }
 
 type OAIRequest struct {
-	Model           string            `json:"model"`
-	Messages        []OAIMessage      `json:"messages"`
-	Stream          bool              `json:"stream,omitempty"`
-	StreamOptions   *OAIStreamOptions `json:"stream_options,omitempty"`
-	MaxTokens       int               `json:"max_tokens,omitempty"`
-	Temperature     *float64          `json:"temperature,omitempty"`
-	TopP            *float64          `json:"top_p,omitempty"`
-	Tools           []OAITool         `json:"tools,omitempty"`
-	ReasoningEffort string            `json:"reasoning_effort,omitempty"`
-	AnthropicTools  []ATool           `json:"-"`
+	Model              string            `json:"model"`
+	Messages           []OAIMessage      `json:"messages"`
+	Stream             bool              `json:"stream,omitempty"`
+	StreamOptions      *OAIStreamOptions `json:"stream_options,omitempty"`
+	MaxTokens          int               `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int              `json:"max_completion_tokens,omitempty"`
+	Temperature        *float64          `json:"temperature,omitempty"`
+	TopP               *float64          `json:"top_p,omitempty"`
+	Tools              []OAITool         `json:"tools,omitempty"`
+	ReasoningEffort    string            `json:"reasoning_effort,omitempty"`
+	AnthropicTools     []ATool           `json:"-"`
 }
 
 type OAIStreamOptions struct {
@@ -403,7 +431,7 @@ func setupOpencodeGoCmd() *cobra.Command {
 
 func setupCloudflareCmd() *cobra.Command {
 	var token, account, gateway string
-	var force bool
+	var force, openAINative bool
 	cmd := &cobra.Command{
 		Use:   "cloudflare",
 		Short: "Configure Cloudflare AI Gateway as the upstream",
@@ -425,6 +453,8 @@ func setupCloudflareCmd() *cobra.Command {
 				UpstreamAPIKey:  values.token,
 				UpstreamAuth:    "bearer",
 				Gateway:         values.gateway,
+				Account:         values.account,
+				OpenAINative:    openAINative,
 			}
 			return saveProviderConfig("cloudflare", p)
 		},
@@ -433,6 +463,7 @@ func setupCloudflareCmd() *cobra.Command {
 	cmd.Flags().StringVar(&account, "account", "", "Cloudflare account ID (falls back to $CLOUDFLARE_ACCOUNT_ID)")
 	cmd.Flags().StringVar(&gateway, "gateway", "", "Cloudflare AI Gateway ID (falls back to $CLOUDFLARE_GATEWAY_ID)")
 	cmd.Flags().BoolVar(&force, "force", false, "Overwrite an existing cloudflare provider config without prompting")
+	cmd.Flags().BoolVar(&openAINative, "openai-native", false, "Route OpenAI-style models (gpt-5.x) through Cloudflare's native /openai provider endpoint instead of the /ai/v1 compat adapter")
 	return cmd
 }
 
@@ -687,6 +718,21 @@ func modelMetadata(model string) openCodeModelMetadata {
 			meta.InputModalities = []string{"text", "image"}
 			meta.CodexInputModalities = []string{"text", "image"}
 		}
+	case "gpt-5.5", "gpt-5.4":
+		// OpenAI gpt-5.x via cloudflare's /openai native endpoint. multimodal,
+		// 1M context (200k output cap on the wire, surfaced as 128k here for
+		// the codex catalog). Values mirror the opencode config defaults.
+		meta.ContextWindow = 1000000
+		meta.MaxContextWindow = 1000000
+		meta.InputModalities = []string{"text", "image"}
+		meta.CodexInputModalities = []string{"text", "image"}
+		meta.SupportsImageOriginal = true
+	case "gpt-5.4-mini":
+		meta.ContextWindow = 400000
+		meta.MaxContextWindow = 400000
+		meta.InputModalities = []string{"text", "image"}
+		meta.CodexInputModalities = []string{"text", "image"}
+		meta.SupportsImageOriginal = true
 	}
 	return meta
 }
@@ -834,11 +880,44 @@ func fetchCloudflareModels(cfg ProviderConfig) ([]string, error) {
 	return ids, nil
 }
 
+// cloudflareNativeModelIDs returns the static list of OpenAI models
+// routable through the cloudflare /openai native endpoint when
+// OpenAINative is enabled. The compat /ai/models/search endpoint doesn't
+// surface these, so we list them by hand. Keep the list aligned with
+// modelMetadata() — adding a gpt-* model there but not here makes it
+// invisible to `cfgate-cc list` until a manual mapping is set.
+func cloudflareNativeModelIDs() []string {
+	return []string{"gpt-5.5", "gpt-5.4", "gpt-5.4-mini"}
+}
+
 // cloudflareModelIDs returns the live cloudflare model list. unlike
 // opencode-go's knownModelIDs chain there's no static fallback — the
-// REST API is the only source.
+// REST API is the only source. when OpenAINative is enabled, append the
+// native-side models so `list` shows the full set a user can route to.
 func cloudflareModelIDs(cfg ProviderConfig) ([]string, error) {
-	return fetchCloudflareModels(cfg)
+	ids, err := fetchCloudflareModels(cfg)
+	if err != nil {
+		if !cfg.OpenAINative {
+			return nil, err
+		}
+		// fall back to native ids only when compat fetch fails, so the
+		// user at least sees what's routable on the native path.
+		return append([]string(nil), cloudflareNativeModelIDs()...), nil
+	}
+	if cfg.OpenAINative {
+		seen := make(map[string]bool, len(ids))
+		for _, id := range ids {
+			seen[id] = true
+		}
+		for _, id := range cloudflareNativeModelIDs() {
+			if !seen[id] {
+				ids = append(ids, id)
+				seen[id] = true
+			}
+		}
+		sort.Strings(ids)
+	}
+	return ids, nil
 }
 
 func defaultModelMappings() map[string]map[string]string {
@@ -1804,13 +1883,13 @@ func proxyMessages(w http.ResponseWriter, r *http.Request, cfg ProviderConfig) {
 	}
 	body, _ := json.Marshal(or)
 	body, wireModel := cloudflarePrepareBody(body, cfg)
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, openAIURL(cfg), bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, openAIURLForModel(cfg, or.Model), bytes.NewReader(body))
 	if err != nil {
 		dlogHandlerErr("messages", err, http.StatusInternalServerError)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	applyUpstreamAuth(req, cfg)
+	applyUpstreamAuthForModel(req, cfg, wireModel)
 	applyCloudflareGatewayHeader(req, cfg, wireModel)
 	req.Header.Set("Content-Type", "application/json")
 	dlogUpstreamReq(req, body)
@@ -1899,13 +1978,13 @@ func proxyChatCompletions(w http.ResponseWriter, r *http.Request, cfg ProviderCo
 		return
 	}
 	body, wireModel := cloudflarePrepareBody(body, cfg)
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, openAIURL(cfg), bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, openAIURLForModel(cfg, or.Model), bytes.NewReader(body))
 	if err != nil {
 		dlogHandlerErr("chat", err, http.StatusInternalServerError)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	applyUpstreamAuth(req, cfg)
+	applyUpstreamAuthForModel(req, cfg, wireModel)
 	applyCloudflareGatewayHeader(req, cfg, wireModel)
 	req.Header.Set("Content-Type", "application/json")
 	dlogUpstreamReq(req, body)
@@ -1989,13 +2068,13 @@ func proxyResponses(w http.ResponseWriter, r *http.Request, cfg ProviderConfig) 
 	}
 	body, _ := json.Marshal(or)
 	body, wireModel := cloudflarePrepareBody(body, cfg)
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, openAIURL(cfg), bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, openAIURLForModel(cfg, or.Model), bytes.NewReader(body))
 	if err != nil {
 		dlogHandlerErr("responses", err, http.StatusInternalServerError)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	applyUpstreamAuth(req, cfg)
+	applyUpstreamAuthForModel(req, cfg, wireModel)
 	applyCloudflareGatewayHeader(req, cfg, wireModel)
 	req.Header.Set("Content-Type", "application/json")
 	dlogUpstreamReq(req, body)
@@ -2121,6 +2200,27 @@ func applyCloudflareGatewayHeader(req *http.Request, cfg ProviderConfig, wireMod
 	if cfg.Gateway != "" && strings.HasPrefix(wireModel, "@cf/") {
 		req.Header.Set("cf-aig-gateway-id", cfg.Gateway)
 	}
+}
+
+// applyUpstreamAuthForModel picks the right auth-header strategy for the
+// given model in flight. opencode-go (or any non-cloudflare provider) keeps
+// the existing bearer/x-api-key behavior. cloudflare splits per model:
+// @cf/... workers-ai uses a bearer token; everything else on a native-
+// enabled config uses a blank Authorization + cf-aig-authorization
+// header so the gateway injects the stored BYOK OpenAI key.
+func applyUpstreamAuthForModel(req *http.Request, cfg ProviderConfig, wireModel string) {
+	if cfg.Name != "cloudflare" {
+		applyUpstreamAuth(req, cfg)
+		return
+	}
+	if strings.HasPrefix(wireModel, "@cf/") {
+		applyUpstreamAuth(req, cfg)
+		return
+	}
+	if cfg.UpstreamAPIKey != "" {
+		req.Header.Set("cf-aig-authorization", "Bearer "+cfg.UpstreamAPIKey)
+	}
+	req.Header.Set("Authorization", "")
 }
 
 func forwardAnthropic(ctx context.Context, cfg ProviderConfig, ar AnthropicRequest) (*http.Response, error) {
@@ -2380,6 +2480,19 @@ func prepareChatBody(body []byte, p ProviderConfig) ([]byte, error) {
 		model = mapped
 		changed = true
 	}
+	if usesMaxCompletionTokens(model) {
+		// GPT-5.x rejects max_tokens. Move any value to max_completion_tokens
+		// at the raw layer so the chat-completions path doesn't need its own
+		// special-cased rewriter.
+		if v, ok := req["max_tokens"]; ok {
+			if _, already := req["max_completion_tokens"]; !already {
+				req["max_completion_tokens"] = v
+				changed = true
+			}
+			delete(req, "max_tokens")
+			changed = true
+		}
+	}
 	if rawChatBodyHasImages(req) {
 		if !modelSupportsImages(model) {
 			return nil, unsupportedImageModelError(model)
@@ -2587,9 +2700,25 @@ func stripRawChatImageDetails(req map[string]any) bool {
 	return changed
 }
 
+// usesMaxCompletionTokens reports whether the given model id needs the
+// max_completion_tokens field instead of max_tokens. applies to gpt-5.x
+// (any new-style openai model that dropped the older field).
+func usesMaxCompletionTokens(model string) bool {
+	id := modelID(model)
+	if id == "gpt-5" || strings.HasPrefix(id, "gpt-5.") {
+		return true
+	}
+	return false
+}
+
 func convertRequest(ar AnthropicRequest, p ProviderConfig) OAIRequest {
 	model := resolveToolModel("claude", ar.Model, p)
-	out := OAIRequest{Model: model, Stream: ar.Stream, StreamOptions: streamUsageOptions(ar.Stream), MaxTokens: ar.MaxTokens, Temperature: ar.Temperature, TopP: ar.TopP, ReasoningEffort: downstreamReasoningEffort(ar.Reasoning, ar.Thinking, ar.OutputConfig, ar.ReasoningEffort, ar.Effort, ar.Level, ar.Depth)}
+	out := OAIRequest{Model: model, Stream: ar.Stream, StreamOptions: streamUsageOptions(ar.Stream), Temperature: ar.Temperature, TopP: ar.TopP, ReasoningEffort: downstreamReasoningEffort(ar.Reasoning, ar.Thinking, ar.OutputConfig, ar.ReasoningEffort, ar.Effort, ar.Level, ar.Depth)}
+	if usesMaxCompletionTokens(model) {
+		out.MaxCompletionTokens = ar.MaxTokens
+	} else {
+		out.MaxTokens = ar.MaxTokens
+	}
 	if sys := systemText(ar.System); sys != "" {
 		out.Messages = append(out.Messages, OAIMessage{Role: "system", Content: sys})
 	}
@@ -2606,7 +2735,12 @@ func convertRequest(ar AnthropicRequest, p ProviderConfig) OAIRequest {
 
 func responsesToChat(rr ResponsesRequest, p ProviderConfig) OAIRequest {
 	model := resolveToolModel("codex", rr.Model, p)
-	out := OAIRequest{Model: model, Stream: rr.Stream, StreamOptions: streamUsageOptions(rr.Stream), MaxTokens: rr.MaxTokens, Temperature: rr.Temperature, TopP: rr.TopP, ReasoningEffort: downstreamReasoningEffort(rr.Reasoning, rr.Thinking, rr.OutputConfig, rr.ReasoningEffort, rr.Effort, rr.Level, rr.Depth)}
+	out := OAIRequest{Model: model, Stream: rr.Stream, StreamOptions: streamUsageOptions(rr.Stream), Temperature: rr.Temperature, TopP: rr.TopP, ReasoningEffort: downstreamReasoningEffort(rr.Reasoning, rr.Thinking, rr.OutputConfig, rr.ReasoningEffort, rr.Effort, rr.Level, rr.Depth)}
+	if usesMaxCompletionTokens(model) {
+		out.MaxCompletionTokens = rr.MaxTokens
+	} else {
+		out.MaxTokens = rr.MaxTokens
+	}
 	if rr.Instructions != "" {
 		out.Messages = append(out.Messages, OAIMessage{Role: "system", Content: rr.Instructions})
 	}
@@ -4997,20 +5131,39 @@ func providerForUpstreamURL(url string) string {
 // pulling the gateway id out of the path and into ProviderConfig.Gateway
 // (the new shape uses a cf-aig-gateway-id header instead).
 // idempotent: a no-op once the URL is already on the REST API.
+//
+// also back-fills ProviderConfig.Account from the REST URL when the field
+// is missing — required by the /openai native endpoint which doesn't carry
+// the account id in the path.
 func migrateCloudflareURLIfNeeded() {
 	const oldPrefix = "https://gateway.ai.cloudflare.com/v1/"
 	path := providerConfigFile("cloudflare")
 	p, err := loadProviderConfig("cloudflare")
-	if err != nil || !strings.HasPrefix(p.UpstreamBaseURL, oldPrefix) {
+	if err != nil || (!strings.HasPrefix(p.UpstreamBaseURL, oldPrefix) && !strings.HasPrefix(p.UpstreamBaseURL, cloudflareUpstreamPrefix)) {
 		return
 	}
-	rest := strings.TrimPrefix(p.UpstreamBaseURL, oldPrefix)
-	parts := strings.SplitN(rest, "/", 3)
-	if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+	dirty := false
+	if strings.HasPrefix(p.UpstreamBaseURL, oldPrefix) {
+		rest := strings.TrimPrefix(p.UpstreamBaseURL, oldPrefix)
+		parts := strings.SplitN(rest, "/", 3)
+		if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
+			return
+		}
+		p.UpstreamBaseURL = buildCloudflareURL(parts[0])
+		p.Gateway = parts[1]
+		dirty = true
+	}
+	if p.Account == "" && strings.HasPrefix(p.UpstreamBaseURL, cloudflareUpstreamPrefix) {
+		rest := strings.TrimPrefix(p.UpstreamBaseURL, cloudflareUpstreamPrefix)
+		parts := strings.SplitN(rest, "/", 3)
+		if len(parts) > 0 && parts[0] != "" {
+			p.Account = parts[0]
+			dirty = true
+		}
+	}
+	if !dirty {
 		return
 	}
-	p.UpstreamBaseURL = buildCloudflareURL(parts[0])
-	p.Gateway = parts[1]
 	b, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {
 		return
