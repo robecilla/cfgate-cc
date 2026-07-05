@@ -4274,7 +4274,7 @@ func writeCodexProfile(path, baseURL, instanceName string) error {
 		`model_reasoning_summary = "none"`,
 		"",
 		fmt.Sprintf("[model_providers.%s]", profileName),
-		`name = "Upstream",`,
+		`name = "Upstream"`,
 		fmt.Sprintf("base_url = %q", baseURL),
 		`wire_api = "responses"`,
 		"",
