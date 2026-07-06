@@ -34,6 +34,19 @@ override hatch for every weird case.
 canonical logic lives in `scripts/next-version.sh` — if this doc and the
 script disagree, the script is right; update this file.
 
+## addressing review comments
+
+when a reviewer (greptile, a human, anyone) leaves a comment, fix it in
+a commit and push. **do not post a PR comment summarising what you
+changed.** the commit message is the artifact; the diff is the proof.
+a "fixed in 698bb04" comment on the PR is noise that rots the moment
+the next fix lands on top of it.
+
+exceptions — comment when:
+- the reviewer is factually wrong and you need to push back, or
+- the fix needs context that doesn't fit in a commit message (rare —
+  usually it means the commit should be split or the message expanded).
+
 ## Agent skills
 
 ### Issue tracker
