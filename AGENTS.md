@@ -34,6 +34,16 @@ override hatch for every weird case.
 canonical logic lives in `scripts/next-version.sh` — if this doc and the
 script disagree, the script is right; update this file.
 
+## commits
+
+**never add a `Co-Authored-By:` trailer for an AI harness** (claude,
+gpt, gemini, copilot, any of them). the commit is the human's — the
+harness is a tool, not a co-author. this applies to every commit on
+every branch, including `--amend`, fixups, and cherry-picks. if a
+trailer slipped in, drop it before pushing. the `release:*` label
+rule above stays the source of truth on what to label, not who's
+listed in the message.
+
 ## addressing review comments
 
 when a reviewer (greptile, a human, anyone) leaves a comment, fix it in
