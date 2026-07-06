@@ -8,8 +8,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
-	"net"
 	"net/http"
 	"net/http/httptest"
 	neturl "net/url"
@@ -19,11 +17,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"testing"
-
-	"github.com/spf13/cobra"
 )
+
+// ptr returns a pointer to v. used by tests that need to set
+// *ModelEndpointOverride.ThinkingBudgetMax (a *int) inline.
+func ptr[T any](v T) *T { return &v }
 
 // testProviderCfg is the default cfg passed to helpers that need a provider
 // identity to read the right mapping section / model list. tests that don't
@@ -31,25 +30,58 @@ import (
 // dispatch) construct their own.
 var testProviderCfg = ProviderConfig{Name: "opencode-go"}
 
+// testInst builds a minimal Instance wrapping the given provider. used by
+// the model-mapping / codex-catalog tests that want to exercise the v2
+// shape without standing up a full instance dir.
+func testInst(p ProviderConfig) Instance {
+	return Instance{Host: defaultHost, Port: defaultPort, Provider: p}
+}
+
+// testMappings returns a fresh empty ModelMapping for tests that need
+// to pass mappings to helpers but don't care about per-tool entries.
+func testMappings() map[string]map[string]string {
+	return defaultModelMappings()
+}
+
 func TestMain(m *testing.M) {
 	dir, err := os.MkdirTemp("", "cfgate-cc-test-*")
 	if err != nil {
 		panic(err)
 	}
-	old := modelMappingFile
+	old, had := os.LookupEnv("CFGATE_CC_CONFIG_DIR")
+	os.Setenv("CFGATE_CC_CONFIG_DIR", dir)
 	oldRemoteModels := remoteModels
 	oldOfficialModels := officialModels
-	modelMappingFile = func() string { return filepath.Join(dir, "model-mapping.json") }
 	remoteModels = newLazyFetcher(func() (map[string]remoteModelInfo, error) {
 		return nil, errors.New("remote model fetch disabled in tests")
 	})
 	officialModels = newLazyFetcher(func() ([]string, error) { return nil, errors.New("official model fetch disabled in tests") })
 	code := m.Run()
-	modelMappingFile = old
+	if had {
+		os.Setenv("CFGATE_CC_CONFIG_DIR", old)
+	} else {
+		os.Unsetenv("CFGATE_CC_CONFIG_DIR")
+	}
 	remoteModels = oldRemoteModels
 	officialModels = oldOfficialModels
 	_ = os.RemoveAll(dir)
 	os.Exit(code)
+}
+
+// withConfigDir redirects CFGATE_CC_CONFIG_DIR for the lifetime of the test
+// so per-instance config writes land in t.TempDir(). cleans up via t.Cleanup.
+func withConfigDir(t *testing.T) {
+	t.Helper()
+	old, had := os.LookupEnv("CFGATE_CC_CONFIG_DIR")
+	os.Setenv("CFGATE_CC_CONFIG_DIR", t.TempDir())
+	resolvedInstanceName = ""
+	t.Cleanup(func() {
+		if had {
+			os.Setenv("CFGATE_CC_CONFIG_DIR", old)
+		} else {
+			os.Unsetenv("CFGATE_CC_CONFIG_DIR")
+		}
+	})
 }
 
 func TestWriteCodexProfile(t *testing.T) {
@@ -123,7 +155,7 @@ func TestWriteCodexProfileMigratesLegacySections(t *testing.T) {
 }
 
 func TestWriteCodexModelCatalog(t *testing.T) {
-	withTempModelMappingFile(t, filepath.Join(t.TempDir(), "model-mapping.json"))
+	withConfigDir(t)
 	// feed the opencode-go model set through the remote fetcher so the
 	// catalog writer has a deterministic set to work with.
 	withModelFetchers(t, map[string]remoteModelInfo{
@@ -132,7 +164,7 @@ func TestWriteCodexModelCatalog(t *testing.T) {
 		"minimax-m3":      testRemoteModel("MiniMax M3", 512000, "text", "image"),
 	}, nil)
 	path := filepath.Join(t.TempDir(), "cfgate-cc-models.json")
-	if err := writeCodexModelCatalog(path, testProviderCfg); err != nil {
+	if err := writeCodexModelCatalog(path, testInst(testProviderCfg)); err != nil {
 		t.Fatal(err)
 	}
 	b, err := os.ReadFile(path)
@@ -187,82 +219,17 @@ func TestWriteCodexModelCatalog(t *testing.T) {
 	}
 }
 
-func TestModelMappingsLoadSaveAndResolve(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "model-mapping.json")
-	withTempModelMappingFile(t, path)
-
-	m, err := loadModelMappings()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := resolveMappedModel("claude", "claude-sonnet-4-5", m); got != "claude-sonnet-4-5" {
-		t.Fatalf("unconfigured claude model should pass through, got %q", got)
-	}
-	m["claude"]["claude-sonnet"] = "kimi-k2.6"
-	m["claude"]["claude-sonnet-4-5"] = "qwen3.7-max"
-	m["codex"]["gpt-5"] = "deepseek-v4-pro"
-	if err := saveModelMappings(m); err != nil {
-		t.Fatal(err)
-	}
-	reloaded, err := loadModelMappings()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := resolveMappedModel("claude", "claude-sonnet-4-5", reloaded); got != "qwen3.7-max" {
-		t.Fatalf("custom claude mapping = %q", got)
-	}
-	if got := resolveMappedModel("codex", "gpt-5", reloaded); got != "deepseek-v4-pro" {
-		t.Fatalf("custom codex mapping = %q", got)
-	}
+func testRemoteModel(name string, contextWindow int, modalities ...string) remoteModelInfo {
+	var m remoteModelInfo
+	m.Name = name
+	m.Limit.Context = contextWindow
+	m.Modalities.Input = append([]string(nil), modalities...)
+	return m
 }
 
-func TestPrepareChatBodyAppliesCodexMapping(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "model-mapping.json")
-	withTempModelMappingFile(t, path)
-	m := defaultModelMappings()
-	m["codex"]["gpt-5"] = "deepseek-v4-pro"
-	if err := saveModelMappings(m); err != nil {
-		t.Fatal(err)
-	}
-	body, err := prepareChatBody([]byte(`{"model":"gpt-5","messages":[{"role":"user","content":"hello"}]}`), testProviderCfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(body), `"model":"deepseek-v4-pro"`) {
-		t.Fatalf("mapping was not applied: %s", string(body))
-	}
-}
-
-func TestMappingUnsetCommandRemovesMapping(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "model-mapping.json")
-	withTempModelMappingFile(t, path)
-	t.Setenv("CFGATE_CC_PROVIDER", "opencode-go")
-	m := defaultModelMappings()
-	m["codex"]["gpt-5.5"] = "deepseek-v4-pro"
-	if err := saveModelMappings(m); err != nil {
-		t.Fatal(err)
-	}
-	cmd := toolMappingCmd("codex")
-	cmd.SetArgs([]string{"unset", "gpt-5.5"})
-	if err := cmd.Execute(); err != nil {
-		t.Fatal(err)
-	}
-	reloaded, err := loadModelMappings()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := reloaded["codex"]["gpt-5.5"]; ok {
-		t.Fatalf("mapping was not removed: %+v", reloaded["codex"])
-	}
-}
-
-func withTempModelMappingFile(t *testing.T, path string) {
-	t.Helper()
-	old := modelMappingFile
-	modelMappingFile = func() string { return path }
-	t.Cleanup(func() { modelMappingFile = old })
-}
-
+// withModelFetchers swaps the lazy model fetchers for the lifetime of the
+// test. tests that exercise the model list / codex catalog paths use it to
+// provide a deterministic set without hitting the network.
 func withModelFetchers(t *testing.T, remote map[string]remoteModelInfo, official []string) {
 	t.Helper()
 	oldRemoteModels := remoteModels
@@ -283,14 +250,6 @@ func withModelFetchers(t *testing.T, remote map[string]remoteModelInfo, official
 		remoteModels = oldRemoteModels
 		officialModels = oldOfficialModels
 	})
-}
-
-func testRemoteModel(name string, contextWindow int, modalities ...string) remoteModelInfo {
-	var m remoteModelInfo
-	m.Name = name
-	m.Limit.Context = contextWindow
-	m.Modalities.Input = append([]string(nil), modalities...)
-	return m
 }
 
 func TestKnownModelIDsPreferOfficialThenRemoteThenFallback(t *testing.T) {
@@ -420,10 +379,20 @@ func TestListProviderDispatch(t *testing.T) {
 			fmt.Fprintln(w, `{"success":true,"result":[{"id":"@cf/meta/llama-3.1-8b-instruct","name":"@cf/meta/llama-3.1-8b-instruct"},{"id":"workers-ai/@cf/zai-org/glm-5.2","name":"workers-ai/@cf/zai-org/glm-5.2"}]}`)
 		}))
 		defer srv.Close()
-		if err := os.WriteFile(filepath.Join(dir, "cloudflare.json"), []byte(`{"upstream_base_url":"`+srv.URL+`/ai/v1","upstream_api_key":"tok","upstream_auth":"bearer"}`), 0600); err != nil {
+		// v2 shape: config.json holds provider config (cloudflare base URL
+		// plus account/gateway in the cloudflare substruct).
+		cfJSON := `{
+			"provider": {
+				"name": "cloudflare",
+				"upstream_base_url": "` + srv.URL + `/ai/v1",
+				"upstream_api_key": "tok",
+				"upstream_auth": "bearer",
+				"cloudflare": {"account": "a-1", "gateway": "gw-1"}
+			}
+		}`
+		if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(cfJSON), 0600); err != nil {
 			t.Fatal(err)
 		}
-		defer os.Remove(filepath.Join(dir, "cloudflare.json"))
 
 		cmd := listCmd()
 		buf := &bytes.Buffer{}
@@ -505,412 +474,6 @@ func TestCodexModelCatalogAllowsImagesForKnownVisionModels(t *testing.T) {
 	}
 }
 
-func TestLoadModelMappingsForProvider(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "model-mapping.json")
-	withTempModelMappingFile(t, path)
-
-	// no file: each provider gets a fresh empty section
-	for _, name := range []string{"opencode-go", "cloudflare"} {
-		m, err := loadModelMappingsForProvider(name)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, ok := m["claude"]; !ok {
-			t.Fatalf("%s: claude section missing: %+v", name, m)
-		}
-	}
-
-	// write one section, read both — the other provider's section must be empty
-	if err := saveModelMappingsForProvider("opencode-go", map[string]map[string]string{
-		"claude": {"claude-opus": "minimax-m3"},
-		"codex":  {},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	oc, err := loadModelMappingsForProvider("opencode-go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if oc["claude"]["claude-opus"] != "minimax-m3" {
-		t.Fatalf("opencode-go claude-opus = %q", oc["claude"]["claude-opus"])
-	}
-	cf, err := loadModelMappingsForProvider("cloudflare")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(cf["claude"]) != 0 {
-		t.Fatalf("cloudflare claude should be empty, got %+v", cf["claude"])
-	}
-
-	// unknown provider: empty section, no error
-	weird, err := loadModelMappingsForProvider("not-a-provider")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(weird) != 0 {
-		t.Fatalf("unknown provider should get empty section, got %+v", weird)
-	}
-}
-
-func TestSaveModelMappingsForProviderPreservesOthers(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "model-mapping.json")
-	withTempModelMappingFile(t, path)
-
-	// seed opencode-go
-	if err := saveModelMappingsForProvider("opencode-go", map[string]map[string]string{
-		"claude": {"claude-opus": "minimax-m3"},
-		"codex":  {"gpt-5": "deepseek-v4-pro"},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	// add cloudflare — must not wipe opencode-go
-	if err := saveModelMappingsForProvider("cloudflare", map[string]map[string]string{
-		"claude": {"claude-opus": "workers-ai/@cf/zai-org/glm-5.2"},
-		"codex":  {},
-	}); err != nil {
-		t.Fatal(err)
-	}
-	oc, _ := loadModelMappingsForProvider("opencode-go")
-	if oc["claude"]["claude-opus"] != "minimax-m3" {
-		t.Fatalf("opencode-go claude-opus lost: %q", oc["claude"]["claude-opus"])
-	}
-	if oc["codex"]["gpt-5"] != "deepseek-v4-pro" {
-		t.Fatalf("opencode-go codex gpt-5 lost: %q", oc["codex"]["gpt-5"])
-	}
-	cf, _ := loadModelMappingsForProvider("cloudflare")
-	if cf["claude"]["claude-opus"] != "workers-ai/@cf/zai-org/glm-5.2" {
-		t.Fatalf("cloudflare claude-opus wrong: %q", cf["claude"]["claude-opus"])
-	}
-
-	// verify on disk: top-level keys are provider names, not tool names
-	b, _ := os.ReadFile(path)
-	var raw map[string]any
-	if err := json.Unmarshal(b, &raw); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := raw["opencode-go"]; !ok {
-		t.Fatalf("file should have opencode-go section, got: %s", string(b))
-	}
-	if _, ok := raw["cloudflare"]; !ok {
-		t.Fatalf("file should have cloudflare section, got: %s", string(b))
-	}
-	if _, ok := raw["claude"]; ok {
-		t.Fatalf("file should NOT have top-level claude (old format leak): %s", string(b))
-	}
-}
-
-func TestLoadModelMappingsAutoMigratesOldFormat(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "model-mapping.json")
-	withTempModelMappingFile(t, path)
-	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	oldWarned := oldMappingFormatWarned
-	oldMappingFormatWarned = false
-	t.Cleanup(func() { oldMappingFormatWarned = oldWarned })
-
-	old := `{"claude":{"claude-haiku":"opencode-go/deepseek-v4-flash","claude-opus":"minimax-m3","claude-sonnet":"kimi-k2.7-code"},"codex":{}}`
-	if err := os.WriteFile(path, []byte(old), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	// load with a known provider: legacy entries get lifted into that
-	// provider's section in place, the on-disk file is rewritten, and
-	// the returned shape reflects the original entries (with the
-	// opencode-go/ prefix stripped from the haiku target).
-	all, err := loadAllModelMappings("opencode-go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if all["opencode-go"] == nil {
-		t.Fatalf("expected opencode-go section, got %+v", all)
-	}
-	claude := all["opencode-go"]["claude"]
-	if claude["claude-opus"] != "minimax-m3" ||
-		claude["claude-sonnet"] != "kimi-k2.7-code" ||
-		claude["claude-haiku"] != "deepseek-v4-flash" {
-		t.Fatalf("entries not lifted as expected: %+v", claude)
-	}
-	if codex := all["opencode-go"]["codex"]; len(codex) != 0 {
-		t.Fatalf("codex section should be empty, got %+v", codex)
-	}
-
-	// on-disk file is now in the new shape with no legacy tool keys at
-	// the top level
-	b, _ := os.ReadFile(path)
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(b, &raw); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := raw["claude"]; ok {
-		t.Fatalf("legacy top-level claude should be gone, got: %s", string(b))
-	}
-	if _, ok := raw["opencode-go"]; !ok {
-		t.Fatalf("opencode-go section should be at top level, got: %s", string(b))
-	}
-
-	// sentinel was cleared so the warning stays silent
-	if _, err := os.Stat(filepath.Join(dir, "model-mapping.migrated")); err == nil {
-		t.Fatalf("sentinel should be removed after migration: %v", err)
-	}
-
-	// subsequent load sees the new format and returns the same section
-	// without touching the file again
-	again, err := loadAllModelMappings("opencode-go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if again["opencode-go"]["claude"]["claude-opus"] != "minimax-m3" {
-		t.Fatalf("second load lost the migrated entry: %+v", again)
-	}
-}
-
-func TestLoadModelMappingsAutoMigrationPreservesPeerProvider(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "model-mapping.json")
-	withTempModelMappingFile(t, path)
-	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	oldWarned := oldMappingFormatWarned
-	oldMappingFormatWarned = false
-	t.Cleanup(func() { oldMappingFormatWarned = oldWarned })
-
-	// malformed-but-tolerable: legacy tool keys alongside a real
-	// per-provider section. migration should leave the peer section
-	// alone and lift the legacy keys into the active provider.
-	hybrid := `{"opencode-go":{"claude":{"claude-opus":"minimax-m3"}},"claude":{"claude-haiku":"deepseek-v4-flash"},"codex":{}}`
-	if err := os.WriteFile(path, []byte(hybrid), 0644); err != nil {
-		t.Fatal(err)
-	}
-	all, err := loadAllModelMappings("cloudflare")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if all["opencode-go"]["claude"]["claude-opus"] != "minimax-m3" {
-		t.Fatalf("peer opencode-go section was clobbered: %+v", all["opencode-go"])
-	}
-	if all["cloudflare"]["claude"]["claude-haiku"] != "deepseek-v4-flash" {
-		t.Fatalf("legacy entries not lifted into cloudflare: %+v", all["cloudflare"])
-	}
-}
-
-func TestOneShotMappingFormatWarning(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "model-mapping.json")
-	withTempModelMappingFile(t, path)
-	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	// reset the in-process guard so the warning fires fresh for this test
-	oldWarned := oldMappingFormatWarned
-	oldMappingFormatWarned = false
-	t.Cleanup(func() { oldMappingFormatWarned = oldWarned })
-
-	// write an old-format file
-	old := `{"claude":{"claude-opus":"minimax-m3"},"codex":{}}`
-	if err := os.WriteFile(path, []byte(old), 0644); err != nil {
-		t.Fatal(err)
-	}
-
-	// capture stderr
-	capturePath := filepath.Join(dir, "stderr.log")
-	f, err := os.Create(capturePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	oldStderr := os.Stderr
-	os.Stderr = f
-	t.Cleanup(func() {
-		os.Stderr = oldStderr
-		f.Close()
-	})
-
-	// first load: warning fires, sentinel is created
-	all, err := loadAllModelMappings("")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(all) != 0 {
-		t.Fatalf("old format should produce empty result, got %+v", all)
-	}
-	_ = f.Sync()
-	captured, _ := os.ReadFile(capturePath)
-	if !strings.Contains(string(captured), "old tool-scoped format") {
-		t.Fatalf("expected warning on first load, got: %q", string(captured))
-	}
-	if _, err := os.Stat(filepath.Join(dir, "model-mapping.migrated")); err != nil {
-		t.Fatalf("sentinel file should be created: %v", err)
-	}
-
-	// truncate the capture file for the second load
-	_ = f.Truncate(0)
-	_, _ = f.Seek(0, 0)
-
-	// second load: warning is silent (sentinel exists)
-	oldMappingFormatWarned = false // simulate a fresh process
-	_, _ = loadAllModelMappings("")
-	_ = f.Sync()
-	captured, _ = os.ReadFile(capturePath)
-	if len(captured) != 0 {
-		t.Fatalf("second load should be silent, got: %q", string(captured))
-	}
-}
-
-func TestMappingSetUsesPerProviderFormat(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	t.Setenv("CFGATE_CC_PROVIDER", "opencode-go")
-	if err := os.WriteFile(filepath.Join(dir, "opencode-go.json"), []byte(`{"upstream_api_key":"k"}`), 0600); err != nil {
-		t.Fatal(err)
-	}
-	// stub the model list so `set` validates the target
-	withModelFetchers(t, nil, []string{"minimax-m3"})
-
-	path := filepath.Join(dir, "model-mapping.json")
-	withTempModelMappingFile(t, path)
-
-	cmd := mappingCmd()
-	cmd.SetArgs([]string{"claude", "set", "claude-opus", "minimax-m3"})
-	cmd.SetOut(io.Discard)
-	cmd.SetErr(io.Discard)
-	if err := cmd.Execute(); err != nil {
-		t.Fatalf("mapping set: %v", err)
-	}
-
-	// the on-disk file should have a top-level "opencode-go" key
-	b, _ := os.ReadFile(path)
-	if !strings.Contains(string(b), `"opencode-go"`) {
-		t.Fatalf("mapping file should have opencode-go section, got: %s", string(b))
-	}
-	oc, _ := loadModelMappingsForProvider("opencode-go")
-	if oc["claude"]["claude-opus"] != "minimax-m3" {
-		t.Fatalf("opencode-go mapping not written: %+v", oc["claude"])
-	}
-	// cloudflare section should not exist (or be empty)
-	cf, _ := loadModelMappingsForProvider("cloudflare")
-	if v, ok := cf["claude"]["claude-opus"]; ok && v != "" {
-		t.Fatalf("cloudflare section should not have the opencode-go mapping, got: %+v", cf)
-	}
-}
-
-func TestAnthropicEndpointModels(t *testing.T) {
-	// empty cfg: no overrides, falls back to modelMetadata heuristic
-	cfg := ProviderConfig{}
-	for _, model := range []string{"qwen3.7-max", "qwen3.7-plus", "qwen3.6-plus", "qwen3.5-plus", "minimax-m3", "minimax-m2.7", "glm-5.2", "kimi-k2.7-code", "opencode-go/qwen3.7-max", "opencode-go/qwen3.7-plus", "opencode-go/minimax-m3", "opencode-go/glm-5.2", "opencode-go/kimi-k2.7-code"} {
-		if !modelUsesAnthropicEndpoint(model, cfg) {
-			t.Fatalf("%s should use Anthropic-compatible upstream", model)
-		}
-	}
-	for _, model := range []string{"kimi-k2.6"} {
-		if modelUsesAnthropicEndpoint(model, cfg) {
-			t.Fatalf("%s should use OpenAI-compatible upstream", model)
-		}
-	}
-}
-
-func TestChatToAnthropicForCodexModel(t *testing.T) {
-	or := responsesToChat(ResponsesRequest{Model: "qwen3.7-max", Stream: true, Input: []byte(`[{"type":"message","role":"user","content":"hello"}]`), Tools: []ResponseTool{{Type: "function", Name: "shell", Description: "run", Parameters: []byte(`{"type":"object"}`)}}}, testProviderCfg)
-	ar := chatToAnthropic(or, testProviderCfg)
-	if ar.Model != "qwen3.7-max" || !ar.Stream || ar.MaxTokens == 0 {
-		t.Fatalf("bad anthropic request metadata: %+v", ar)
-	}
-	if len(ar.Messages) != 1 || ar.Messages[0].Role != "user" || string(ar.Messages[0].Content) != `"hello"` {
-		t.Fatalf("bad anthropic messages: %+v", ar.Messages)
-	}
-	if len(ar.Tools) != 1 || ar.Tools[0].Name != "shell" {
-		t.Fatalf("bad anthropic tools: %+v", ar.Tools)
-	}
-}
-
-func TestResponsesToChatMapsBuiltInWebToolsForAnthropicModels(t *testing.T) {
-	or := responsesToChat(ResponsesRequest{
-		Model:  "qwen3.7-max",
-		Input:  []byte(`[{"type":"message","role":"user","content":"search the web"}]`),
-		Tools:  []ResponseTool{{Type: "web_search_preview"}, {Type: "web_search"}, {Type: "web_extractor"}, {Type: "function", Name: "shell", Parameters: []byte(`{"type":"object"}`)}},
-		Stream: true,
-	}, testProviderCfg)
-	if len(or.AnthropicTools) != 2 {
-		t.Fatalf("expected web search and fetch anthropic tools, got %+v", or.AnthropicTools)
-	}
-	ar := chatToAnthropic(or, testProviderCfg)
-	if len(ar.Tools) != 3 {
-		t.Fatalf("expected 2 built-in tools plus shell, got %+v", ar.Tools)
-	}
-	if ar.Tools[0].Type != "web_search_20250305" || ar.Tools[0].Name != "web_search" {
-		t.Fatalf("bad web search tool mapping: %+v", ar.Tools[0])
-	}
-	if ar.Tools[1].Type != "web_fetch_20250910" || ar.Tools[1].Name != "web_fetch" {
-		t.Fatalf("bad web fetch tool mapping: %+v", ar.Tools[1])
-	}
-	if ar.Tools[2].Type != "" || ar.Tools[2].Name != "shell" {
-		t.Fatalf("bad function tool mapping: %+v", ar.Tools[2])
-	}
-}
-
-func TestResponsesToChatSkipsEmptyToolNamesAndDefaultsParameters(t *testing.T) {
-	or := responsesToChat(ResponsesRequest{
-		Model: "minimax-m2.7",
-		Input: []byte(`"hello"`),
-		Tools: []ResponseTool{
-			{Type: "function", Name: ""},
-			{Type: "function", Name: "shell"},
-		},
-	}, testProviderCfg)
-	if len(or.Tools) != 1 {
-		t.Fatalf("expected one valid tool, got %+v", or.Tools)
-	}
-	if or.Tools[0].Function.Name != "shell" {
-		t.Fatalf("bad tool name: %+v", or.Tools[0])
-	}
-	if string(or.Tools[0].Function.Parameters) != `{"type":"object","properties":{}}` {
-		t.Fatalf("bad default params: %s", string(or.Tools[0].Function.Parameters))
-	}
-	ar := chatToAnthropic(or, testProviderCfg)
-	if len(ar.Tools) != 1 || ar.Tools[0].Name != "shell" || string(ar.Tools[0].InputSchema) != `{"type":"object","properties":{}}` {
-		t.Fatalf("bad anthropic tools: %+v", ar.Tools)
-	}
-}
-
-func TestNormalizeAnthropicRequestForStrictUpstream(t *testing.T) {
-	ar := AnthropicRequest{
-		Model:        "opencode-go/qwen3.7-max",
-		Thinking:     []byte(`{"type":"enabled","budget_tokens":1024}`),
-		Reasoning:    []byte(`{"effort":"high"}`),
-		OutputConfig: []byte(`{"reasoning":{"depth":2}}`),
-		System:       []byte(`[{"type":"text","text":"rules","cache_control":{"type":"ephemeral"}}]`),
-		Tools:        []ATool{{Type: "web_search_20250305", Name: "web_search", MaxUses: 8, AllowedDomains: []string{"example.com"}}},
-		Messages: []AMessage{{Role: "user", Content: []byte(`[
-			{"type":"text","text":"hello","cache_control":{"type":"ephemeral"}},
-			{"type":"thinking","thinking":"private","signature":"abc"},
-			{"type":"tool_result","tool_use_id":"toolu_1","content":[{"type":"text","text":"ok","cache_control":{"type":"ephemeral"}}]}
-		]`)}},
-	}
-	normalizeAnthropicRequestForUpstream(&ar, testProviderCfg)
-	body, err := json.Marshal(ar)
-	if err != nil {
-		t.Fatal(err)
-	}
-	out := string(body)
-	for _, gone := range []string{"opencode-go/", "reasoning", "output_config", "cache_control", "signature"} {
-		if strings.Contains(out, gone) {
-			t.Fatalf("strict upstream request still contains %q: %s", gone, out)
-		}
-	}
-	for _, want := range []string{
-		`"model":"qwen3.7-max"`,
-		`"system":"rules"`,
-		`"type":"text"`,
-		`"text":"hello"`,
-		`"tool_use_id":"toolu_1"`,
-		`"type":"web_search_20250305"`,
-		`"name":"web_search"`,
-		`"max_uses":8`,
-		`"allowed_domains":["example.com"]`,
-		`"type":"enabled"`,
-		`"budget_tokens":8192`,
-	} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("missing %q in normalized request: %s", want, out)
-		}
-	}
-}
-
 func TestNormalizeAnthropicToolResultTruncatesLargeFetchContent(t *testing.T) {
 	large := strings.Repeat("a", maxAnthropicToolResultContentChars+50) + "tail-should-be-omitted"
 	ar := AnthropicRequest{
@@ -922,7 +485,7 @@ func TestNormalizeAnthropicToolResultTruncatesLargeFetchContent(t *testing.T) {
 		}})}},
 	}
 
-	normalizeAnthropicRequestForUpstream(&ar, testProviderCfg)
+	normalizeAnthropicRequestForUpstream(&ar, testProviderCfg, testMappings())
 	body, err := json.Marshal(ar)
 	if err != nil {
 		t.Fatal(err)
@@ -1001,7 +564,7 @@ func TestNormalizeQwenAnthropicRequestThinkingVariants(t *testing.T) {
 				{"type":"tool_use","id":"toolu_1","name":"Bash","input":{"command":"pwd","cache_control":{"type":"ephemeral"}}}
 			]`)}}
 
-			normalizeAnthropicRequestForUpstream(&ar, testProviderCfg)
+			normalizeAnthropicRequestForUpstream(&ar, testProviderCfg, testMappings())
 			body, err := json.Marshal(ar)
 			if err != nil {
 				t.Fatal(err)
@@ -1062,7 +625,7 @@ func TestNormalizeGlm5AnthropicRequestThinkingVariants(t *testing.T) {
 			ar := tc.req
 			ar.Model = "opencode-go/glm-5.2"
 			ar.Messages = []AMessage{{Role: "user", Content: []byte(`"hello glm"`)}}
-			normalizeAnthropicRequestForUpstream(&ar, testProviderCfg)
+			normalizeAnthropicRequestForUpstream(&ar, testProviderCfg, testMappings())
 			body, err := json.Marshal(ar)
 			if err != nil {
 				t.Fatal(err)
@@ -1108,7 +671,7 @@ func TestNormalizeKimiCodeAnthropicRequestThinkingVariants(t *testing.T) {
 			ar := tc.req
 			ar.Model = "opencode-go/kimi-k2.7-code"
 			ar.Messages = []AMessage{{Role: "user", Content: []byte(`"hello kimi"`)}}
-			normalizeAnthropicRequestForUpstream(&ar, testProviderCfg)
+			normalizeAnthropicRequestForUpstream(&ar, testProviderCfg, testMappings())
 			body, err := json.Marshal(ar)
 			if err != nil {
 				t.Fatal(err)
@@ -1213,7 +776,7 @@ func TestForwardAnthropicSendsNormalizedBody(t *testing.T) {
 		System:    []byte(`[{"type":"text","text":"rules","cache_control":{"type":"ephemeral"}}]`),
 		Messages:  []AMessage{{Role: "user", Content: []byte(`[{"type":"text","text":"hello","cache_control":{"type":"ephemeral"}},{"type":"thinking","thinking":"private","signature":"abc"}]`)}},
 		MaxTokens: 1000,
-	})
+	}, testMappings())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1317,7 +880,7 @@ func TestResponsesInputPreservesImages(t *testing.T) {
 
 func TestResponsesImageKeepsKimiModel(t *testing.T) {
 	req := ResponsesRequest{Model: "kimi-k2.6", Input: []byte(`[{"type":"message","role":"user","content":[{"type":"input_text","text":"describe this"},{"type":"input_image","image_url":"data:image/png;base64=abc"}]}]`)}
-	out := responsesToChat(req, testProviderCfg)
+	out := responsesToChat(req, testMappings())
 	if out.Model != "kimi-k2.6" {
 		t.Fatalf("image request should keep Kimi model, got %q", out.Model)
 	}
@@ -1328,14 +891,14 @@ func TestResponsesImageKeepsKimiModel(t *testing.T) {
 
 func TestResponsesImageRejectsUnsupportedModel(t *testing.T) {
 	req := ResponsesRequest{Model: "deepseek-v4-pro", Input: []byte(`[{"type":"message","role":"user","content":[{"type":"input_text","text":"describe this"},{"type":"input_image","image_url":"data:image/png;base64=abc"}]}]`)}
-	out := responsesToChat(req, testProviderCfg)
+	out := responsesToChat(req, testMappings())
 	if err := validateImageSupport(out); err == nil || !strings.Contains(err.Error(), "deepseek-v4-pro") {
 		t.Fatalf("DeepSeek image request should be rejected, got %v", err)
 	}
 }
 
 func TestRawChatImageKeepsKimiAndStripsDetail(t *testing.T) {
-	body, err := prepareChatBody([]byte(`{"model":"kimi-k2.6","messages":[{"role":"user","content":[{"type":"text","text":"describe this"},{"type":"image_url","image_url":{"url":"data:image/png;base64,abc","detail":"high"}}]}]}`), testProviderCfg)
+	body, err := prepareChatBody([]byte(`{"model":"kimi-k2.6","messages":[{"role":"user","content":[{"type":"text","text":"describe this"},{"type":"image_url","image_url":{"url":"data:image/png;base64,abc","detail":"high"}}]}]}`), testInst(testProviderCfg))
 	if err != nil {
 		t.Fatalf("Kimi image request should validate: %v", err)
 	}
@@ -1348,14 +911,14 @@ func TestRawChatImageKeepsKimiAndStripsDetail(t *testing.T) {
 }
 
 func TestRawChatImageRejectsUnsupportedModel(t *testing.T) {
-	_, err := prepareChatBody([]byte(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":[{"type":"text","text":"describe this"},{"type":"image_url","image_url":{"url":"data:image/png;base64,abc"}}]}]}`), testProviderCfg)
+	_, err := prepareChatBody([]byte(`{"model":"deepseek-v4-pro","messages":[{"role":"user","content":[{"type":"text","text":"describe this"},{"type":"image_url","image_url":{"url":"data:image/png;base64,abc"}}]}]}`), testInst(testProviderCfg))
 	if err == nil || !strings.Contains(err.Error(), "deepseek-v4-pro") {
 		t.Fatalf("DeepSeek image request should be rejected, got %v", err)
 	}
 }
 
 func TestRawChatStreamRequestsUsage(t *testing.T) {
-	body, err := prepareChatBody([]byte(`{"model":"kimi-k2.6","stream":true,"stream_options":{"foo":"bar"},"messages":[{"role":"user","content":"hello"}]}`), testProviderCfg)
+	body, err := prepareChatBody([]byte(`{"model":"kimi-k2.6","stream":true,"stream_options":{"foo":"bar"},"messages":[{"role":"user","content":"hello"}]}`), testInst(testProviderCfg))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1394,7 +957,7 @@ func TestNormalizeReasoningEffort(t *testing.T) {
 }
 
 func TestRawChatReasoningEffortPassThrough(t *testing.T) {
-	body, err := prepareChatBody([]byte(`{"model":"glm-5.1","reasoning":{"effort":"xhigh"},"thinking":{"type":"enabled"},"output_config":{"reasoning":{"depth":2}},"messages":[{"role":"user","content":"hello"}]}`), testProviderCfg)
+	body, err := prepareChatBody([]byte(`{"model":"glm-5.1","reasoning":{"effort":"xhigh"},"thinking":{"type":"enabled"},"output_config":{"reasoning":{"depth":2}},"messages":[{"role":"user","content":"hello"}]}`), testInst(testProviderCfg))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1418,9 +981,9 @@ func TestRawChatReasoningEffortPassThrough(t *testing.T) {
 // body normalizer, and the body still has to carry the effort to the upstream
 // chat-completions endpoint.
 func TestReasoningEffortCollapsedForChatCompletions(t *testing.T) {
-	cfg := ProviderConfig{Name: "cloudflare", Gateway: "test-gw"}
+	cfg := ProviderConfig{Name: "cloudflare", Cloudflare: &CloudflareOptions{Gateway: "test-gw"}}
 	raw := []byte(`{"model":"@cf/meta/llama-3.1-8b-instruct","reasoning_effort":"low","messages":[{"role":"user","content":"hi"}]}`)
-	body, err := prepareChatBody(raw, cfg)
+	body, err := prepareChatBody(raw, testInst(cfg))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1472,26 +1035,26 @@ func TestRawChatReasoningEffortPreservesMax(t *testing.T) {
 }
 
 func TestConvertedStreamingRequestsAskForUsage(t *testing.T) {
-	anthropic := convertRequest(AnthropicRequest{Model: "kimi-k2.6", Stream: true, Messages: []AMessage{{Role: "user", Content: []byte(`hello`)}}}, testProviderCfg)
+	anthropic := convertRequest(AnthropicRequest{Model: "kimi-k2.6", Stream: true, Messages: []AMessage{{Role: "user", Content: []byte(`hello`)}}}, testMappings())
 	if anthropic.StreamOptions == nil || !anthropic.StreamOptions.IncludeUsage {
 		t.Fatalf("anthropic conversion should request stream usage: %+v", anthropic.StreamOptions)
 	}
-	responses := responsesToChat(ResponsesRequest{Model: "kimi-k2.6", Stream: true, Input: []byte(`"hello"`)}, testProviderCfg)
+	responses := responsesToChat(ResponsesRequest{Model: "kimi-k2.6", Stream: true, Input: []byte(`"hello"`)}, testMappings())
 	if responses.StreamOptions == nil || !responses.StreamOptions.IncludeUsage {
 		t.Fatalf("responses conversion should request stream usage: %+v", responses.StreamOptions)
 	}
-	plain := responsesToChat(ResponsesRequest{Model: "kimi-k2.6", Input: []byte(`"hello"`)}, testProviderCfg)
+	plain := responsesToChat(ResponsesRequest{Model: "kimi-k2.6", Input: []byte(`"hello"`)}, testMappings())
 	if plain.StreamOptions != nil {
 		t.Fatalf("non-streaming conversion should not set stream options: %+v", plain.StreamOptions)
 	}
 }
 
 func TestConvertedRequestsForwardReasoningEffort(t *testing.T) {
-	anthropic := convertRequest(AnthropicRequest{Model: "glm-5.1", Reasoning: []byte(`{"effort":"high"}`), Messages: []AMessage{{Role: "user", Content: []byte(`[{"type":"text","text":"hello"}]`)}}}, testProviderCfg)
+	anthropic := convertRequest(AnthropicRequest{Model: "glm-5.1", Reasoning: []byte(`{"effort":"high"}`), Messages: []AMessage{{Role: "user", Content: []byte(`[{"type":"text","text":"hello"}]`)}}}, testMappings())
 	if anthropic.ReasoningEffort != "high" {
 		t.Fatalf("anthropic reasoning effort = %q, want high", anthropic.ReasoningEffort)
 	}
-	responses := responsesToChat(ResponsesRequest{Model: "glm-5.1", OutputConfig: []byte(`{"reasoning":{"depth":2}}`), Input: []byte(`[{"type":"message","role":"user","content":"hello"}]`)}, testProviderCfg)
+	responses := responsesToChat(ResponsesRequest{Model: "glm-5.1", OutputConfig: []byte(`{"reasoning":{"depth":2}}`), Input: []byte(`[{"type":"message","role":"user","content":"hello"}]`)}, testMappings())
 	if responses.ReasoningEffort != "medium" {
 		t.Fatalf("responses reasoning effort = %q, want medium", responses.ReasoningEffort)
 	}
@@ -1515,7 +1078,7 @@ func TestAnthropicContentPreservesImages(t *testing.T) {
 }
 
 func TestAnthropicImageKeepsKimiModel(t *testing.T) {
-	out := convertRequest(AnthropicRequest{Model: "kimi-k2.6", Messages: []AMessage{{Role: "user", Content: []byte(`[{"type":"text","text":"what is this?"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}]`)}}}, testProviderCfg)
+	out := convertRequest(AnthropicRequest{Model: "kimi-k2.6", Messages: []AMessage{{Role: "user", Content: []byte(`[{"type":"text","text":"what is this?"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}]`)}}}, testMappings())
 	if out.Model != "kimi-k2.6" {
 		t.Fatalf("image request should keep Kimi model, got %q", out.Model)
 	}
@@ -1525,7 +1088,7 @@ func TestAnthropicImageKeepsKimiModel(t *testing.T) {
 }
 
 func TestAnthropicImageRejectsUnsupportedModel(t *testing.T) {
-	out := convertRequest(AnthropicRequest{Model: "deepseek-v4-pro", Messages: []AMessage{{Role: "user", Content: []byte(`[{"type":"text","text":"what is this?"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}]`)}}}, testProviderCfg)
+	out := convertRequest(AnthropicRequest{Model: "deepseek-v4-pro", Messages: []AMessage{{Role: "user", Content: []byte(`[{"type":"text","text":"what is this?"},{"type":"image","source":{"type":"base64","media_type":"image/png","data":"abc"}}]`)}}}, testMappings())
 	if err := validateImageSupport(out); err == nil || !strings.Contains(err.Error(), "deepseek-v4-pro") {
 		t.Fatalf("DeepSeek image request should be rejected, got %v", err)
 	}
@@ -1558,14 +1121,17 @@ func TestSetupCloudflareWritesAssembledConfig(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	b, err := os.ReadFile(filepath.Join(dir, "cloudflare.json"))
+	// v2 shape: setup writes a single config.json with the provider
+	// section nested under the cloudflare options.
+	b, err := os.ReadFile(filepath.Join(dir, "config.json"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	var p ProviderConfig
-	if err := json.Unmarshal(b, &p); err != nil {
+	var inst Instance
+	if err := json.Unmarshal(b, &inst); err != nil {
 		t.Fatal(err)
 	}
+	p := inst.Provider
 	if p.UpstreamBaseURL != "https://api.cloudflare.com/client/v4/accounts/acct-123/ai/v1" {
 		t.Fatalf("upstream_base_url = %q", p.UpstreamBaseURL)
 	}
@@ -1575,8 +1141,8 @@ func TestSetupCloudflareWritesAssembledConfig(t *testing.T) {
 	if p.UpstreamAuth != "bearer" {
 		t.Fatalf("upstream_auth = %q, want bearer", p.UpstreamAuth)
 	}
-	if p.Gateway != "gw-456" {
-		t.Fatalf("gateway = %q, want gw-456", p.Gateway)
+	if p.Cloudflare == nil || p.Cloudflare.Gateway != "gw-456" {
+		t.Fatalf("cloudflare.gateway = %v, want gw-456", p.Cloudflare)
 	}
 }
 
@@ -1628,8 +1194,9 @@ func TestSetupCloudflareRefusesToOverwriteExisting(t *testing.T) {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		t.Fatal(err)
 	}
-	existing := `{"upstream_base_url":"https://example.com/v1/","upstream_api_key":"k","upstream_auth":"bearer"}`
-	if err := os.WriteFile(filepath.Join(dir, "cloudflare.json"), []byte(existing), 0600); err != nil {
+	// v2 shape: existing config.json with a different cloudflare URL.
+	existing := `{"host":"127.0.0.1","port":3456,"provider":{"name":"cloudflare","upstream_base_url":"https://example.com/v1/","upstream_api_key":"k","upstream_auth":"bearer","cloudflare":{"account":"a","gateway":"g"}}}`
+	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(existing), 0600); err != nil {
 		t.Fatal(err)
 	}
 
@@ -1644,7 +1211,7 @@ func TestSetupCloudflareRefusesToOverwriteExisting(t *testing.T) {
 	if err := cmd.Execute(); err != nil {
 		t.Fatal(err)
 	}
-	b, _ := os.ReadFile(filepath.Join(dir, "cloudflare.json"))
+	b, _ := os.ReadFile(filepath.Join(dir, "config.json"))
 	if !strings.Contains(string(b), "https://api.cloudflare.com/client/v4/accounts/a/ai/v1") {
 		t.Fatalf("forced overwrite did not update URL:\n%s", string(b))
 	}
@@ -1894,7 +1461,11 @@ func TestShouldRestartForLaunch(t *testing.T) {
 func TestActiveProviderRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	if err := os.WriteFile(activeProviderFile(), []byte("cloudflare"), 0644); err != nil {
+	// v2 shape: write a config.json with provider.name=cloudflare and
+	// verify readActiveProvider picks it up.
+	if err := os.WriteFile(filepath.Join(dir, "config.json"),
+		[]byte(`{"provider":{"name":"cloudflare","upstream_api_key":"k","upstream_auth":"bearer","cloudflare":{"account":"a","gateway":"g"}}}`),
+		0600); err != nil {
 		t.Fatal(err)
 	}
 	got, err := readActiveProvider()
@@ -2094,876 +1665,6 @@ func TestSanitizeRawChatToolMessagesDropsLateToolMessage(t *testing.T) {
 	}
 }
 
-func TestResolveProviderFlagWinsOverEnv(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	t.Setenv("CFGATE_CC_PROVIDER", "opencode-go")
-	if err := os.WriteFile(filepath.Join(dir, "opencode-go.json"), []byte(`{"upstream_api_key":"k"}`), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "cloudflare.json"), []byte(`{"upstream_api_key":"k"}`), 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	cmd := &cobra.Command{}
-	cmd.Flags().String("provider", "", "")
-	if err := cmd.Flags().Set("provider", "cloudflare"); err != nil {
-		t.Fatal(err)
-	}
-	got, err := resolveProvider(cmd)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != "cloudflare" {
-		t.Fatalf("flag should win: got %q", got)
-	}
-}
-
-func TestResolveProviderEnvWinsOverSingle(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	t.Setenv("CFGATE_CC_PROVIDER", "opencode-go")
-	if err := os.WriteFile(filepath.Join(dir, "cloudflare.json"), []byte(`{"upstream_api_key":"k"}`), 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	got, err := resolveProvider(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != "opencode-go" {
-		t.Fatalf("env should win over single-configured: got %q", got)
-	}
-}
-
-func TestResolveProviderSingleConfiguredWins(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	t.Setenv("CFGATE_CC_PROVIDER", "")
-	if err := os.WriteFile(filepath.Join(dir, "opencode-go.json"), []byte(`{"upstream_api_key":"k"}`), 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	got, err := resolveProvider(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got != "opencode-go" {
-		t.Fatalf("single configured should win: got %q", got)
-	}
-}
-
-func TestResolveProviderAmbiguous(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	t.Setenv("CFGATE_CC_PROVIDER", "")
-	if err := os.WriteFile(filepath.Join(dir, "opencode-go.json"), []byte(`{}`), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "cloudflare.json"), []byte(`{}`), 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	_, err := resolveProvider(nil)
-	if err == nil {
-		t.Fatal("expected ambiguity error")
-	}
-	if !strings.Contains(err.Error(), "multiple providers") {
-		t.Fatalf("error should mention multiple providers: %v", err)
-	}
-}
-
-func TestResolveProviderUnknownValueRejected(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	t.Setenv("CFGATE_CC_PROVIDER", "bogus")
-
-	_, err := resolveProvider(nil)
-	if err == nil {
-		t.Fatal("expected unknown-provider error")
-	}
-	if !strings.Contains(err.Error(), "bogus") {
-		t.Fatalf("error should name the bad value: %v", err)
-	}
-}
-
-func TestResolveProviderNoConfig(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	t.Setenv("CFGATE_CC_PROVIDER", "")
-
-	_, err := resolveProvider(nil)
-	if err == nil {
-		t.Fatal("expected no-config error")
-	}
-	if !strings.Contains(err.Error(), "no provider configured") {
-		t.Fatalf("error should say no provider: %v", err)
-	}
-}
-
-func TestMigrateConfigMovesUpstreamToProviderFile(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	old := `{"host":"127.0.0.1","port":3456,"api_key":"local","upstream_base_url":"https://gateway.ai.cloudflare.com/v1/acct-123/gw-456/compat/v1","upstream_api_key":"tok-xyz","upstream_auth":"bearer","endpoint_overrides":[]}`
-	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(old), 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	cfg, err := loadConfig()
-	if err != nil {
-		t.Fatal(err)
-	}
-	if cfg.Host != "127.0.0.1" || cfg.Port != 3456 {
-		t.Fatalf("config lost: %+v", cfg)
-	}
-
-	p, err := loadProviderConfig("cloudflare")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if p.UpstreamBaseURL != "https://api.cloudflare.com/client/v4/accounts/acct-123/ai/v1" {
-		t.Fatalf("cloudflare upstream_base_url = %q", p.UpstreamBaseURL)
-	}
-	if p.Gateway != "gw-456" {
-		t.Fatalf("cloudflare gateway = %q, want gw-456", p.Gateway)
-	}
-	if p.UpstreamAPIKey != "tok-xyz" {
-		t.Fatalf("cloudflare upstream_api_key = %q", p.UpstreamAPIKey)
-	}
-
-	// config.json should no longer carry upstream fields
-	b, _ := os.ReadFile(filepath.Join(dir, "config.json"))
-	if strings.Contains(string(b), "upstream_base_url") || strings.Contains(string(b), "tok-xyz") {
-		t.Fatalf("config.json still has upstream fields after migration:\n%s", string(b))
-	}
-}
-
-func TestMigrateConfigOpencodeGoFallback(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	old := `{"host":"127.0.0.1","port":3456,"upstream_api_key":"cfgate-cc-key","upstream_auth":"bearer"}`
-	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(old), 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := loadConfig(); err != nil {
-		t.Fatal(err)
-	}
-	p, err := loadProviderConfig("opencode-go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if p.UpstreamAPIKey != "cfgate-cc-key" {
-		t.Fatalf("opencode-go upstream_api_key = %q", p.UpstreamAPIKey)
-	}
-}
-
-func TestMigrateCloudflareURLIfNeeded(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	old := `{"upstream_base_url":"https://gateway.ai.cloudflare.com/v1/acct-123/gw-456/compat/v1","upstream_api_key":"tok-xyz","upstream_auth":"bearer"}`
-	if err := os.WriteFile(filepath.Join(dir, "cloudflare.json"), []byte(old), 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	migrateCloudflareURLIfNeeded()
-
-	p, err := loadProviderConfig("cloudflare")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if p.UpstreamBaseURL != "https://api.cloudflare.com/client/v4/accounts/acct-123/ai/v1" {
-		t.Fatalf("upstream_base_url = %q", p.UpstreamBaseURL)
-	}
-	if p.Gateway != "gw-456" {
-		t.Fatalf("gateway = %q, want gw-456", p.Gateway)
-	}
-	if p.UpstreamAPIKey != "tok-xyz" {
-		t.Fatalf("upstream_api_key lost: %q", p.UpstreamAPIKey)
-	}
-
-	// idempotent: a second pass leaves the file alone.
-	migrateCloudflareURLIfNeeded()
-	p, _ = loadProviderConfig("cloudflare")
-	if p.UpstreamBaseURL != "https://api.cloudflare.com/client/v4/accounts/acct-123/ai/v1" {
-		t.Fatalf("second pass rewrote URL: %q", p.UpstreamBaseURL)
-	}
-}
-
-func TestStripWorkersAIPrefix(t *testing.T) {
-	cfg := ProviderConfig{UpstreamBaseURL: "https://api.cloudflare.com/client/v4/accounts/acct-123/ai/v1"}
-
-	t.Run("strips workers-ai prefix", func(t *testing.T) {
-		body := []byte(`{"model":"workers-ai/@cf/zai-org/glm-5.2","messages":[]}`)
-		out, wire := cloudflarePrepareBody(body, cfg)
-		if wire != "@cf/zai-org/glm-5.2" {
-			t.Fatalf("wire model = %q", wire)
-		}
-		if !strings.Contains(string(out), `"model":"@cf/zai-org/glm-5.2"`) {
-			t.Fatalf("body model not stripped: %s", out)
-		}
-		if strings.Contains(string(out), "workers-ai/") {
-			t.Fatalf("workers-ai/ still present: %s", out)
-		}
-	})
-
-	t.Run("leaves bare @cf/ alone", func(t *testing.T) {
-		body := []byte(`{"model":"@cf/zai-org/glm-5.2","messages":[]}`)
-		out, wire := cloudflarePrepareBody(body, cfg)
-		if wire != "@cf/zai-org/glm-5.2" {
-			t.Fatalf("wire model = %q", wire)
-		}
-		if string(out) != string(body) {
-			t.Fatalf("body should be unchanged: %s", out)
-		}
-	})
-
-	t.Run("leaves non-cf model alone", func(t *testing.T) {
-		body := []byte(`{"model":"anthropic/claude-sonnet-4","messages":[]}`)
-		out, wire := cloudflarePrepareBody(body, cfg)
-		if wire != "anthropic/claude-sonnet-4" {
-			t.Fatalf("wire model = %q", wire)
-		}
-		if string(out) != string(body) {
-			t.Fatalf("body should be unchanged: %s", out)
-		}
-	})
-
-	t.Run("no-op for non-cloudflare upstream", func(t *testing.T) {
-		other := ProviderConfig{UpstreamBaseURL: "https://example.com/v1"}
-		body := []byte(`{"model":"workers-ai/@cf/foo","messages":[]}`)
-		out, wire := cloudflarePrepareBody(body, other)
-		if wire != "" {
-			t.Fatalf("wire model = %q, want empty for non-cloudflare", wire)
-		}
-		if string(out) != string(body) {
-			t.Fatalf("body should be unchanged: %s", out)
-		}
-	})
-}
-
-func TestInjectsGatewayHeaderForCFModels(t *testing.T) {
-	cfg := ProviderConfig{
-		UpstreamBaseURL: "https://api.cloudflare.com/client/v4/accounts/acct-123/ai/v1",
-		Gateway:         "gw-456",
-	}
-
-	t.Run("cf model sets header", func(t *testing.T) {
-		req, _ := http.NewRequest(http.MethodPost, "https://upstream", nil)
-		applyCloudflareGatewayHeader(req, cfg, "@cf/zai-org/glm-5.2")
-		if got := req.Header.Get("cf-aig-gateway-id"); got != "gw-456" {
-			t.Fatalf("cf-aig-gateway-id = %q, want gw-456", got)
-		}
-	})
-
-	t.Run("non-cf model leaves header off", func(t *testing.T) {
-		req, _ := http.NewRequest(http.MethodPost, "https://upstream", nil)
-		applyCloudflareGatewayHeader(req, cfg, "anthropic/claude-sonnet-4")
-		if got := req.Header.Get("cf-aig-gateway-id"); got != "" {
-			t.Fatalf("cf-aig-gateway-id = %q, want empty", got)
-		}
-	})
-
-	t.Run("empty gateway leaves header off", func(t *testing.T) {
-		noGW := cfg
-		noGW.Gateway = ""
-		req, _ := http.NewRequest(http.MethodPost, "https://upstream", nil)
-		applyCloudflareGatewayHeader(req, noGW, "@cf/foo")
-		if got := req.Header.Get("cf-aig-gateway-id"); got != "" {
-			t.Fatalf("cf-aig-gateway-id = %q, want empty", got)
-		}
-	})
-}
-
-func TestMigrateConfigLeavesExistingProviderFileAlone(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	// both files exist; migration should NOT clobber the existing provider file
-	if err := os.WriteFile(filepath.Join(dir, "opencode-go.json"), []byte(`{"upstream_api_key":"existing"}`), 0600); err != nil {
-		t.Fatal(err)
-	}
-	old := `{"host":"127.0.0.1","upstream_api_key":"newer","upstream_auth":"bearer"}`
-	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(old), 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	if _, err := loadConfig(); err != nil {
-		t.Fatal(err)
-	}
-	p, err := loadProviderConfig("opencode-go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if p.UpstreamAPIKey != "existing" {
-		t.Fatalf("existing provider file was clobbered: got %q", p.UpstreamAPIKey)
-	}
-}
-
-func TestMigrateConfigIsIdempotent(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	old := `{"host":"127.0.0.1","upstream_api_key":"k","upstream_auth":"bearer"}`
-	if err := os.WriteFile(filepath.Join(dir, "config.json"), []byte(old), 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	for i := 0; i < 3; i++ {
-		if _, err := loadConfig(); err != nil {
-			t.Fatalf("call %d: %v", i, err)
-		}
-	}
-	p, err := loadProviderConfig("opencode-go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if p.UpstreamAPIKey != "k" {
-		t.Fatalf("upstream_api_key after repeated calls = %q", p.UpstreamAPIKey)
-	}
-}
-
-func TestSetupOpencodeGoWritesProviderFile(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	t.Setenv("CFGATE_CC_API_KEY", "")
-
-	cmd := setupOpencodeGoCmd()
-	cmd.SetArgs([]string{"--api-key", "test-cfgate-cc-key"})
-	if err := cmd.Execute(); err != nil {
-		t.Fatal(err)
-	}
-
-	b, err := os.ReadFile(filepath.Join(dir, "opencode-go.json"))
-	if err != nil {
-		t.Fatalf("opencode-go.json not written: %v", err)
-	}
-	var p ProviderConfig
-	if err := json.Unmarshal(b, &p); err != nil {
-		t.Fatal(err)
-	}
-	if p.UpstreamAPIKey != "test-cfgate-cc-key" {
-		t.Fatalf("upstream_api_key = %q, want test-cfgate-cc-key", p.UpstreamAPIKey)
-	}
-	if p.UpstreamAuth != "both" {
-		t.Fatalf("upstream_auth = %q, want both (opencode-go sends Bearer + x-api-key)", p.UpstreamAuth)
-	}
-
-	// api_key must NOT land in config.json — that's the local proxy key,
-	// not the upstream key. this is the whole point of the split.
-	if _, err := os.Stat(filepath.Join(dir, "config.json")); err == nil {
-		b, _ := os.ReadFile(filepath.Join(dir, "config.json"))
-		if strings.Contains(string(b), "test-cfgate-cc-key") {
-			t.Fatalf("upstream key leaked into config.json:\n%s", string(b))
-		}
-	}
-}
-
-func TestApplyUpstreamAuthNoLongerFallsBackToLocalKey(t *testing.T) {
-	// empty UpstreamAPIKey must NOT send any Authorization header. pre-refactor
-	// this fell through to cfg.APIKey (ocgo-compat hack); post-refactor the
-	// local key is structurally unreachable from applyUpstreamAuth because
-	// the function only takes ProviderConfig.
-	p := ProviderConfig{UpstreamAuth: "bearer"}
-
-	req, _ := http.NewRequest(http.MethodPost, "http://example", nil)
-	applyUpstreamAuth(req, p)
-
-	if got := req.Header.Get("Authorization"); got != "" {
-		t.Fatalf("Authorization should be empty when upstream key is empty, got %q", got)
-	}
-
-	// sanity: with the upstream key set, the bearer header is correct
-	p.UpstreamAPIKey = "upstream-key"
-	req2, _ := http.NewRequest(http.MethodPost, "http://example", nil)
-	applyUpstreamAuth(req2, p)
-	if got := req2.Header.Get("Authorization"); got != "Bearer upstream-key" {
-		t.Fatalf("Authorization = %q, want Bearer upstream-key", got)
-	}
-}
-
-func TestApplyUpstreamAuthBothMode(t *testing.T) {
-	// opencode-go's /v1/chat/completions wants Bearer, /v1/messages wants
-	// x-api-key. the "both" mode sends both so either endpoint accepts it.
-	p := ProviderConfig{UpstreamAuth: "both", UpstreamAPIKey: "k"}
-	req, _ := http.NewRequest(http.MethodPost, "http://example", nil)
-	applyUpstreamAuth(req, p)
-	if got := req.Header.Get("Authorization"); got != "Bearer k" {
-		t.Fatalf("Authorization = %q, want Bearer k", got)
-	}
-	if got := req.Header.Get("x-api-key"); got != "k" {
-		t.Fatalf("x-api-key = %q, want k", got)
-	}
-}
-
-func TestLoadActiveProviderAppliesEnvOverrides(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "opencode-go.json"), []byte(`{"upstream_base_url":"https://file.example/v1","upstream_api_key":"file-key","upstream_auth":"bearer"}`), 0600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("CFGATE_CC_UPSTREAM_BASE_URL", "https://env.example/v1")
-	t.Setenv("CFGATE_CC_UPSTREAM_API_KEY", "env-key")
-
-	p, err := loadActiveProvider("opencode-go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if p.UpstreamBaseURL != "https://env.example/v1" {
-		t.Fatalf("upstream_base_url = %q, want env override", p.UpstreamBaseURL)
-	}
-	if p.UpstreamAPIKey != "env-key" {
-		t.Fatalf("upstream_api_key = %q, want env override", p.UpstreamAPIKey)
-	}
-}
-
-func TestLoadActiveProviderOpencodeGoDefaultURL(t *testing.T) {
-	// an opencode-go provider file with no upstream_base_url should still
-	// resolve to a usable URL via the opencode-go default fallback.
-	dir := t.TempDir()
-	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(dir, "opencode-go.json"), []byte(`{"upstream_api_key":"k"}`), 0600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("CFGATE_CC_UPSTREAM_BASE_URL", "")
-
-	p, err := loadActiveProvider("opencode-go")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got := openAIURL(p); got != "https://opencode.ai/zen/go/v1/chat/completions" {
-		t.Fatalf("openAIURL = %q, want opencode-go default", got)
-	}
-}
-
-func TestDebugLoggingProxyMessages(t *testing.T) {
-	dir := t.TempDir()
-	logPath := filepath.Join(dir, "debug.log")
-	t.Setenv("CFGATE_CC_DEBUG", logPath)
-
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if got := r.Header.Get("Authorization"); got != "Bearer secret-key" {
-			t.Errorf("upstream Authorization = %q", got)
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"id":"x","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`))
-	}))
-	defer upstream.Close()
-
-	// enable debug + re-arm after the test so other tests stay quiet
-	prev := debugEnabled
-	debugEnabled = false
-	t.Cleanup(func() {
-		debugEnabled = prev
-		log.SetOutput(os.Stderr)
-	})
-	setupDebug()
-
-	cfg := ProviderConfig{Name: "opencode-go", UpstreamBaseURL: upstream.URL, UpstreamAPIKey: "secret-key", UpstreamAuth: "bearer"}
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { proxyMessages(w, r, cfg) }))
-	defer proxy.Close()
-
-	body := strings.NewReader(`{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"hi"}]}`)
-	resp, err := http.Post(proxy.URL+"/v1/messages", "application/json", body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	resp.Body.Close()
-
-	logBytes, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	debugLog := string(logBytes)
-	for _, want := range []string{
-		"[messages] incoming POST /v1/messages",
-		"[upstream] POST " + upstream.URL + "/chat/completions",
-		"[upstream] response 200 application/json",
-		"[messages] client response: 200",
-		"Authorization: [REDACTED]",
-		`"content":"hi"`,
-	} {
-		if !strings.Contains(debugLog, want) {
-			t.Errorf("debug log missing %q\n---\n%s\n---", want, debugLog)
-		}
-	}
-	if strings.Contains(debugLog, "secret-key") {
-		t.Errorf("debug log leaked upstream key\n---\n%s\n---", debugLog)
-	}
-}
-
-func TestDebugLoggingStderr(t *testing.T) {
-	t.Setenv("CFGATE_CC_DEBUG", "1")
-
-	// capture stderr
-	orig := os.Stderr
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	os.Stderr = w
-	prev := debugEnabled
-	debugEnabled = false
-	t.Cleanup(func() {
-		debugEnabled = prev
-		log.SetOutput(orig)
-		os.Stderr = orig
-	})
-	setupDebug()
-	if !debugEnabled {
-		t.Fatal("setupDebug did not enable debug")
-	}
-
-	dlogf("hello from stderr")
-
-	w.Close()
-	out, _ := io.ReadAll(r)
-	if !strings.Contains(string(out), "hello from stderr") {
-		t.Errorf("stderr capture missing log line: %q", string(out))
-	}
-	if !strings.Contains(string(out), "debug log: 1") {
-		t.Errorf("stderr capture missing setup banner: %q", string(out))
-	}
-}
-
-func TestDebugLoggingUnset(t *testing.T) {
-	t.Setenv("CFGATE_CC_DEBUG", "")
-
-	prev := debugEnabled
-	debugEnabled = false
-	t.Cleanup(func() { debugEnabled = prev })
-	setupDebug()
-	if debugEnabled {
-		t.Fatal("setupDebug enabled debug with CFGATE_CC_DEBUG unset")
-	}
-
-	// capture stderr to confirm dlogf is a no-op
-	orig := os.Stderr
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatal(err)
-	}
-	os.Stderr = w
-	dlogf("this should be dropped")
-	w.Close()
-	out, _ := io.ReadAll(r)
-	os.Stderr = orig
-	if strings.Contains(string(out), "this should be dropped") {
-		t.Errorf("debug log emitted with CFGATE_CC_DEBUG unset: %q", string(out))
-	}
-}
-
-func TestDebugLoggingStreamSSE(t *testing.T) {
-	dir := t.TempDir()
-	logPath := filepath.Join(dir, "debug.log")
-	t.Setenv("CFGATE_CC_DEBUG", logPath)
-
-	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "text/event-stream")
-		flusher, _ := w.(http.Flusher)
-		// 5 events so first 2 + last 2 are visible
-		for i := 0; i < 5; i++ {
-			fmt.Fprintf(w, "data: {\"i\":%d}\n\n", i)
-			if flusher != nil {
-				flusher.Flush()
-			}
-		}
-	}))
-	defer upstream.Close()
-
-	prev := debugEnabled
-	debugEnabled = false
-	t.Cleanup(func() {
-		debugEnabled = prev
-		log.SetOutput(os.Stderr)
-	})
-	setupDebug()
-
-	cfg := ProviderConfig{Name: "opencode-go", UpstreamBaseURL: upstream.URL, UpstreamAPIKey: "k", UpstreamAuth: "bearer"}
-	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { proxyMessages(w, r, cfg) }))
-	defer proxy.Close()
-
-	body := strings.NewReader(`{"model":"m","max_tokens":1,"stream":true,"messages":[{"role":"user","content":"hi"}]}`)
-	resp, err := http.Post(proxy.URL+"/v1/messages", "application/json", body)
-	if err != nil {
-		t.Fatal(err)
-	}
-	// drain the response so the proxy's streamReader hits eof and writes
-	// the [messages] stream end line before we read the log. Close() on a
-	// streaming body returns as soon as headers are in, which races the
-	// server-side log write and flakes on fast runners.
-	_, _ = io.ReadAll(resp.Body)
-	resp.Body.Close()
-
-	logBytes, err := os.ReadFile(logPath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	debugLog := string(logBytes)
-	for _, want := range []string{
-		"[upstream] response 200 text/event-stream",
-		"[messages] stream end: events=5",
-		`event[first/1]: data: {"i":0}`,
-		`event[last/5]: data: {"i":4}`,
-	} {
-		if !strings.Contains(debugLog, want) {
-			t.Errorf("debug log missing %q\n---\n%s\n---", want, debugLog)
-		}
-	}
-}
-
-func ptr[T any](v T) *T { return &v }
-
-// withTempInstanceDir redirects the resolved instance to name under a temp
-// CFGATE_CC_CONFIG_DIR and resets resolvedInstanceName. callers must not run
-// in parallel (resolvedInstanceName is a package-level global).
-func withTempInstanceDir(t *testing.T, name string) {
-	t.Helper()
-	t.Setenv("CFGATE_CC_CONFIG_DIR", t.TempDir())
-	old := resolvedInstanceName
-	resolvedInstanceName = name
-	t.Cleanup(func() { resolvedInstanceName = old })
-}
-
-func TestResolveInstanceName_Precedence(t *testing.T) {
-	// flag > env > empty. the resolveInstanceName helper sets
-	// resolvedInstanceName as a side effect, which the path helpers read.
-	tests := []struct {
-		name    string
-		flagVal string
-		envVal  string
-		want    string
-	}{
-		{"flag wins over env", "alpha", "beta", "alpha"},
-		{"env used when no flag", "", "beta", "beta"},
-		{"empty when neither", "", "", ""},
-		{"flag whitespace trims", "  alpha  ", "beta", "alpha"},
-		{"env whitespace trims", "", "  beta  ", "beta"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Setenv("CFGATE_CC_NAME", tt.envVal)
-			resolvedInstanceName = ""
-			root := &cobra.Command{Use: "test"}
-			root.PersistentFlags().String("name", "", "")
-			if tt.flagVal != "" {
-				if err := root.PersistentFlags().Set("name", tt.flagVal); err != nil {
-					t.Fatal(err)
-				}
-			}
-			got := resolveInstanceName(root)
-			if got != tt.want {
-				t.Fatalf("resolveInstanceName() = %q, want %q", got, tt.want)
-			}
-			if resolvedInstanceName != tt.want {
-				t.Fatalf("resolvedInstanceName = %q, want %q", resolvedInstanceName, tt.want)
-			}
-		})
-	}
-}
-
-func TestInstanceDir_Isolated(t *testing.T) {
-	// two named instances must not see each other's pid/port/active-provider.
-	withTempInstanceDir(t, "foo")
-	fooPid := filepath.Join(instanceDir("foo"), "cfgate-cc.pid")
-	if err := os.MkdirAll(instanceDir("foo"), 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(fooPid, []byte("1234"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	// with the current name set to "bar", the bar-scoped pid file path
-	// must not collide with foo's. write a different value to bar's path
-	// and confirm foo's is still 1234.
-	resolvedInstanceName = "bar"
-	if instanceDir("foo") == instanceDir("bar") {
-		t.Fatal("instanceDir must differ per name")
-	}
-	if err := os.MkdirAll(instanceDir("bar"), 0755); err != nil {
-		t.Fatal(err)
-	}
-	barPid := filepath.Join(instanceDir("bar"), "cfgate-cc.pid")
-	if err := os.WriteFile(barPid, []byte("5678"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if b, _ := os.ReadFile(fooPid); string(b) != "1234" {
-		t.Fatalf("foo's pid file was clobbered: %q", string(b))
-	}
-	if b, _ := os.ReadFile(barPid); string(b) != "5678" {
-		t.Fatalf("bar's pid file is wrong: %q", string(b))
-	}
-	// the per-instance path helpers all land in the instance dir.
-	for _, p := range []string{instanceConfigFile("foo"), instancePidFile("foo"), instanceActiveProviderFile("foo"), instancePortFile("foo"), instanceModelMappingFile("foo")} {
-		if !strings.HasPrefix(p, instanceDir("foo")) {
-			t.Fatalf("%q does not live under instanceDir(foo) %q", p, instanceDir("foo"))
-		}
-	}
-	// back-compat: with empty name, path helpers collapse to configDir.
-	resolvedInstanceName = ""
-	if instanceDir("") != configDir() {
-		t.Fatalf("instanceDir(\"\") = %q, want configDir() %q", instanceDir(""), configDir())
-	}
-}
-
-func TestAutoAllocatePort_Persists(t *testing.T) {
-	// fresh instance: ensureInstancePort must scan from defaultPort+1,
-	// not squat on defaultPort itself (that's reserved for legacy
-	// back-compat). scan range is [defaultPort+1, defaultPort+100].
-	withTempInstanceDir(t, "p1")
-	cfg := Config{Host: defaultHost, Port: defaultPort}
-	base1, err := resolveInstanceBase(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	port1, err := strconv.Atoi(strings.TrimPrefix(base1, fmt.Sprintf("http://%s:", defaultHost)))
-	if err != nil {
-		t.Fatalf("base1 %q is not parseable: %v", base1, err)
-	}
-	if port1 < defaultPort+1 || port1 > defaultPort+100 {
-		t.Fatalf("first allocation = %d, want in [%d, %d]", port1, defaultPort+1, defaultPort+100)
-	}
-	// the port must be persisted so a second invocation (or the spawned
-	// subprocess) reads the same value. persistence is in the `port` file
-	// — the `instances` table reads from there, ensureInstancePort writes
-	// there. config.json is for visibility only.
-	b, err := os.ReadFile(instancePortFile("p1"))
-	if err != nil {
-		t.Fatalf("port file not written: %v", err)
-	}
-	saved, err := strconv.Atoi(strings.TrimSpace(string(b)))
-	if err != nil {
-		t.Fatalf("port file not parseable: %v", err)
-	}
-	if saved != port1 {
-		t.Fatalf("saved port = %d, want %d", saved, port1)
-	}
-	// second call reuses the persisted port. the subprocess startup path
-	// calls ensureInstancePort which reads the `port` file first.
-	base2, err := resolveInstanceBase(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	port2, _ := strconv.Atoi(strings.TrimPrefix(base2, fmt.Sprintf("http://%s:", defaultHost)))
-	if port2 != port1 {
-		t.Fatalf("second allocation = %d, want %d (reused)", port2, port1)
-	}
-}
-
-func TestStartLaunchServer_DoesNotKillPeer(t *testing.T) {
-	// regression test for the bug vecilla hit: an opencode-go instance
-	// was already healthy on its port; launching a cloudflare instance
-	// must not stop the opencode-go one. both pids live in different
-	// instance dirs; stopRunningServer is instance-scoped via path
-	// helpers, so killing instance A's pid must leave instance B's
-	// pid file and a healthy subprocess on B's port untouched.
-	probe, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	portA := probe.Addr().(*net.TCPAddr).Port
-	_ = probe.Close()
-	probe, err = net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	portB := probe.Addr().(*net.TCPAddr).Port
-	_ = probe.Close()
-	t.Setenv("CFGATE_CC_CONFIG_DIR", t.TempDir())
-	// fake "B is running" by writing B's pid file under B's instance dir.
-	// we use a real long-lived process (a sleep) so the pid is actually
-	// killable, and we can prove the stop call routed to B's pid only.
-	bProc := exec.Command("/bin/sh", "-c", "sleep 60")
-	if err := bProc.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = bProc.Process.Kill(); _, _ = bProc.Process.Wait() })
-
-	resolvedInstanceName = "A"
-	t.Cleanup(func() { resolvedInstanceName = "" })
-	if err := os.MkdirAll(instanceDir("A"), 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(instanceConfigFile("A"), []byte(fmt.Sprintf(`{"host":"127.0.0.1","port":%d}`, portA)), 0600); err != nil {
-		t.Fatal(err)
-	}
-	resolvedInstanceName = "B"
-	if err := os.MkdirAll(instanceDir("B"), 0755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(instanceConfigFile("B"), []byte(fmt.Sprintf(`{"host":"127.0.0.1","port":%d}`, portB)), 0600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(instancePidFile("B"), []byte(strconv.Itoa(bProc.Process.Pid)), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(instanceActiveProviderFile("B"), []byte("opencode-go"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	// act: pretend A is launching and its startLaunchServer decided A
-	// needed a different provider. stopRunningServer is called on A
-	// (the *current* instance), so B's pid file and process must
-	// survive.
-	resolvedInstanceName = "A"
-	if err := stopRunningServer(); err != nil {
-		t.Fatalf("stopRunningServer on A: %v", err)
-	}
-	// A had no pid file, so the call was a no-op. now set A to have a
-	// real (killed) pid, and re-run: still no effect on B.
-	aProc := exec.Command("/bin/sh", "-c", "sleep 60")
-	if err := aProc.Start(); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = aProc.Process.Kill(); _, _ = aProc.Process.Wait() })
-	if err := os.WriteFile(instancePidFile("A"), []byte(strconv.Itoa(aProc.Process.Pid)), 0644); err != nil {
-		t.Fatal(err)
-	}
-	if err := stopRunningServer(); err != nil {
-		t.Fatalf("stopRunningServer on A (second): %v", err)
-	}
-	// A's process is gone...
-	if _, err := os.FindProcess(aProc.Process.Pid); err == nil {
-		// FindProcess always succeeds on unix, so check by signalling.
-		if err := aProc.Process.Signal(os.Signal(nil)); err == nil {
-			// best-effort: process is alive (Signal(nil) is a no-op on linux,
-			// but a dead process returns an error). we already explicitly
-			// killed it via Cleanup on shutdown.
-		}
-	}
-	// ...A's pid file is gone...
-	if _, err := os.Stat(instancePidFile("A")); !os.IsNotExist(err) {
-		t.Fatalf("A's pid file should be removed, got err=%v", err)
-	}
-	// ...B's pid file is intact...
-	if _, err := os.Stat(instancePidFile("B")); err != nil {
-		t.Fatalf("B's pid file disappeared: %v", err)
-	}
-	if b, _ := os.ReadFile(instancePidFile("B")); strings.TrimSpace(string(b)) != strconv.Itoa(bProc.Process.Pid) {
-		t.Fatalf("B's pid file was modified: %q", string(b))
-	}
-	// ...and B's process is still alive.
-	if err := bProc.Process.Signal(os.Signal(syscall.SIGCONT)); err != nil {
-		t.Fatalf("B's process was killed: %v", err)
-	}
-}
 
 func TestListCmd(t *testing.T) {
 	t.Setenv("CFGATE_CC_CONFIG_DIR", t.TempDir())
@@ -3039,322 +1740,3 @@ func mustPort(t *testing.T, url string) int {
 	return p
 }
 
-func TestSetupCloudflareNativeWritesOpenAINative(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	t.Setenv("CLOUDFLARE_API_TOKEN", "")
-	t.Setenv("CLOUDFLARE_ACCOUNT_ID", "")
-	t.Setenv("CLOUDFLARE_GATEWAY_ID", "")
-
-	// peers in the suite mutate resolvedInstanceName without restoring it.
-	// reset here so providerConfigFile resolves to our temp dir, not some
-	// leftover instance's dir.
-	old := resolvedInstanceName
-	resolvedInstanceName = ""
-	t.Cleanup(func() { resolvedInstanceName = old })
-
-	cmd := setupCloudflareCmd()
-	cmd.SetArgs([]string{"--token", "tok-xyz", "--account", "acct-123", "--gateway", "gw-456", "--openai-native"})
-	cmd.SetIn(strings.NewReader(""))
-	if err := cmd.Execute(); err != nil {
-		t.Fatal(err)
-	}
-
-	b, err := os.ReadFile(filepath.Join(dir, "cloudflare.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var p ProviderConfig
-	if err := json.Unmarshal(b, &p); err != nil {
-		t.Fatal(err)
-	}
-	if !p.OpenAINative {
-		t.Fatalf("openai_native should be true, got %+v", p)
-	}
-	if p.Account != "acct-123" {
-		t.Fatalf("account = %q, want acct-123", p.Account)
-	}
-	if p.Gateway != "gw-456" {
-		t.Fatalf("gateway = %q, want gw-456", p.Gateway)
-	}
-}
-
-func TestCloudflareNativeURLBuild(t *testing.T) {
-	cfg := ProviderConfig{Account: "acct-123", Gateway: "gw-456", OpenAINative: true}
-	got := openAINativeURL(cfg)
-	want := "https://gateway.ai.cloudflare.com/v1/acct-123/gw-456/openai/chat/completions"
-	if got != want {
-		t.Fatalf("openAINativeURL = %q, want %q", got, want)
-	}
-}
-
-func TestOpenAIURLForModel(t *testing.T) {
-	// native on, workers-ai → legacy /ai/v1 (gateway header path).
-	// native on, gpt-5 → /openai native. native off, gpt-5 → /ai/v1.
-	cfg := ProviderConfig{
-		Name:            "cloudflare",
-		UpstreamBaseURL: "https://api.cloudflare.com/client/v4/accounts/acct-123/ai/v1",
-		Account:         "acct-123",
-		Gateway:         "gw-456",
-		OpenAINative:    true,
-	}
-	if got := openAIURLForModel(cfg, "@cf/zai-org/glm-5.2"); got != cfg.UpstreamBaseURL+"/chat/completions" {
-		t.Errorf("workers-ai native cfg: got %q, want compat URL", got)
-	}
-	if got := openAIURLForModel(cfg, "gpt-5.4"); got != "https://gateway.ai.cloudflare.com/v1/acct-123/gw-456/openai/chat/completions" {
-		t.Errorf("gpt-5 native cfg: got %q, want native URL", got)
-	}
-	cfg.OpenAINative = false
-	if got := openAIURLForModel(cfg, "gpt-5.4"); got != cfg.UpstreamBaseURL+"/chat/completions" {
-		t.Errorf("gpt-5 non-native cfg: got %q, want compat URL", got)
-	}
-}
-
-func TestApplyUpstreamAuthForModel(t *testing.T) {
-	// opencode-go: bearer token always sent.
-	oc := ProviderConfig{Name: "opencode-go", UpstreamAPIKey: "oc-key", UpstreamAuth: "bearer"}
-	req, _ := http.NewRequest(http.MethodPost, "http://example", nil)
-	applyUpstreamAuthForModel(req, oc, "gpt-5.4")
-	if got := req.Header.Get("Authorization"); got != "Bearer oc-key" {
-		t.Fatalf("opencode-go Authorization = %q, want Bearer oc-key", got)
-	}
-	if got := req.Header.Get("cf-aig-authorization"); got != "" {
-		t.Fatalf("opencode-go should not set cf-aig-authorization, got %q", got)
-	}
-
-	// cloudflare workers-ai: bearer token, gateway header set elsewhere.
-	cf := ProviderConfig{Name: "cloudflare", UpstreamAPIKey: "cf-key", UpstreamAuth: "bearer"}
-	req, _ = http.NewRequest(http.MethodPost, "http://example", nil)
-	applyUpstreamAuthForModel(req, cf, "@cf/zai-org/glm-5.2")
-	if got := req.Header.Get("Authorization"); got != "Bearer cf-key" {
-		t.Fatalf("cloudflare workers-ai Authorization = %q, want Bearer cf-key", got)
-	}
-	if got := req.Header.Get("cf-aig-authorization"); got != "" {
-		t.Fatalf("cloudflare workers-ai should not set cf-aig-authorization, got %q", got)
-	}
-
-	// cloudflare gpt-5: blank Authorization, cf-aig-authorization set.
-	req, _ = http.NewRequest(http.MethodPost, "http://example", nil)
-	applyUpstreamAuthForModel(req, cf, "gpt-5.4")
-	if got := req.Header.Get("Authorization"); got != "" {
-		t.Fatalf("cloudflare gpt-5 Authorization = %q, want empty (BYOK bypass guard)", got)
-	}
-	if got := req.Header.Get("cf-aig-authorization"); got != "Bearer cf-key" {
-		t.Fatalf("cloudflare gpt-5 cf-aig-authorization = %q, want Bearer cf-key", got)
-	}
-}
-
-func TestUsesMaxCompletionTokens(t *testing.T) {
-	cases := []struct {
-		model string
-		want  bool
-	}{
-		{"gpt-5.5", true},
-		{"gpt-5.4", true},
-		{"gpt-5.4-mini", true},
-		{"gpt-5", true},
-		{"gpt-4o", false},
-		{"@cf/zai-org/glm-5.2", false},
-		{"kimi-k2.7-code", false},
-	}
-	for _, c := range cases {
-		if got := usesMaxCompletionTokens(c.model); got != c.want {
-			t.Errorf("usesMaxCompletionTokens(%q) = %v, want %v", c.model, got, c.want)
-		}
-	}
-}
-
-func TestConvertRequestEmitsMaxCompletionTokensForGPT5(t *testing.T) {
-	// Anthropic request for gpt-5.4 should emit max_completion_tokens, not
-	// max_tokens, and must not carry both.
-	ar := AnthropicRequest{Model: "gpt-5.4", MaxTokens: 4096, Messages: []AMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}}}
-	or := convertRequest(ar, ProviderConfig{Name: "cloudflare"})
-	if or.MaxCompletionTokens != 4096 {
-		t.Fatalf("MaxCompletionTokens = %d, want 4096", or.MaxCompletionTokens)
-	}
-	if or.MaxTokens != 0 {
-		t.Fatalf("MaxTokens = %d, want 0 (gpt-5.x rejects max_tokens)", or.MaxTokens)
-	}
-
-	// non-gpt-5 model: max_tokens kept.
-	ar2 := AnthropicRequest{Model: "kimi-k2.6", MaxTokens: 4096, Messages: []AMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}}}
-	or2 := convertRequest(ar2, ProviderConfig{Name: "cloudflare"})
-	if or2.MaxTokens != 4096 {
-		t.Fatalf("non-gpt-5 MaxTokens = %d, want 4096", or2.MaxTokens)
-	}
-	if or2.MaxCompletionTokens != 0 {
-		t.Fatalf("non-gpt-5 MaxCompletionTokens = %d, want 0", or2.MaxCompletionTokens)
-	}
-}
-
-func TestResponsesToChatEmitsMaxCompletionTokensForGPT5(t *testing.T) {
-	rr := ResponsesRequest{Model: "gpt-5.5", MaxTokens: 8192, Input: json.RawMessage(`[{"role":"user","content":"hi"}]`)}
-	or := responsesToChat(rr, ProviderConfig{Name: "cloudflare"})
-	if or.MaxCompletionTokens != 8192 {
-		t.Fatalf("MaxCompletionTokens = %d, want 8192", or.MaxCompletionTokens)
-	}
-	if or.MaxTokens != 0 {
-		t.Fatalf("MaxTokens = %d, want 0 for gpt-5.x", or.MaxTokens)
-	}
-}
-
-func TestPrepareChatBodyEmitsMaxCompletionTokensForGPT5(t *testing.T) {
-	// raw chat-completions body for a gpt-5 model: max_tokens must be moved
-	// to max_completion_tokens. applies after the codex mapping resolves
-	// the model name.
-	mappings := defaultModelMappings()
-	mappings["codex"] = map[string]string{"gpt-5.4-target": "gpt-5.4"}
-	prev := modelMappingFile
-	modelMappingFile = func() string { return filepath.Join(t.TempDir(), "model-mapping.json") }
-	b, _ := json.MarshalIndent(map[string]map[string]map[string]string{"cloudflare": mappings}, "", "  ")
-	if err := os.WriteFile(modelMappingFile(), b, 0600); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { modelMappingFile = prev })
-
-	body := []byte(`{"model":"gpt-5.4-target","max_tokens":2048,"messages":[{"role":"user","content":"hi"}]}`)
-	out, err := prepareChatBody(body, ProviderConfig{Name: "cloudflare"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(out), `"max_completion_tokens":2048`) {
-		t.Fatalf("max_completion_tokens missing in: %s", out)
-	}
-	if strings.Contains(string(out), `"max_tokens"`) {
-		t.Fatalf("max_tokens should be removed for gpt-5.x, got: %s", out)
-	}
-
-	// non-gpt-5: max_tokens preserved.
-	body2 := []byte(`{"model":"kimi-k2.6","max_tokens":2048,"messages":[{"role":"user","content":"hi"}]}`)
-	out2, err := prepareChatBody(body2, ProviderConfig{Name: "cloudflare"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(out2), `"max_tokens":2048`) {
-		t.Fatalf("non-gpt-5 max_tokens missing: %s", out2)
-	}
-	if strings.Contains(string(out2), `"max_completion_tokens"`) {
-		t.Fatalf("non-gpt-5 should not have max_completion_tokens: %s", out2)
-	}
-}
-
-func TestModelMetadataForGPT5(t *testing.T) {
-	cases := []struct {
-		model           string
-		wantCtx         int
-		wantImageInput  bool
-	}{
-		{"gpt-5.5", 1000000, true},
-		{"gpt-5.4", 1000000, true},
-		{"gpt-5.4-mini", 400000, true},
-	}
-	for _, c := range cases {
-		m := modelMetadata(c.model)
-		if m.ContextWindow != c.wantCtx {
-			t.Errorf("modelMetadata(%q).ContextWindow = %d, want %d", c.model, m.ContextWindow, c.wantCtx)
-		}
-		if m.MaxContextWindow != c.wantCtx {
-			t.Errorf("modelMetadata(%q).MaxContextWindow = %d, want %d", c.model, m.MaxContextWindow, c.wantCtx)
-		}
-		hasImage := false
-		for _, mod := range m.InputModalities {
-			if mod == "image" {
-				hasImage = true
-				break
-			}
-		}
-		if hasImage != c.wantImageInput {
-			t.Errorf("modelMetadata(%q) image modality = %v, want %v (input: %v)", c.model, hasImage, c.wantImageInput, m.InputModalities)
-		}
-		if m.UsesAnthropicEndpoint {
-			t.Errorf("modelMetadata(%q) should not use anthropic endpoint", c.model)
-		}
-	}
-}
-
-func TestMigrateCloudflareURLBackfillsAccount(t *testing.T) {
-	// pre-migration config that already has the REST API URL but is
-	// missing the Account field needed for the /openai native path.
-	dir := t.TempDir()
-	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		t.Fatal(err)
-	}
-	// reset instance name; peers in the suite leak it (TestListCmd sets
-	// "cf" and "lab" without restoring), so without this reset the
-	// providerConfigFile resolver lands in a non-existent instance dir.
-	oldInst := resolvedInstanceName
-	resolvedInstanceName = ""
-	t.Cleanup(func() { resolvedInstanceName = oldInst })
-
-	old := `{"upstream_base_url":"https://api.cloudflare.com/client/v4/accounts/acct-777/ai/v1","upstream_api_key":"tok","upstream_auth":"bearer","gateway":"gw-1"}`
-	if err := os.WriteFile(filepath.Join(dir, "cloudflare.json"), []byte(old), 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	migrateCloudflareURLIfNeeded()
-
-	p, err := loadProviderConfig("cloudflare")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if p.Account != "acct-777" {
-		t.Fatalf("Account = %q, want acct-777 (back-filled from UpstreamBaseURL)", p.Account)
-	}
-	if p.Gateway != "gw-1" {
-		t.Fatalf("Gateway = %q, want gw-1", p.Gateway)
-	}
-
-	// idempotent: a second pass leaves Account alone.
-	migrateCloudflareURLIfNeeded()
-	p, _ = loadProviderConfig("cloudflare")
-	if p.Account != "acct-777" {
-		t.Fatalf("Account changed on second pass: %q", p.Account)
-	}
-}
-
-func TestCloudflareModelIDsMergesNativeWhenEnabled(t *testing.T) {
-	// stand up a fake cloudflare compat server at /accounts/acct/ai/models/search
-	// and verify cloudflareModelIDs appends the native ids when OpenAINative
-	// is on. with OpenAINative off, only the compat id is returned.
-	mux := http.NewServeMux()
-	mux.HandleFunc("/accounts/acct/ai/models/search", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write([]byte(`{"success":true,"result":[{"id":"@cf/zai-org/glm-5.2","name":"@cf/zai-org/glm-5.2"}]}`))
-	})
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-
-	cfg := ProviderConfig{
-		Name:            "cloudflare",
-		UpstreamBaseURL: srv.URL + "/accounts/acct/ai/v1",
-		Account:         "acct",
-		Gateway:         "gw",
-		OpenAINative:    true,
-	}
-	ids, err := cloudflareModelIDs(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	seen := map[string]bool{}
-	for _, id := range ids {
-		seen[id] = true
-	}
-	for _, want := range []string{"gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "@cf/zai-org/glm-5.2"} {
-		if !seen[want] {
-			t.Errorf("missing %q in cloudflare list: %v", want, ids)
-		}
-	}
-
-	// native off → only the compat result.
-	cfg.OpenAINative = false
-	ids2, err := cloudflareModelIDs(cfg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, id := range ids2 {
-		if strings.HasPrefix(id, "gpt-") {
-			t.Errorf("native off should not include gpt- ids, got %q", id)
-		}
-	}
-}

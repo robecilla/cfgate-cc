@@ -5,8 +5,6 @@ import (
 	"bytes"
 	"container/list"
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,7 +17,6 @@ import (
 	"path"
 	"path/filepath"
 	"runtime"
-	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -27,7 +24,6 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/spf13/pflag"
 )
 
 const (
@@ -40,44 +36,8 @@ const (
 
 var version = "dev"
 
-// openAIURL builds the upstream openai-compatible chat/completions URL
-// from cfg.UpstreamBaseURL. Falls back to the opencode-go default when no
-// upstream is configured, preserving the original ocgo behavior.
-func openAIURL(cfg ProviderConfig) string {
-	if cfg.UpstreamBaseURL != "" {
-		return strings.TrimRight(cfg.UpstreamBaseURL, "/") + "/chat/completions"
-	}
-	return "https://opencode.ai/zen/go/v1/chat/completions"
-}
-
-// openAINativeURL builds the Cloudflare AI Gateway native /openai provider
-// URL — a transparent pass-through to OpenAI (the /ai/v1 compat adapter
-// sends max_tokens which gpt-5.x rejects). only valid when cfg.OpenAINative
-// is set and cfg.Account + cfg.Gateway are populated.
-func openAINativeURL(cfg ProviderConfig) string {
-	return fmt.Sprintf("https://gateway.ai.cloudflare.com/v1/%s/%s/openai/chat/completions", cfg.Account, cfg.Gateway)
-}
-
-// openAIURLForModel picks the right upstream URL for a model in flight.
-// workers-ai @cf/... models always use the legacy /ai/v1 path (the compat
-// adapter speaks the same chat/completions shape and routes to workers-ai
-// via cf-aig-gateway-id header). other models on a native-enabled config
-// use the /openai provider endpoint.
-func openAIURLForModel(cfg ProviderConfig, model string) string {
-	if cfg.OpenAINative && !strings.HasPrefix(modelID(model), "@cf/") {
-		return openAINativeURL(cfg)
-	}
-	return openAIURL(cfg)
-}
-
-// anthropicURL is the upstream anthropic-compatible /messages URL, used
-// only for models routed via endpoint_overrides with route=anthropic.
-func anthropicURL(cfg ProviderConfig) string {
-	if cfg.UpstreamBaseURL != "" {
-		return strings.TrimRight(cfg.UpstreamBaseURL, "/") + "/messages"
-	}
-	return "https://opencode.ai/zen/go/v1/messages"
-}
+// openAIURL, openAINativeURL, openAIURLForModel, anthropicURL, and
+// buildCloudflareURL live in config.go.
 
 const (
 	remoteModelsURL   = "https://models.dev/api.json"
@@ -197,52 +157,13 @@ var (
 	officialModels = newLazyFetcher(fetchOfficialModels)
 )
 
-// ModelEndpointOverride lets a model id (matched as glob) pick its upstream
-// endpoint: "openai" (chat/completions) or "anthropic" (/messages). empty list
-// = everything routes to openai. ThinkingBudgetMax (optional) overrides every
-// per-model thinking budget entry for matching models — useful when a single
-// deployment needs a different cap than the in-code table.
-type ModelEndpointOverride struct {
-	Pattern           string `json:"pattern"`
-	Route             string `json:"route"`
-	ThinkingBudgetMax *int   `json:"thinking_budget_max,omitempty"`
-}
+// ModelEndpointOverride lives in config.go.
 
-type Config struct {
-	Host string `json:"host"` // local proxy bind
-	Port int    `json:"port"` // local proxy port (default 3456)
-}
-
-// ProviderConfig is the per-provider upstream config. each named provider
-// (opencode-go, cloudflare, ...) lives in its own json file under configDir().
-// upstream-only fields moved out of Config so swapping providers doesn't
-// require rewriting local-proxy settings, and so two providers can coexist
-// (e.g. cloudflare for prod, opencode-go for the opencode.ai default).
-type ProviderConfig struct {
-	Name              string                  `json:"-"`                  // populated by loadActiveProvider, used by the proxy + list to dispatch on provider identity
-	UpstreamBaseURL   string                  `json:"upstream_base_url"`  // e.g. cloudflare /ai/v1 or opencode-go
-	UpstreamAPIKey    string                  `json:"upstream_api_key"`   // bearer/x-api-key value sent upstream
-	UpstreamAuth      string                  `json:"upstream_auth"`      // "bearer" | "x-api-key" | "header"
-	UpstreamAuthHdr   string                  `json:"upstream_auth_hdr"`  // header name for "header" mode
-	UpstreamExtraHdr  map[string]string       `json:"upstream_extra_hdr"` // extra headers for upstream
-	EndpointOverrides []ModelEndpointOverride `json:"endpoint_overrides"` // per-model routing
-	Gateway           string                  `json:"gateway,omitempty"`  // cloudflare: cf-aig-gateway-id value
-	Account           string                  `json:"account,omitempty"`  // cloudflare account id; needed for the /openai native path, derived from UpstreamBaseURL for legacy configs
-	// OpenAINative: when true, GPT-style models route through Cloudflare's
-	// native /openai provider endpoint (transparent pass-through to OpenAI,
-	// not the /ai/v1 compat adapter). required for gpt-5.x because the compat
-	// adapter sends max_tokens which gpt-5.x rejects. workers-ai @cf/... models
-	// still use the legacy /ai/v1 path even when this is true.
-	OpenAINative bool `json:"openai_native,omitempty"`
-}
-
-// knownProviders is the fixed enum. add a new provider = add a setup
-// subcommand + a row in the file. nothing else.
-var knownProviders = []string{"opencode-go", "cloudflare"}
-
-func isKnownProvider(name string) bool {
-	return slices.Contains(knownProviders, name)
-}
+// Config, ProviderConfig, CloudflareOptions, ModelEndpointOverride,
+// ModelMapping, and the knownProviders enum live in config.go. the
+// loaders (loadInstance, saveInstance, applyEnvOverrides) and the
+// path helpers live in instance.go. the v1→v2 cutover lives in
+// migrate.go.
 
 type AnthropicRequest struct {
 	Model           string          `json:"model"`
@@ -421,8 +342,16 @@ func setupOpencodeGoCmd() *cobra.Command {
 			if key == "" {
 				return errors.New("API key cannot be empty")
 			}
-			p := ProviderConfig{UpstreamAPIKey: key, UpstreamAuth: "both"}
-			return saveProviderConfig("opencode-go", p)
+			inst, err := loadInstance()
+			if err != nil {
+				return err
+			}
+			inst.Provider = ProviderConfig{Name: "opencode-go", UpstreamAPIKey: key, UpstreamAuth: "both"}
+			if err := saveInstance(inst); err != nil {
+				return err
+			}
+			fmt.Printf("Saved provider %q to %s\n", "opencode-go", configFile())
+			return nil
 		},
 	}
 	cmd.Flags().StringVar(&key, "api-key", "", "Upstream provider API key")
@@ -441,22 +370,30 @@ func setupCloudflareCmd() *cobra.Command {
 				return err
 			}
 			targetURL := buildCloudflareURL(values.account)
-			existing, err := loadProviderConfig("cloudflare")
+			inst, err := loadInstance()
 			if err != nil {
 				return err
 			}
-			if existing.UpstreamBaseURL != "" && existing.UpstreamBaseURL != targetURL && !force {
+			if existing := inst.Provider; existing.Name == "cloudflare" && existing.UpstreamBaseURL != "" && existing.UpstreamBaseURL != targetURL && !force {
 				return fmt.Errorf("cloudflare provider is already configured for %q; pass --force to overwrite", existing.UpstreamBaseURL)
 			}
-			p := ProviderConfig{
+			cf := &CloudflareOptions{
+				Gateway:      values.gateway,
+				Account:      values.account,
+				OpenAINative: openAINative,
+			}
+			inst.Provider = ProviderConfig{
+				Name:            "cloudflare",
 				UpstreamBaseURL: targetURL,
 				UpstreamAPIKey:  values.token,
 				UpstreamAuth:    "bearer",
-				Gateway:         values.gateway,
-				Account:         values.account,
-				OpenAINative:    openAINative,
+				Cloudflare:      cf,
 			}
-			return saveProviderConfig("cloudflare", p)
+			if err := saveInstance(inst); err != nil {
+				return err
+			}
+			fmt.Printf("Saved provider %q to %s\n", "cloudflare", configFile())
+			return nil
 		},
 	}
 	cmd.Flags().StringVar(&token, "token", "", "Cloudflare API token (falls back to $CLOUDFLARE_API_TOKEN)")
@@ -514,18 +451,20 @@ func readCloudflareValues(r io.Reader, tokenFlag, accountFlag, gatewayFlag strin
 	return cloudflareValues{token: t, account: a, gateway: g}, nil
 }
 
-// buildCloudflareURL assembles the AI Gateway REST API URL from the account ID.
-// the gateway id rides on a header, not the path; see applyCloudflareGatewayHeader.
-// ponytail: if cloudflare ever changes the URL shape, only this function moves.
-func buildCloudflareURL(account string) string {
-	return fmt.Sprintf("https://api.cloudflare.com/client/v4/accounts/%s/ai/v1", account)
-}
+// buildCloudflareURL lives in config.go.
 
 func listCmd() *cobra.Command {
 	cmd := &cobra.Command{Use: "list", Aliases: []string{"ls", "models"}, Short: "List models exposed by the configured upstream", RunE: func(cmd *cobra.Command, args []string) error {
-		providerName, err := resolveProvider(cmd)
+		inst, err := loadInstance()
 		if err != nil {
 			return err
+		}
+		providerName := inst.Provider.Name
+		if v := strings.TrimSpace(providerFlagValue(cmd)); v != "" {
+			providerName = v
+		}
+		if providerName == "" {
+			return errors.New("list: no provider configured; run `cfgate-cc setup opencode-go` or `cfgate-cc setup cloudflare`")
 		}
 		out := cmd.OutOrStdout()
 		switch providerName {
@@ -545,11 +484,7 @@ func listCmd() *cobra.Command {
 			}
 			return nil
 		case "cloudflare":
-			p, err := loadActiveProvider(providerName)
-			if err != nil {
-				return err
-			}
-			ids, err := cloudflareModelIDs(p)
+			ids, err := cloudflareModelIDs(inst.Provider)
 			if err != nil {
 				return err
 			}
@@ -564,6 +499,19 @@ func listCmd() *cobra.Command {
 	}}
 	cmd.Flags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $CFGATE_CC_PROVIDER or the single configured provider")
 	return cmd
+}
+
+// providerFlagValue reads --provider from a cobra command tree, returning
+// "" when unset. used by listCmd / mappingCmd where --provider is the
+// only flag and the active provider is implied by the saved instance.
+func providerFlagValue(cmd *cobra.Command) string {
+	if cmd == nil {
+		return ""
+	}
+	if f := cmd.Flags().Lookup("provider"); f != nil {
+		return strings.TrimSpace(f.Value.String())
+	}
+	return ""
 }
 
 // knownModelIDs returns the opencode-go model ids. usedCache is true when
@@ -895,16 +843,17 @@ func cloudflareNativeModelIDs() []string {
 // REST API is the only source. when OpenAINative is enabled, append the
 // native-side models so `list` shows the full set a user can route to.
 func cloudflareModelIDs(cfg ProviderConfig) ([]string, error) {
+	native := cfg.Cloudflare != nil && cfg.Cloudflare.OpenAINative
 	ids, err := fetchCloudflareModels(cfg)
 	if err != nil {
-		if !cfg.OpenAINative {
+		if !native {
 			return nil, err
 		}
 		// fall back to native ids only when compat fetch fails, so the
 		// user at least sees what's routable on the native path.
 		return append([]string(nil), cloudflareNativeModelIDs()...), nil
 	}
-	if cfg.OpenAINative {
+	if native {
 		seen := make(map[string]bool, len(ids))
 		for _, id := range ids {
 			seen[id] = true
@@ -927,210 +876,26 @@ func defaultModelMappings() map[string]map[string]string {
 	}
 }
 
-// modelMappingMigratedSentinel marks that the old tool-scoped format warning
-// has already been printed. file presence = warning already shown. per-
-// instance: each named cfgate-cc is self-contained, so its migration state
-// lives in its own dir.
-var modelMappingMigratedSentinel = func() string { return instanceModelMappingMigratedSentinel(resolvedInstanceName) }
-
-// loadAllModelMappings reads the model-mapping file. the file shape is
-// per-provider at the top level: { "opencode-go": { "claude": {...} },
-// "cloudflare": { "claude": {...} } }.
-//
-// if the file is in the old tool-scoped shape (top-level "claude" /
-// "codex") and providerName is a known provider, the legacy entries are
-// lifted into that provider's section in place — the user's existing
-// mappings carry over without a manual `mapping set` re-run. the on-disk
-// file is rewritten in the new shape and the migration sentinel is
-// removed so the next read sees the new format. pass "" for providerName
-// to skip migration (used by tests and the warn-only path).
-//
-// if the file is in the old shape but providerName is empty or not a
-// known provider, the result is empty and a one-shot warning is printed
-// (gated by modelMappingMigratedSentinel) — picking a target without
-// knowing the active provider would just dump the entries somewhere
-// arbitrary.
-func loadAllModelMappings(providerName string) (map[string]map[string]map[string]string, error) {
-	path := modelMappingFile()
-	b, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) && resolvedInstanceName != "" {
-		// ad-hoc (auto-named) instance: fall back to the base model-mapping
-		// so all ad-hoc launches for the same provider share one config.
-		// named instances always use their own (they may have customized it).
-		path = filepath.Join(configDir(), "model-mapping.json")
-		b, err = os.ReadFile(path)
+// loadModelMappings returns the active instance's model mapping. one
+// per-instance, no provider key (the provider is implied by the instance).
+// known tool with no entries: empty default mapping (claude/codex keys,
+// no entries). the proxy falls through to the default model passthrough
+// when the section has no entries for the requested tool.
+func loadModelMappings(inst Instance) map[string]map[string]string {
+	if len(inst.ModelMapping) == 0 {
+		return defaultModelMappings()
 	}
-	if errors.Is(err, os.ErrNotExist) {
-		return map[string]map[string]map[string]string{}, nil
-	}
-	if err != nil {
-		return nil, err
-	}
-	// two-stage parse: first as a flat map of raw json so we can detect
-	// the old tool-scoped shape before committing to a typed unmarshal
-	// (the old shape doesn't fit map[string]map[string]map[string]string).
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(b, &raw); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", modelMappingFile(), err)
-	}
-	if looksLikeOldMappingFormatRaw(raw) {
-		if isKnownProvider(providerName) {
-			return migrateOldMappingFormatInPlace(raw, providerName)
-		}
-		warnOldMappingFormatOnce()
-		return map[string]map[string]map[string]string{}, nil
-	}
-	var typed map[string]map[string]map[string]string
-	if err := json.Unmarshal(b, &typed); err != nil {
-		return nil, fmt.Errorf("parse %s: %w", modelMappingFile(), err)
-	}
-	if typed == nil {
-		typed = map[string]map[string]map[string]string{}
-	}
-	for name, byTool := range typed {
-		for tool, entries := range byTool {
-			if typed[name][tool] == nil {
-				typed[name][tool] = map[string]string{}
-			}
-			typed[name][tool] = cleanMappingEntries(entries)
-		}
-	}
-	return typed, nil
+	return inst.ModelMapping
 }
 
-// cleanMappingEntries drops empty source/target pairs and strips the
-// opencode-go/ prefix from targets. shared by the new-format read path
-// and the old-format migration so both end up with the same shape on
-// disk.
-func cleanMappingEntries(entries map[string]string) map[string]string {
-	cleaned := map[string]string{}
-	for source, target := range entries {
-		if strings.TrimSpace(source) != "" && strings.TrimSpace(target) != "" {
-			cleaned[strings.TrimSpace(source)] = modelID(target)
-		}
-	}
-	return cleaned
-}
-
-// migrateOldMappingFormatInPlace lifts a legacy tool-scoped model-mapping
-// file into providerName's section, writes the new-shape file back, and
-// drops the migration sentinel. preserves any non-tool top-level entries
-// (none expected, but be safe). the caller has already confirmed the
-// file is in the old shape via looksLikeOldMappingFormatRaw. returns the
-// full post-migration shape so callers see peer provider sections too.
-func migrateOldMappingFormatInPlace(raw map[string]json.RawMessage, providerName string) (map[string]map[string]map[string]string, error) {
-	oldShape := map[string]map[string]string{}
-	for _, tool := range []string{"claude", "codex"} {
-		v, ok := raw[tool]
-		if !ok {
-			continue
-		}
-		var entries map[string]string
-		if err := json.Unmarshal(v, &entries); err != nil {
-			return nil, fmt.Errorf("parse legacy %s/%s: %w", modelMappingFile(), tool, err)
-		}
-		oldShape[tool] = cleanMappingEntries(entries)
-	}
-	newShape := map[string]map[string]map[string]string{}
-	for k, v := range raw {
-		if k == "claude" || k == "codex" {
-			continue
-		}
-		var sec map[string]map[string]string
-		if err := json.Unmarshal(v, &sec); err == nil {
-			newShape[k] = sec
-		}
-	}
-	newShape[providerName] = oldShape
-	if err := saveAllModelMappings(newShape); err != nil {
-		return nil, err
-	}
-	_ = os.Remove(modelMappingMigratedSentinel())
-	oldMappingFormatWarned = true
-	fmt.Fprintf(os.Stderr, "cfgate-cc: migrated legacy model-mapping.json into %q section (one-time)\n", providerName)
-	return newShape, nil
-}
-
-func saveAllModelMappings(all map[string]map[string]map[string]string) error {
-	if err := os.MkdirAll(filepath.Dir(modelMappingFile()), 0755); err != nil {
-		return err
-	}
-	b, err := json.MarshalIndent(all, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(modelMappingFile(), append(b, '\n'), 0644)
-}
-
-// loadModelMappingsForProvider returns the tool → source→target section for
-// the named provider. known provider with no section: empty default mapping
-// (claude/codex keys, no entries). unknown provider: empty map. either way
-// the proxy falls through to the default model passthrough when the section
-// has no entries for the requested tool.
-func loadModelMappingsForProvider(name string) (map[string]map[string]string, error) {
-	all, err := loadAllModelMappings(name)
-	if err != nil {
-		return nil, err
-	}
-	if !isKnownProvider(name) {
-		return map[string]map[string]string{}, nil
-	}
-	section := all[name]
-	if section == nil {
-		return defaultModelMappings(), nil
-	}
-	return section, nil
-}
-
-// saveModelMappingsForProvider updates the section for name and writes the
-// file back, preserving other providers' sections.
-func saveModelMappingsForProvider(name string, m map[string]map[string]string) error {
-	all, err := loadAllModelMappings(name)
-	if err != nil {
-		return err
-	}
+// saveModelMappings writes the active instance's model mapping back to
+// config.json. used by the mapping subcommands.
+func saveModelMappings(inst *Instance, m map[string]map[string]string) error {
 	if m == nil {
 		m = defaultModelMappings()
 	}
-	all[name] = m
-	return saveAllModelMappings(all)
-}
-
-// looksLikeOldMappingFormatRaw detects the old tool-scoped shape by
-// checking the top-level keys. only the old format's tools are checked —
-// the new format's providers are opencode-go and cloudflare, which the
-// old format never used.
-func looksLikeOldMappingFormatRaw(raw map[string]json.RawMessage) bool {
-	if len(raw) == 0 {
-		return false
-	}
-	for _, tool := range []string{"claude", "codex"} {
-		if _, ok := raw[tool]; ok {
-			return true
-		}
-	}
-	return false
-}
-
-var oldMappingFormatWarned bool
-
-// warnOldMappingFormatOnce prints the migration warning the first time an
-// old-format model-mapping.json is read, and creates the sentinel file so
-// subsequent runs are silent. the in-process flag avoids duplicate prints
-// when many calls happen in one invocation (e.g. tests).
-func warnOldMappingFormatOnce() {
-	if oldMappingFormatWarned {
-		return
-	}
-	if _, err := os.Stat(modelMappingMigratedSentinel()); err == nil {
-		oldMappingFormatWarned = true
-		return
-	}
-	fmt.Fprintf(os.Stderr, "warning: %s is in the old tool-scoped format. run `cfgate-cc mapping --provider <name> <tool> set ...` to re-create mappings per provider.\n", modelMappingFile())
-	oldMappingFormatWarned = true
-	_ = os.MkdirAll(filepath.Dir(modelMappingMigratedSentinel()), 0755)
-	_ = os.WriteFile(modelMappingMigratedSentinel(), []byte("warned at "+time.Now().UTC().Format(time.RFC3339)+"\n"), 0644)
-	_ = os.Stderr.Sync()
+	inst.ModelMapping = m
+	return saveInstance(*inst)
 }
 
 func mappingCmd() *cobra.Command {
@@ -1144,42 +909,38 @@ func mappingCmd() *cobra.Command {
 // tree. the flag lives on the parent (`mapping`), cobra inherits persistent
 // flags to children, so cmd.Flags().Lookup("provider") on a leaf works.
 func providerFromMappingCmd(cmd *cobra.Command) (string, error) {
-	if cmd != nil {
-		if f := cmd.Flags().Lookup("provider"); f != nil {
-			if v := strings.TrimSpace(f.Value.String()); v != "" {
-				if !isKnownProvider(v) {
-					return "", fmt.Errorf("unknown --provider %q (known: %s)", v, strings.Join(knownProviders, ", "))
-				}
-				return v, nil
-			}
+	if v := providerFlagValue(cmd); v != "" {
+		if !isKnownProvider(v) {
+			return "", fmt.Errorf("unknown --provider %q (known: %s)", v, strings.Join(knownProviders, ", "))
 		}
+		return v, nil
 	}
-	return resolveProvider(cmd)
+	inst, err := loadInstance()
+	if err != nil {
+		return "", err
+	}
+	if inst.Provider.Name == "" {
+		return "", errors.New("no provider configured; run `cfgate-cc setup opencode-go` or `cfgate-cc setup cloudflare`")
+	}
+	return inst.Provider.Name, nil
 }
 
 func toolMappingCmd(tool string) *cobra.Command {
 	cmd := &cobra.Command{Use: tool, Short: fmt.Sprintf("Manage %s model mappings", tool)}
 	cmd.AddCommand(&cobra.Command{Use: "show", Short: "Show current mapping", RunE: func(cmd *cobra.Command, args []string) error {
-		name, err := providerFromMappingCmd(cmd)
+		inst, err := loadInstance()
 		if err != nil {
 			return err
 		}
-		m, err := loadModelMappingsForProvider(name)
-		if err != nil {
-			return err
-		}
-		printToolMapping(tool, m[tool])
+		printToolMapping(tool, loadModelMappings(inst)[tool])
 		return nil
 	}})
 	cmd.AddCommand(&cobra.Command{Use: "get <source-model>", Short: "Get one mapped upstream model", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		name, err := providerFromMappingCmd(cmd)
+		inst, err := loadInstance()
 		if err != nil {
 			return err
 		}
-		m, err := loadModelMappingsForProvider(name)
-		if err != nil {
-			return err
-		}
+		m := loadModelMappings(inst)
 		source := strings.TrimSpace(args[0])
 		normalized := modelID(source)
 		if target := resolveMappedModel(tool, source, m); target != normalized {
@@ -1189,10 +950,11 @@ func toolMappingCmd(tool string) *cobra.Command {
 		return fmt.Errorf("no mapping for %q in %s", source, tool)
 	}})
 	cmd.AddCommand(&cobra.Command{Use: "set <source-model> <opencode-model>", Short: "Set one model mapping", Args: cobra.ExactArgs(2), RunE: func(cmd *cobra.Command, args []string) error {
-		name, err := providerFromMappingCmd(cmd)
+		inst, err := loadInstance()
 		if err != nil {
 			return err
 		}
+		name := inst.Provider.Name
 		source := strings.TrimSpace(args[0])
 		target := strings.TrimSpace(args[1])
 		if source == "" || target == "" {
@@ -1205,32 +967,26 @@ func toolMappingCmd(tool string) *cobra.Command {
 			}
 			return fmt.Errorf("unknown upstream model %q for provider %q; run `cfgate-cc list --provider %s`", target, name, name)
 		}
-		m, err := loadModelMappingsForProvider(name)
-		if err != nil {
-			return err
-		}
+		m := loadModelMappings(inst)
 		if m[tool] == nil {
 			m[tool] = map[string]string{}
 		}
 		m[tool][source] = modelID(target)
-		if err := saveModelMappingsForProvider(name, m); err != nil {
+		if err := saveModelMappings(&inst, m); err != nil {
 			return err
 		}
 		fmt.Printf("%s %s -> %s\n", tool, source, modelID(target))
 		return nil
 	}})
 	cmd.AddCommand(&cobra.Command{Use: "unset <source-model>", Aliases: []string{"rm", "remove", "delete"}, Short: "Remove one model mapping", Args: cobra.ExactArgs(1), RunE: func(cmd *cobra.Command, args []string) error {
-		name, err := providerFromMappingCmd(cmd)
+		inst, err := loadInstance()
 		if err != nil {
 			return err
 		}
+		m := loadModelMappings(inst)
 		source := strings.TrimSpace(args[0])
 		if source == "" {
 			return errors.New("source model cannot be empty")
-		}
-		m, err := loadModelMappingsForProvider(name)
-		if err != nil {
-			return err
 		}
 		if m[tool] == nil {
 			m[tool] = map[string]string{}
@@ -1239,15 +995,20 @@ func toolMappingCmd(tool string) *cobra.Command {
 			return fmt.Errorf("no mapping for %q in %s", source, tool)
 		}
 		delete(m[tool], source)
-		if err := saveModelMappingsForProvider(name, m); err != nil {
+		if err := saveModelMappings(&inst, m); err != nil {
 			return err
 		}
 		fmt.Printf("removed %s mapping for %s\n", tool, source)
 		return nil
 	}})
 	cmd.AddCommand(&cobra.Command{Use: "open", Short: "Open mapping file in $EDITOR", RunE: func(cmd *cobra.Command, args []string) error {
-		if _, err := os.Stat(modelMappingFile()); errors.Is(err, os.ErrNotExist) {
-			if err := saveAllModelMappings(map[string]map[string]map[string]string{}); err != nil {
+		inst, err := loadInstance()
+		if err != nil {
+			return err
+		}
+		if len(inst.ModelMapping) == 0 {
+			inst.ModelMapping = defaultModelMappings()
+			if err := saveInstance(inst); err != nil {
 				return err
 			}
 		}
@@ -1255,7 +1016,7 @@ func toolMappingCmd(tool string) *cobra.Command {
 		if editor == "" {
 			editor = "vi"
 		}
-		c := exec.Command(editor, modelMappingFile())
+		c := exec.Command(editor, configFile())
 		c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
 		return c.Run()
 	}})
@@ -1263,7 +1024,7 @@ func toolMappingCmd(tool string) *cobra.Command {
 }
 
 func printToolMapping(tool string, mapping map[string]string) {
-	fmt.Printf("%s -> upstream mapping (%s):\n", displayToolName(tool), modelMappingFile())
+	fmt.Printf("%s -> upstream mapping (%s):\n", displayToolName(tool), configFile())
 	if len(mapping) == 0 {
 		fmt.Println("  (empty)")
 		return
@@ -1287,10 +1048,10 @@ func displayToolName(tool string) string {
 
 func printLaunchMapping(tool string, mapping map[string]string) {
 	if len(mapping) == 0 {
-		fmt.Fprintf(os.Stderr, "No cfgate-cc model mappings configured for %s (%s)\n", tool, modelMappingFile())
+		fmt.Fprintf(os.Stderr, "No cfgate-cc model mappings configured for %s (%s)\n", tool, configFile())
 		return
 	}
-	fmt.Fprintf(os.Stderr, "cfgate-cc model mapping enabled for %s (%s)\n", tool, modelMappingFile())
+	fmt.Fprintf(os.Stderr, "cfgate-cc model mapping enabled for %s (%s)\n", tool, configFile())
 	keys := make([]string, 0, len(mapping))
 	for k := range mapping {
 		keys = append(keys, k)
@@ -1331,11 +1092,11 @@ func knownModelForProvider(name, model string) (bool, error) {
 		}
 		return false, kerr
 	case "cloudflare":
-		p, err := loadActiveProvider(name)
+		inst, err := loadInstance()
 		if err != nil {
 			return false, err
 		}
-		ids, err := cloudflareModelIDs(p)
+		ids, err := cloudflareModelIDs(inst.Provider)
 		if err != nil {
 			return false, err
 		}
@@ -1369,13 +1130,9 @@ func providerKnownModelIDs(name string, p ProviderConfig) ([]string, error) {
 	}
 }
 
-func loadModelMappings() (map[string]map[string]string, error) {
-	return loadModelMappingsForProvider("opencode-go")
-}
-
-func saveModelMappings(mappings map[string]map[string]string) error {
-	return saveModelMappingsForProvider("opencode-go", mappings)
-}
+// legacy back-compat wrappers loadModelMappings / saveModelMappings
+// were removed when the per-provider file went away. tests and other
+// callers must use loadModelMappings(inst) / saveModelMappings(&inst, m).
 
 func resolveMappedModel(tool, source string, mappings map[string]map[string]string) string {
 	source = strings.TrimSpace(modelID(source))
@@ -1447,33 +1204,41 @@ func modelInputModalities(model string) []string {
 	return append([]string(nil), modalities...)
 }
 
+// supportsSearchTool reports whether a model advertises a built-in web
+// search tool. today only the qwen family does, but the field is part
+// of the codex catalog shape so callers can pick a model on that basis.
+func supportsSearchTool(model string) bool {
+	id := modelID(model)
+	return strings.HasPrefix(id, "qwen")
+}
+
 func launchCmd() *cobra.Command {
 	var model string
 	var yes bool
 	var codexConfigOnly bool
 	cmd := &cobra.Command{Use: "launch", Short: "Launch tools through cfgate-cc"}
 	claude := &cobra.Command{Use: "claude [-- claude args...]", Short: "Launch Claude Code through the configured upstream provider", Args: cobra.ArbitraryArgs, RunE: func(cmd *cobra.Command, args []string) error {
-		cfg, err := loadConfig()
+		inst, err := loadInstance()
 		if err != nil {
 			return err
 		}
-		providerName, err := resolveProvider(cmd)
-		if err != nil {
-			return err
-		}
+		applyEnvOverrides(&inst.Provider)
+		inst.Provider.Name = ensureProviderName(inst.Provider.Name, inst.Provider.UpstreamBaseURL)
 		if resolvedInstanceName == "" {
-			resolvedInstanceName = autoInstanceName(providerName)
+			resolvedInstanceName = autoInstanceName(inst.Provider.Name)
 			fmt.Fprintf(os.Stderr, "cfgate-cc: auto-named instance %q (use --name to pick your own; `cfgate-cc instances` to see all)\n", resolvedInstanceName)
 		}
-		base, err := resolveInstanceBase(cfg)
+		if _, err := allocateInstancePort(&inst); err != nil {
+			return err
+		}
+		if err := saveInstance(inst); err != nil {
+			return err
+		}
+		base, err := resolveInstanceBase(inst)
 		if err != nil {
 			return err
 		}
-		p, err := loadActiveProvider(providerName)
-		if err != nil {
-			return err
-		}
-		serverCmd, err := startLaunchServer(base, providerName)
+		serverCmd, err := startLaunchServer(base, inst.Provider.Name)
 		if err != nil {
 			return err
 		}
@@ -1490,16 +1255,13 @@ func launchCmd() *cobra.Command {
 		}
 		c := exec.Command(bin, claudeArgs...)
 		c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
-		// ponytail: non-empty placeholder when no key is set; claude code's startup check rejects empty tokens ("login required"). the proxy's applyUpstreamAuth signs every upstream request from cfg.UpstreamAPIKey, so the child's value is decorative.
-		authToken := p.UpstreamAPIKey
+		// ponytail: non-empty placeholder when no key is set; claude code's startup check rejects empty tokens ("login required"). the proxy's applyUpstreamAuth signs every upstream request from inst.Provider.UpstreamAPIKey, so the child's value is decorative.
+		authToken := inst.Provider.UpstreamAPIKey
 		if authToken == "" {
 			authToken = "cfgate-cc"
 		}
 		c.Env = append(os.Environ(), "ANTHROPIC_BASE_URL="+base, "ANTHROPIC_AUTH_TOKEN="+authToken)
-		mappings, err := loadModelMappingsForProvider(providerName)
-		if err != nil {
-			return err
-		}
+		mappings := loadModelMappings(inst)
 		if model != "" {
 			c.Env = append(c.Env,
 				"ANTHROPIC_MODEL="+model,
@@ -1546,27 +1308,27 @@ func launchCmd() *cobra.Command {
 	claude.Flags().BoolVar(&yes, "yes", false, "Allow Claude Code to skip permission prompts")
 	claude.Flags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $CFGATE_CC_PROVIDER or the single configured provider")
 	codex := &cobra.Command{Use: "codex [-- codex args...]", Short: "Launch Codex CLI through the configured upstream provider", Args: cobra.ArbitraryArgs, RunE: func(cmd *cobra.Command, args []string) error {
-		cfg, err := loadConfig()
+		inst, err := loadInstance()
 		if err != nil {
 			return err
 		}
-		providerName, err := resolveProvider(cmd)
-		if err != nil {
-			return err
-		}
+		applyEnvOverrides(&inst.Provider)
+		inst.Provider.Name = ensureProviderName(inst.Provider.Name, inst.Provider.UpstreamBaseURL)
 		if resolvedInstanceName == "" {
-			resolvedInstanceName = autoInstanceName(providerName)
+			resolvedInstanceName = autoInstanceName(inst.Provider.Name)
 			fmt.Fprintf(os.Stderr, "cfgate-cc: auto-named instance %q (use --name to pick your own; `cfgate-cc instances` to see all)\n", resolvedInstanceName)
 		}
-		base, err := resolveInstanceBase(cfg)
+		if _, err := allocateInstancePort(&inst); err != nil {
+			return err
+		}
+		if err := saveInstance(inst); err != nil {
+			return err
+		}
+		base, err := resolveInstanceBase(inst)
 		if err != nil {
 			return err
 		}
-		p, err := loadActiveProvider(providerName)
-		if err != nil {
-			return err
-		}
-		if err := ensureCodexConfig(base, p); err != nil {
+		if err := ensureCodexConfig(base, inst); err != nil {
 			return fmt.Errorf("failed to configure codex: %w", err)
 		}
 		if codexConfigOnly {
@@ -1576,7 +1338,7 @@ func launchCmd() *cobra.Command {
 		if err := checkCodexVersion(); err != nil {
 			return err
 		}
-		serverCmd, err := startLaunchServer(base, providerName)
+		serverCmd, err := startLaunchServer(base, inst.Provider.Name)
 		if err != nil {
 			return err
 		}
@@ -1595,9 +1357,8 @@ func launchCmd() *cobra.Command {
 		c := exec.Command(bin, codexArgs...)
 		c.Stdin, c.Stdout, c.Stderr = os.Stdin, os.Stdout, os.Stderr
 		c.Env = append(os.Environ(), "OPENAI_API_KEY=cfgate-cc")
-		if mappings, err := loadModelMappingsForProvider(providerName); err == nil {
-			printLaunchMapping("codex", mappings["codex"])
-		}
+		mappings := loadModelMappings(inst)
+		printLaunchMapping("codex", mappings["codex"])
 		return c.Run()
 	}}
 	codex.Flags().StringVar(&model, "model", "", "Upstream model ID")
@@ -1610,29 +1371,26 @@ func launchCmd() *cobra.Command {
 func serveCmd() *cobra.Command {
 	var background bool
 	cmd := &cobra.Command{Use: "serve", Short: "Start local Anthropic-compatible proxy", RunE: func(cmd *cobra.Command, args []string) error {
-		providerName, err := resolveProvider(cmd)
+		inst, err := loadInstance()
 		if err != nil {
 			return err
 		}
-		cfg, err := loadConfig()
-		if err != nil {
-			return err
-		}
+		applyEnvOverrides(&inst.Provider)
+		inst.Provider.Name = ensureProviderName(inst.Provider.Name, inst.Provider.UpstreamBaseURL)
 		if background {
 			// ensure the instance has a port allocated and persisted to
 			// config.json before spawning the subprocess. the subprocess
-			// reads loadConfig() to learn its bind port, so we have to
+			// reads loadInstance() to learn its bind port, so we have to
 			// commit the port first.
-			if _, err := resolveInstanceBase(cfg); err != nil {
+			if _, err := allocateInstancePort(&inst); err != nil {
 				return err
 			}
-			return startBackground(providerName)
+			if err := saveInstance(inst); err != nil {
+				return err
+			}
+			return startBackground(inst.Provider.Name)
 		}
-		p, err := loadActiveProvider(providerName)
-		if err != nil {
-			return err
-		}
-		return runServer(cfg, p)
+		return runServer(inst)
 	}}
 	cmd.Flags().BoolVarP(&background, "background", "b", false, "Run proxy in the background")
 	cmd.Flags().String("provider", "", "Upstream provider (opencode-go, cloudflare). defaults to $CFGATE_CC_PROVIDER or the single configured provider")
@@ -1641,13 +1399,10 @@ func serveCmd() *cobra.Command {
 
 func stopCmd() *cobra.Command {
 	return &cobra.Command{Use: "stop", Short: "Stop background proxy", RunE: func(cmd *cobra.Command, args []string) error {
+		inst, _ := loadInstance()
 		pid, err := readPID()
 		if err != nil {
-			cfg, cfgErr := loadConfig()
-			if cfgErr != nil {
-				return errors.New("proxy is not running")
-			}
-			pid, err = findListenerPID(cfg.Port)
+			pid, err = findListenerPID(inst.Port)
 			if err != nil {
 				return errors.New("proxy is not running")
 			}
@@ -1657,7 +1412,6 @@ func stopCmd() *cobra.Command {
 			return err
 		}
 		_ = os.Remove(pidFile())
-		_ = os.Remove(activeProviderFile())
 		if err := p.Kill(); err != nil {
 			return err
 		}
@@ -1668,30 +1422,35 @@ func stopCmd() *cobra.Command {
 
 func statusCmd() *cobra.Command {
 	return &cobra.Command{Use: "status", Short: "Show proxy status", Run: func(cmd *cobra.Command, args []string) {
-		cfg, err := loadConfig()
-		if err != nil || !healthy(fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port)) {
+		inst, _ := loadInstance()
+		addr := fmt.Sprintf("http://%s:%d", inst.Host, inst.Port)
+		if !healthy(addr) {
 			fmt.Println("Proxy is not running")
 			return
 		}
 		provider := "(unknown)"
-		if name, err := resolveProvider(cmd); err == nil {
-			provider = name
+		if inst.Provider.Name != "" {
+			provider = inst.Provider.Name
 		}
 		if pid, err := readPID(); err == nil {
-			fmt.Printf("Proxy is running on %s:%d (provider %s, PID %d)\n", cfg.Host, cfg.Port, provider, pid)
+			fmt.Printf("Proxy is running on %s:%d (provider %s, PID %d)\n", inst.Host, inst.Port, provider, pid)
 			return
 		}
-		if pid, err := findListenerPID(cfg.Port); err == nil {
-			fmt.Printf("Proxy is running on %s:%d (provider %s, PID %d, discovered from listener)\n", cfg.Host, cfg.Port, provider, pid)
+		if pid, err := findListenerPID(inst.Port); err == nil {
+			fmt.Printf("Proxy is running on %s:%d (provider %s, PID %d, discovered from listener)\n", inst.Host, inst.Port, provider, pid)
 			return
 		}
-		fmt.Printf("Proxy is running on %s:%d (provider %s, no cfgate-cc PID file)\n", cfg.Host, cfg.Port, provider)
+		fmt.Printf("Proxy is running on %s:%d (provider %s, no cfgate-cc PID file)\n", inst.Host, inst.Port, provider)
 	}}
 }
 
 // instancesCmd lists all named cfgate-cc instances under configDir()/instances/*
 // and prints a table of name, provider, port, pid, and status. empty/no
 // instances dir = "no instances" with a hint to set up one with --name.
+//
+// the provider is read from each instance's config.json (the v2 cutover
+// removed the active-provider file). for pre-v2 instances that haven't
+// been loaded yet, falls back to the old file so the table still renders.
 func instancesCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "instances",
@@ -1715,7 +1474,7 @@ func instancesCmd() *cobra.Command {
 				name := e.Name()
 				instDir := instanceDir(name)
 				port := readInstancePort(instDir)
-				provider := readInstanceActiveProvider(instDir)
+				provider := readInstanceProviderName(instDir)
 				pid := readInstancePID(instDir)
 				status := "stopped"
 				if port > 0 && healthy(fmt.Sprintf("http://%s:%d", defaultHost, port)) {
@@ -1740,60 +1499,35 @@ func instancesCmd() *cobra.Command {
 	}
 }
 
-func readInstancePort(dir string) int {
-	b, err := os.ReadFile(filepath.Join(dir, "port"))
-	if err != nil {
-		return 0
+// readInstanceProviderName returns the active provider name for a
+// per-instance directory. reads from config.json (the v2 shape); falls
+// back to a legacy active-provider file so a pre-migration instance
+// still renders something useful in `cfgate-cc instances`.
+func readInstanceProviderName(dir string) string {
+	b, err := os.ReadFile(filepath.Join(dir, "config.json"))
+	if err == nil {
+		var inst Instance
+		if json.Unmarshal(b, &inst) == nil && inst.Provider.Name != "" {
+			return inst.Provider.Name
+		}
 	}
-	p, err := strconv.Atoi(strings.TrimSpace(string(b)))
-	if err != nil {
-		return 0
+	if legacy := readInstanceActiveProvider(dir); legacy != "" {
+		return legacy
 	}
-	return p
+	return ""
 }
 
-// saveInstancePort writes the chosen port to the instance's `port` file.
-// ponytail: single file is enough; config.json is human-readable and the
-// truth lives here, not there.
-func saveInstancePort(port int) error {
-	if err := os.MkdirAll(instanceDir(resolvedInstanceName), 0755); err != nil {
-		return err
-	}
-	return os.WriteFile(instancePortFile(resolvedInstanceName), []byte(strconv.Itoa(port)+"\n"), 0644)
-}
-
-func readInstanceActiveProvider(dir string) string {
-	b, err := os.ReadFile(filepath.Join(dir, "active-provider"))
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(b))
-}
-
-func readInstancePID(dir string) int {
-	b, err := os.ReadFile(filepath.Join(dir, "cfgate-cc.pid"))
-	if err != nil {
-		return 0
-	}
-	p, err := strconv.Atoi(strings.TrimSpace(string(b)))
-	if err != nil {
-		return 0
-	}
-	return p
-}
-
-func runServer(cfg Config, p ProviderConfig) error {
+func runServer(inst Instance) error {
+	inst.Provider.Name = ensureProviderName(inst.Provider.Name, inst.Provider.UpstreamBaseURL)
 	if err := os.MkdirAll(instanceDir(resolvedInstanceName), 0755); err == nil {
 		_ = os.WriteFile(pidFile(), []byte(fmt.Sprint(os.Getpid())), 0644)
-		_ = os.WriteFile(activeProviderFile(), []byte(p.Name), 0644)
 		defer os.Remove(pidFile())
-		defer os.Remove(activeProviderFile())
 	}
 	// resolve the actual bind port from the instance base. when launched
 	// by `serve -b` (background), the parent already wrote the port to
-	// the `port` file via ensureInstancePort; this read reuses it. when
+	// the `port` file via allocateInstancePort; this read reuses it. when
 	// launched standalone (no parent), this allocates.
-	base, err := resolveInstanceBase(cfg)
+	base, err := resolveInstanceBase(inst)
 	if err != nil {
 		return err
 	}
@@ -1805,12 +1539,24 @@ func runServer(cfg Config, p ProviderConfig) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) { _, _ = w.Write([]byte("ok\n")) })
 	mux.HandleFunc("/v1/messages/count_tokens", countTokens)
-	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) { proxyMessages(w, r, p) })
-	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) { proxyChatCompletions(w, r, p) })
-	mux.HandleFunc("/v1/responses", func(w http.ResponseWriter, r *http.Request) { proxyResponses(w, r, p) })
+	mux.HandleFunc("/v1/messages", func(w http.ResponseWriter, r *http.Request) { proxyMessages(w, r, inst) })
+	mux.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) { proxyChatCompletions(w, r, inst) })
+	mux.HandleFunc("/v1/responses", func(w http.ResponseWriter, r *http.Request) { proxyResponses(w, r, inst) })
 	addr := fmt.Sprintf("%s:%d", bindHost, bindPort)
 	fmt.Printf("cfgate-cc proxy listening on http://%s\n", addr)
 	return http.ListenAndServe(addr, mux)
+}
+
+// ensureProviderName backfills the provider Name from the URL if it's
+// empty. legacy v1 configs that haven't been migrated may have a
+// provider with fields populated but Name blank; the v2 loader sets
+// Name from the file's filename, so this only fires when the filename
+// can't be determined (e.g. constructed in memory).
+func ensureProviderName(name, upstreamURL string) string {
+	if name != "" {
+		return name
+	}
+	return providerForUpstreamURL(upstreamURL)
 }
 
 // parseBaseURL extracts host+port from a http://host:port/ URL. ponytail:
@@ -1829,7 +1575,9 @@ func parseBaseURL(base string) (string, int, error) {
 	return host, port, nil
 }
 
-func proxyMessages(w http.ResponseWriter, r *http.Request, cfg ProviderConfig) {
+func proxyMessages(w http.ResponseWriter, r *http.Request, inst Instance) {
+	cfg := inst.Provider
+	mappings := loadModelMappings(inst)
 	if r.Method != http.MethodPost {
 		dlogHandlerErr("messages", errors.New("method not allowed"), http.StatusMethodNotAllowed)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1850,8 +1598,8 @@ func proxyMessages(w http.ResponseWriter, r *http.Request, cfg ProviderConfig) {
 	dlogIncoming("messages", r, rawBody)
 	if modelUsesAnthropicEndpoint(ar.Model, cfg) {
 		ar.Model = modelID(ar.Model)
-		ensureAnthropicRequestDefaults(&ar, cfg)
-		resp, err := forwardAnthropic(r.Context(), cfg, ar)
+		ensureAnthropicRequestDefaults(&ar, mappings)
+		resp, err := forwardAnthropic(r.Context(), cfg, ar, mappings)
 		if err != nil {
 			dlogHandlerErr("messages", err, http.StatusBadGateway)
 			http.Error(w, err.Error(), http.StatusBadGateway)
@@ -1875,7 +1623,7 @@ func proxyMessages(w http.ResponseWriter, r *http.Request, cfg ProviderConfig) {
 		_, _ = w.Write(bodyBytes)
 		return
 	}
-	or := convertRequest(ar, cfg)
+	or := convertRequest(ar, mappings)
 	if err := validateImageSupport(or); err != nil {
 		dlogHandlerErr("messages", err, http.StatusBadRequest)
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -1921,7 +1669,9 @@ func proxyMessages(w http.ResponseWriter, r *http.Request, cfg ProviderConfig) {
 	dlogClientResp("messages", http.StatusOK)
 }
 
-func proxyChatCompletions(w http.ResponseWriter, r *http.Request, cfg ProviderConfig) {
+func proxyChatCompletions(w http.ResponseWriter, r *http.Request, inst Instance) {
+	cfg := inst.Provider
+	mappings := loadModelMappings(inst)
 	if r.Method != http.MethodPost {
 		dlogHandlerErr("chat", errors.New("method not allowed"), http.StatusMethodNotAllowed)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -1934,7 +1684,7 @@ func proxyChatCompletions(w http.ResponseWriter, r *http.Request, cfg ProviderCo
 		return
 	}
 	dlogIncoming("chat", r, rawBody)
-	body, err := prepareChatBody(rawBody, cfg)
+	body, err := prepareChatBody(rawBody, inst)
 	if err != nil {
 		dlogHandlerErr("chat", err, http.StatusBadRequest)
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -1948,7 +1698,7 @@ func proxyChatCompletions(w http.ResponseWriter, r *http.Request, cfg ProviderCo
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-		resp, err := forwardAnthropic(r.Context(), cfg, chatToAnthropic(or, cfg))
+		resp, err := forwardAnthropic(r.Context(), cfg, chatToAnthropic(or, mappings), mappings)
 		if err != nil {
 			dlogHandlerErr("chat", err, http.StatusBadGateway)
 			http.Error(w, err.Error(), http.StatusBadGateway)
@@ -2011,7 +1761,9 @@ func proxyChatCompletions(w http.ResponseWriter, r *http.Request, cfg ProviderCo
 	_, _ = io.Copy(w, resp.Body)
 }
 
-func proxyResponses(w http.ResponseWriter, r *http.Request, cfg ProviderConfig) {
+func proxyResponses(w http.ResponseWriter, r *http.Request, inst Instance) {
+	cfg := inst.Provider
+	mappings := loadModelMappings(inst)
 	if r.Method != http.MethodPost {
 		dlogHandlerErr("responses", errors.New("method not allowed"), http.StatusMethodNotAllowed)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -2030,7 +1782,7 @@ func proxyResponses(w http.ResponseWriter, r *http.Request, cfg ProviderConfig) 
 		http.Error(w, "invalid request", http.StatusBadRequest)
 		return
 	}
-	or := responsesToChat(rr, cfg)
+	or := responsesToChat(rr, mappings)
 	if err := validateImageSupport(or); err != nil {
 		dlogHandlerErr("responses", err, http.StatusBadRequest)
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -2038,7 +1790,7 @@ func proxyResponses(w http.ResponseWriter, r *http.Request, cfg ProviderConfig) 
 	}
 	if modelUsesAnthropicEndpoint(or.Model, cfg) {
 		or.Model = modelID(or.Model)
-		resp, err := forwardAnthropic(r.Context(), cfg, chatToAnthropic(or, cfg))
+		resp, err := forwardAnthropic(r.Context(), cfg, chatToAnthropic(or, mappings), mappings)
 		if err != nil {
 			dlogHandlerErr("responses", err, http.StatusBadGateway)
 			http.Error(w, err.Error(), http.StatusBadGateway)
@@ -2197,8 +1949,12 @@ func cloudflarePrepareBody(body []byte, cfg ProviderConfig) ([]byte, string) {
 // (@cf/...) models on the cloudflare REST API. third-party models go
 // through the default gateway and don't need the header.
 func applyCloudflareGatewayHeader(req *http.Request, cfg ProviderConfig, wireModel string) {
-	if cfg.Gateway != "" && strings.HasPrefix(wireModel, "@cf/") {
-		req.Header.Set("cf-aig-gateway-id", cfg.Gateway)
+	gateway := ""
+	if cfg.Cloudflare != nil {
+		gateway = cfg.Cloudflare.Gateway
+	}
+	if gateway != "" && strings.HasPrefix(wireModel, "@cf/") {
+		req.Header.Set("cf-aig-gateway-id", gateway)
 	}
 }
 
@@ -2223,8 +1979,8 @@ func applyUpstreamAuthForModel(req *http.Request, cfg ProviderConfig, wireModel 
 	req.Header.Set("Authorization", "")
 }
 
-func forwardAnthropic(ctx context.Context, cfg ProviderConfig, ar AnthropicRequest) (*http.Response, error) {
-	normalizeAnthropicRequestForUpstream(&ar, cfg)
+func forwardAnthropic(ctx context.Context, cfg ProviderConfig, ar AnthropicRequest, mappings map[string]map[string]string) (*http.Response, error) {
+	normalizeAnthropicRequestForUpstream(&ar, cfg, mappings)
 	body, err := json.Marshal(ar)
 	if err != nil {
 		return nil, err
@@ -2239,8 +1995,8 @@ func forwardAnthropic(ctx context.Context, cfg ProviderConfig, ar AnthropicReque
 	return (&http.Client{Timeout: 10 * time.Minute}).Do(req)
 }
 
-func normalizeAnthropicRequestForUpstream(ar *AnthropicRequest, p ProviderConfig) {
-	ensureAnthropicRequestDefaults(ar, p)
+func normalizeAnthropicRequestForUpstream(ar *AnthropicRequest, p ProviderConfig, mappings map[string]map[string]string) {
+	ensureAnthropicRequestDefaults(ar, mappings)
 	// OpenCode Go's Anthropic-compatible endpoint is stricter than Anthropic's
 	// Claude endpoint for some model families (notably qwen3.7-max). Claude Code
 	// can send Anthropic-specific prompt-caching and extended-thinking fields that
@@ -2450,22 +2206,19 @@ func stripCacheControl(v any) any {
 	}
 }
 
-func ensureAnthropicRequestDefaults(ar *AnthropicRequest, p ProviderConfig) {
-	ar.Model = resolveToolModel("claude", ar.Model, p)
+func ensureAnthropicRequestDefaults(ar *AnthropicRequest, mappings map[string]map[string]string) {
+	ar.Model = resolveToolModel("claude", ar.Model, mappings)
 	if ar.MaxTokens == 0 {
 		ar.MaxTokens = 4096
 	}
 }
 
-func resolveToolModel(tool, source string, p ProviderConfig) string {
-	mappings, err := loadModelMappingsForProvider(p.Name)
-	if err != nil {
-		mappings = defaultModelMappings()
-	}
+func resolveToolModel(tool, source string, mappings map[string]map[string]string) string {
 	return resolveMappedModel(tool, source, mappings)
 }
 
-func prepareChatBody(body []byte, p ProviderConfig) ([]byte, error) {
+func prepareChatBody(body []byte, inst Instance) ([]byte, error) {
+	mappings := loadModelMappings(inst)
 	var req map[string]any
 	if json.Unmarshal(body, &req) != nil {
 		return body, nil
@@ -2475,7 +2228,7 @@ func prepareChatBody(body []byte, p ProviderConfig) ([]byte, error) {
 		changed = true
 	}
 	model, _ := req["model"].(string)
-	if mapped := resolveToolModel("codex", model, p); mapped != model {
+	if mapped := resolveToolModel("codex", model, mappings); mapped != model {
 		req["model"] = mapped
 		model = mapped
 		changed = true
@@ -2711,8 +2464,8 @@ func usesMaxCompletionTokens(model string) bool {
 	return false
 }
 
-func convertRequest(ar AnthropicRequest, p ProviderConfig) OAIRequest {
-	model := resolveToolModel("claude", ar.Model, p)
+func convertRequest(ar AnthropicRequest, mappings map[string]map[string]string) OAIRequest {
+	model := resolveToolModel("claude", ar.Model, mappings)
 	out := OAIRequest{Model: model, Stream: ar.Stream, StreamOptions: streamUsageOptions(ar.Stream), Temperature: ar.Temperature, TopP: ar.TopP, ReasoningEffort: downstreamReasoningEffort(ar.Reasoning, ar.Thinking, ar.OutputConfig, ar.ReasoningEffort, ar.Effort, ar.Level, ar.Depth)}
 	if usesMaxCompletionTokens(model) {
 		out.MaxCompletionTokens = ar.MaxTokens
@@ -2733,8 +2486,8 @@ func convertRequest(ar AnthropicRequest, p ProviderConfig) OAIRequest {
 	return out
 }
 
-func responsesToChat(rr ResponsesRequest, p ProviderConfig) OAIRequest {
-	model := resolveToolModel("codex", rr.Model, p)
+func responsesToChat(rr ResponsesRequest, mappings map[string]map[string]string) OAIRequest {
+	model := resolveToolModel("codex", rr.Model, mappings)
 	out := OAIRequest{Model: model, Stream: rr.Stream, StreamOptions: streamUsageOptions(rr.Stream), Temperature: rr.Temperature, TopP: rr.TopP, ReasoningEffort: downstreamReasoningEffort(rr.Reasoning, rr.Thinking, rr.OutputConfig, rr.ReasoningEffort, rr.Effort, rr.Level, rr.Depth)}
 	if usesMaxCompletionTokens(model) {
 		out.MaxCompletionTokens = rr.MaxTokens
@@ -2785,8 +2538,8 @@ func toolParametersOrDefault(raw json.RawMessage) json.RawMessage {
 	return raw
 }
 
-func chatToAnthropic(or OAIRequest, p ProviderConfig) AnthropicRequest {
-	model := resolveToolModel("codex", or.Model, p)
+func chatToAnthropic(or OAIRequest, mappings map[string]map[string]string) AnthropicRequest {
+	model := resolveToolModel("codex", or.Model, mappings)
 	out := AnthropicRequest{Model: model, MaxTokens: or.MaxTokens, Stream: or.Stream, Temperature: or.Temperature, TopP: or.TopP}
 	if out.MaxTokens == 0 {
 		out.MaxTokens = 4096
@@ -4312,17 +4065,17 @@ func shouldRestartForLaunch(activeProvider, requested string) bool {
 }
 
 func readActiveProvider() (string, error) {
-	b, err := os.ReadFile(activeProviderFile())
+	inst, err := loadInstance()
 	if err != nil {
 		return "", err
 	}
-	return strings.TrimSpace(string(b)), nil
+	return inst.Provider.Name, nil
 }
 
-// stopRunningServer kills the process recorded in pidFile and removes
-// both the pid file and the active-provider file. used by
-// startLaunchServer when the running server's provider doesn't match
-// the requested one. a no-op when there's no pid file.
+// stopRunningServer kills the process recorded in pidFile. the v2
+// layout removed the active-provider file (each instance has one
+// provider baked into config.json), so no second file to clean up.
+// a no-op when there's no pid file.
 func stopRunningServer() error {
 	pid, err := readPID()
 	if err != nil {
@@ -4333,7 +4086,6 @@ func stopRunningServer() error {
 		return nil
 	}
 	_ = os.Remove(pidFile())
-	_ = os.Remove(activeProviderFile())
 	if err := p.Kill(); err != nil {
 		return err
 	}
@@ -4348,7 +4100,6 @@ func stopManagedServer(cmd *exec.Cmd) {
 	_ = cmd.Process.Kill()
 	_, _ = cmd.Process.Wait()
 	_ = os.Remove(pidFile())
-	_ = os.Remove(activeProviderFile())
 }
 
 func healthy(base string) bool {
@@ -4410,16 +4161,6 @@ func startServerProcess(detached bool, providerName string) (*exec.Cmd, error) {
 	return cmd, nil
 }
 
-// configDir returns the cfgate-cc config dir. honors CFGATE_CC_CONFIG_DIR
-// override so smoke tests and per-user installs can redirect it without
-// touching $HOME.
-func configDir() string {
-	if d := os.Getenv("CFGATE_CC_CONFIG_DIR"); d != "" {
-		return d
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".config", "cfgate-cc")
-}
 // writeClaudeSettings writes ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN into
 // the project's .claude/settings.json env block. the claude-code supervisor
 // (and thus agent-view background sessions) reads gateway endpoint vars from
@@ -4457,719 +4198,7 @@ func writeClaudeSettings(base, authToken string) error {
 	return os.WriteFile(path, raw, 0644)
 }
 
-func configFile() string       { return instanceConfigFile(resolvedInstanceName) }
-func pidFile() string          { return instancePidFile(resolvedInstanceName) }
-func activeProviderFile() string { return instanceActiveProviderFile(resolvedInstanceName) }
-
-var modelMappingFile = func() string { return instanceModelMappingFile(resolvedInstanceName) }
-
-// resolvedInstanceName is the --name / CFGATE_CC_NAME value for the current
-// command invocation. resolved once at command entry by resolveInstanceName
-// and read by all path helpers so a named instance's state never bleeds
-// into the global config dir. empty = back-compat mode, all state under
-// configDir() directly.
-var resolvedInstanceName string
-
-// instanceDir returns the per-instance state directory. empty name
-// returns configDir() itself so callers can use one ternary: when name
-// is set, state lives at <configDir>/instances/<name>/; when not, state
-// lives at configDir() as today. ponytail: no separate global-vs-instance
-// code paths — the instance dir collapses to configDir() in legacy mode.
-func instanceDir(name string) string {
-	if name == "" {
-		return configDir()
-	}
-	return filepath.Join(configDir(), "instances", name)
-}
-
-func instanceConfigFile(name string) string {
-	return filepath.Join(instanceDir(name), "config.json")
-}
-func instancePidFile(name string) string {
-	return filepath.Join(instanceDir(name), "cfgate-cc.pid")
-}
-func instanceActiveProviderFile(name string) string {
-	return filepath.Join(instanceDir(name), "active-provider")
-}
-func instanceLogFile(name string) string {
-	return filepath.Join(instanceDir(name), "cfgate-cc.log")
-}
-func instancePortFile(name string) string {
-	return filepath.Join(instanceDir(name), "port")
-}
-func instanceModelMappingFile(name string) string {
-	return filepath.Join(instanceDir(name), "model-mapping.json")
-}
-func instanceModelMappingMigratedSentinel(name string) string {
-	return filepath.Join(instanceDir(name), "model-mapping.migrated")
-}
-func instanceProviderConfigFile(name, provider string) string {
-	return filepath.Join(instanceDir(name), provider+".json")
-}
-
-// resolveInstanceBase returns the http base URL for the current instance.
-// in back-compat mode (no --name) the base is built from cfg.Host/cfg.Port
-// exactly as today. with --name, the port is allocated on first call: if
-// the instance config has a port, use it; otherwise scan starting at
-// cfg.Port+1 for a free port, write the chosen port back to the instance
-// config so the spawned subprocess reads the same value, and return the
-// URL. the port is committed BEFORE the subprocess starts so the kernel
-// port-bind is the only thing racing the next instance.
-//
-// ponytail: port scan uses net.Listen("tcp", ":0") — go's stdlib idiom
-// for "ask the kernel for a free port". no new dep. closes the listener
-// immediately so the port is free for the subprocess to bind. if 100
-// consecutive ports are taken, surface that as an error instead of
-// silently grabbing something weird.
-func resolveInstanceBase(cfg Config) (string, error) {
-	if resolvedInstanceName == "" {
-		return fmt.Sprintf("http://%s:%d", cfg.Host, cfg.Port), nil
-	}
-	port, err := ensureInstancePort(cfg)
-	if err != nil {
-		return "", err
-	}
-	return fmt.Sprintf("http://%s:%d", cfg.Host, port), nil
-}
-
-func ensureInstancePort(cfg Config) (int, error) {
-	// ponytail: persisted port lives in `port`, not config.json. if it's
-	// there, trust it — even if the kernel says it's busy (a healthy
-	// server is bound to it, which is exactly the case we want). never
-	// re-scan and overwrite: that loses the original port and points
-	// the next caller at a port with no server on it.
-	if p := readInstancePort(instanceDir(resolvedInstanceName)); p > 0 {
-		return p, nil
-	}
-	// no persisted port (fresh instance): scan from defaultPort+1.
-	// never squat on the legacy base port — that's reserved for
-	// back-compat (no --name) mode.
-	for p := defaultPort + 1; p <= defaultPort+100; p++ {
-		if isPortFree(p) {
-			if err := saveInstancePort(p); err != nil {
-				return 0, err
-			}
-			return p, nil
-		}
-	}
-	return 0, fmt.Errorf("no free port found in %d..%d", defaultPort+1, defaultPort+100)
-}
-
-// isPortFree reports whether the kernel can bind a tcp listener on port.
-// ponytail: bind to 127.0.0.1:<port> specifically — macOS lets [::]:port
-// and 127.0.0.1:port coexist (separate IPv4/IPv6 sockets), so the more
-// obvious ":port" form reports a free port when a v4 loopback listener
-// is already there. cfgate-cc serves on 127.0.0.1, so we test the same
-// address family.
-func isPortFree(port int) bool {
-	if port <= 0 {
-		return false
-	}
-	l, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
-	if err != nil {
-		return false
-	}
-	_ = l.Close()
-	return true
-}
-
-// resolveInstanceName reads --name (or CFGATE_CC_NAME) from the command
-// invocation. precedence: explicit --name flag > CFGATE_CC_NAME env > empty.
-// empty = back-compat, single-tenant mode. checks both Local and
-// Persistent flags because --name is a PersistentFlag on the root, and
-// cobra's cmd.Flags() returns only Local. falls back to env-only when
-// cmd is nil (e.g. inside a subprocess that re-resolves before serving).
-// stored in resolvedInstanceName so path helpers don't need to thread
-// the value through every signature.
-func resolveInstanceName(cmd *cobra.Command) string {
-	if cmd != nil {
-		for _, set := range []*pflag.FlagSet{cmd.Flags(), cmd.PersistentFlags()} {
-			if f := set.Lookup("name"); f != nil {
-				if v := strings.TrimSpace(f.Value.String()); v != "" {
-					resolvedInstanceName = v
-					return v
-				}
-			}
-		}
-	}
-	if v := strings.TrimSpace(os.Getenv("CFGATE_CC_NAME")); v != "" {
-		resolvedInstanceName = v
-		return v
-	}
-	resolvedInstanceName = ""
-	return ""
-}
-
-// autoInstanceName returns a unique-per-launch name like "oc-a3f2" for
-// ad-hoc `launch` invocations that didn't pass --name. ponytail: 2 random
-// bytes (16 bits) is enough for the "two tabs" use case — collision
-// probability is ~1/65k per pair. if you spin up thousands of ad-hoc
-// instances, the math changes; bump the byte count or check for
-// collisions before then.
-func autoInstanceName(provider string) string {
-	var b [2]byte
-	if _, err := rand.Read(b[:]); err != nil {
-		// crypto/rand failing is a broken OS. fall back to a pid-based
-		// suffix so we still get a unique name; never return "".
-		return fmt.Sprintf("%s-x%x", provider, os.Getpid())
-	}
-	return fmt.Sprintf("%s-%s", provider, hex.EncodeToString(b[:]))
-}
-
-// codexProfileFilename picks the per-instance codex profile filename. empty
-// name = the default profile name, shared with single-tenant installs.
-// named instance = "<base>-<name>.config.toml" so two instances can each
-// own a profile in ~/.codex/ without clobbering each other.
-func codexProfileFilename(name string) string {
-	if name == "" {
-		return codexProfileName + ".config.toml"
-	}
-	return codexProfileName + "-" + name + ".config.toml"
-}
-
-// codexProfileNameFor returns the codex profile name (used in --profile
-// and in [profiles.<name>] / [model_providers.<name>] section headings).
-// per-instance: two named cfgate-ccs each get a distinct profile name in
-// the shared ~/.codex/config.toml. empty = the original single-tenant name.
-func codexProfileNameFor(name string) string {
-	if name == "" {
-		return codexProfileName
-	}
-	return codexProfileName + "-" + name
-}
-
-func codexConfigFile() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".codex", "config.toml")
-}
-
-func codexProfileConfigFile() string {
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".codex", codexProfileFilename(resolvedInstanceName))
-}
-
-func codexModelCatalogFile() string {
-	return codexModelCatalogFileFor(resolvedInstanceName)
-}
-
-func codexModelCatalogFileFor(name string) string {
-	home, _ := os.UserHomeDir()
-	if name == "" {
-		return filepath.Join(home, ".codex", "cfgate-cc-models.json")
-	}
-	return filepath.Join(home, ".codex", "cfgate-cc-models-"+name+".json")
-}
-
-func ensureCodexConfig(base string, p ProviderConfig) error {
-	path := codexConfigFile()
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return err
-	}
-	if err := writeCodexModelCatalog(codexModelCatalogFile(), p); err != nil {
-		return err
-	}
-	return writeCodexProfile(path, strings.TrimRight(base, "/")+"/v1/", resolvedInstanceName)
-}
-
-func writeCodexProfile(path, baseURL, instanceName string) error {
-	profilePath := filepath.Join(filepath.Dir(path), codexProfileFilename(instanceName))
-	catalogPath := filepath.Join(filepath.Dir(path), filepath.Base(codexModelCatalogFileFor(instanceName)))
-	profileName := codexProfileNameFor(instanceName)
-	profileText := strings.Join([]string{
-		fmt.Sprintf("openai_base_url = %q", baseURL),
-		`forced_login_method = "api"`,
-		fmt.Sprintf("model_provider = %q", profileName),
-		fmt.Sprintf("model_catalog_json = %q", catalogPath),
-		`model_reasoning_effort = "minimal"`,
-		`model_reasoning_summary = "none"`,
-		"",
-		fmt.Sprintf("[model_providers.%s]", profileName),
-		`name = "Upstream",`,
-		fmt.Sprintf("base_url = %q", baseURL),
-		`wire_api = "responses"`,
-		"",
-	}, "\n")
-	if err := os.WriteFile(profilePath, []byte(profileText), 0644); err != nil {
-		return err
-	}
-	b, err := os.ReadFile(path)
-	text := ""
-	if err == nil {
-		text = string(b)
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	cleaned := stripLegacyCodexProfile(text, instanceName)
-	return os.WriteFile(path, []byte(cleaned), 0644)
-}
-
-func stripLegacyCodexProfile(text, instanceName string) string {
-	target := codexProfileNameFor(instanceName)
-	var out []string
-	inRemovedSection := false
-	currentSection := ""
-	for _, line := range strings.Split(text, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "[") && strings.HasSuffix(trimmed, "]") {
-			currentSection = trimmed
-			inRemovedSection = isLegacyCodexProfileSection(currentSection, target)
-			if inRemovedSection {
-				continue
-			}
-		}
-		if inRemovedSection {
-			continue
-		}
-		if currentSection == "" && strings.HasPrefix(trimmed, "profile") {
-			parts := strings.SplitN(trimmed, "=", 2)
-			if len(parts) == 2 && strings.TrimSpace(parts[0]) == "profile" {
-				val := strings.Trim(strings.TrimSpace(parts[1]), `"'`)
-				if val == target {
-					continue
-				}
-			}
-		}
-		out = append(out, line)
-	}
-	return strings.TrimLeft(strings.Join(out, "\n"), "\n")
-}
-
-func isLegacyCodexProfileSection(section, target string) bool {
-	// strip stale sections for the cfgate-cc profile name in case a user
-	// is upgrading and the prior install wrote the old name into their
-	// ~/.codex/config.toml. for named instances, target is the per-
-	// instance profile name; we only strip sections matching this run's
-	// profile so peer instances' profiles in the same config.toml stay.
-	name := target
-	profiles := fmt.Sprintf("[profiles.%s", name)
-	providers := fmt.Sprintf("[model_providers.%s", name)
-	if section == fmt.Sprintf("[profiles.%s]", name) ||
-		strings.HasPrefix(section, profiles+".") ||
-		section == fmt.Sprintf("[model_providers.%s]", name) ||
-		strings.HasPrefix(section, providers+".") {
-		return true
-	}
-	return false
-}
-
-func writeCodexModelCatalog(path string, p ProviderConfig) error {
-	mappings, err := loadModelMappingsForProvider(p.Name)
-	if err != nil {
-		mappings = defaultModelMappings()
-	}
-	providerIDs, err := providerKnownModelIDs(p.Name, p)
-	if err != nil {
-		return err
-	}
-	models := make([]map[string]any, 0, len(providerIDs)+len(mappings["codex"]))
-	seen := map[string]bool{}
-	addModel := func(id, target, description string, i int) {
-		if seen[id] {
-			return
-		}
-		seen[id] = true
-		meta := modelMetadata(target)
-		displayName := id
-		if id == target {
-			displayName = meta.DisplayName
-		}
-		models = append(models, map[string]any{
-			"slug":                             id,
-			"display_name":                     displayName,
-			"description":                      description,
-			"default_reasoning_level":          meta.DefaultReasoningLevel,
-			"supported_reasoning_levels":       meta.SupportedReasoning,
-			"shell_type":                       "shell_command",
-			"visibility":                       "list",
-			"supported_in_api":                 true,
-			"priority":                         i,
-			"availability_nux":                 nil,
-			"upgrade":                          nil,
-			"base_instructions":                "You are Codex, a coding agent running in a terminal-based coding assistant.",
-			"supports_reasoning_summaries":     meta.ReasoningSummaries,
-			"default_reasoning_summary":        meta.DefaultReasoningSummary,
-			"support_verbosity":                false,
-			"default_verbosity":                nil,
-			"apply_patch_tool_type":            nil,
-			"web_search_tool_type":             "text",
-			"truncation_policy":                map[string]any{"mode": "tokens", "limit": 10000},
-			"supports_parallel_tool_calls":     meta.ParallelToolCalls,
-			"supports_image_detail_original":   meta.SupportsImageOriginal,
-			"context_window":                   meta.ContextWindow,
-			"max_context_window":               meta.MaxContextWindow,
-			"auto_compact_token_limit":         nil,
-			"effective_context_window_percent": 95,
-			"experimental_supported_tools":     []any{},
-			"input_modalities":                 meta.CodexInputModalities,
-			"supports_search_tool":             meta.SupportsSearchTool,
-		})
-	}
-	for i, id := range providerIDs {
-		addModel(id, id, modelMetadata(id).Description, i)
-	}
-	keys := make([]string, 0, len(mappings["codex"]))
-	for source := range mappings["codex"] {
-		keys = append(keys, source)
-	}
-	sort.Strings(keys)
-	for i, source := range keys {
-		target := mappings["codex"][source]
-		knownIDs, _, _ := knownModelIDs()
-		addModel(source, target, "cfgate-cc mapping to "+target, len(knownIDs)+i)
-	}
-	b, err := json.MarshalIndent(map[string]any{"models": models}, "", "  ")
-	if err != nil {
-		return err
-	}
-	return os.WriteFile(path, append(b, '\n'), 0644)
-}
-
-func checkCodexVersion() error {
-	if _, err := exec.LookPath("codex"); err != nil {
-		return fmt.Errorf("codex is not installed, install with: npm install -g @openai/codex")
-	}
-	out, err := exec.Command("codex", "--version").Output()
-	if err != nil {
-		return fmt.Errorf("failed to get codex version: %w", err)
-	}
-	fields := strings.Fields(strings.TrimSpace(string(out)))
-	if len(fields) == 0 {
-		return fmt.Errorf("unexpected codex version output: %s", string(out))
-	}
-	version := fields[len(fields)-1]
-	if compareVersions(version, "0.81.0") < 0 {
-		return fmt.Errorf("codex version %s is too old, minimum required is 0.81.0; update with: npm update -g @openai/codex", version)
-	}
-	return nil
-}
-
-func compareVersions(a, b string) int {
-	ap, bp := versionParts(a), versionParts(b)
-	for i := 0; i < 3; i++ {
-		if ap[i] > bp[i] {
-			return 1
-		}
-		if ap[i] < bp[i] {
-			return -1
-		}
-	}
-	return 0
-}
-
-func versionParts(v string) [3]int {
-	v = strings.TrimPrefix(v, "v")
-	fields := strings.Split(v, ".")
-	var out [3]int
-	for i := 0; i < len(fields) && i < 3; i++ {
-		part := fields[i]
-		for j, r := range part {
-			if r < '0' || r > '9' {
-				part = part[:j]
-				break
-			}
-		}
-		out[i], _ = strconv.Atoi(part)
-	}
-	return out
-}
-
-// loadConfig returns the slimmed local-proxy config. upstream fields moved
-// to per-provider files; see loadActiveProvider.
-func loadConfig() (Config, error) {
-	migrateConfigIfNeeded()
-	migrateCloudflareURLIfNeeded()
-	cfg := Config{
-		Host: defaultHost,
-		Port: defaultPort,
-	}
-	b, err := os.ReadFile(configFile())
-	if err == nil {
-		if bytes.Contains(b, []byte(`"api_key"`)) {
-			fmt.Fprintln(os.Stderr, "cfgate-cc: config.json contains api_key which is no longer used; remove it to silence this warning.")
-		}
-		_ = json.Unmarshal(b, &cfg)
-	}
-	if cfg.Host == "" {
-		cfg.Host = defaultHost
-	}
-	if cfg.Port == 0 {
-		cfg.Port = defaultPort
-	}
-	return cfg, nil
-}
-
-// providerConfigFile returns the path to the per-provider config file.
-// ponytail: filename pattern fixed; do not derive from a user input.
-func providerConfigFile(name string) string {
-	return instanceProviderConfigFile(resolvedInstanceName, name)
-}
-
-func loadProviderConfig(name string) (ProviderConfig, error) {
-	var p ProviderConfig
-	path := providerConfigFile(name)
-	b, err := os.ReadFile(path)
-	if errors.Is(err, os.ErrNotExist) && resolvedInstanceName != "" {
-		// ad-hoc (auto-named) instance: the provider config lives in the
-		// base configDir, not in the per-instance dir. fall back so the
-		// `launch` flow works without requiring `setup --name <name>`.
-		path = filepath.Join(configDir(), name+".json")
-		b, err = os.ReadFile(path)
-	}
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return p, nil
-		}
-		return p, err
-	}
-	if err := json.Unmarshal(b, &p); err != nil {
-		return p, fmt.Errorf("parse %s: %w", path, err)
-	}
-	return p, nil
-}
-
-func saveProviderConfig(name string, p ProviderConfig) error {
-	if !isKnownProvider(name) {
-		return fmt.Errorf("unknown provider %q", name)
-	}
-	if err := os.MkdirAll(instanceDir(resolvedInstanceName), 0755); err != nil {
-		return err
-	}
-	b, _ := json.MarshalIndent(p, "", "  ")
-	if err := os.WriteFile(providerConfigFile(name), append(b, '\n'), 0600); err != nil {
-		return err
-	}
-	fmt.Printf("Saved provider %q to %s\n", name, providerConfigFile(name))
-	return nil
-}
-
-// listConfiguredProviders returns provider names that have a config file
-// present. used by resolveProvider for the "single configured wins" rule.
-func listConfiguredProviders() ([]string, error) {
-	var out []string
-	for _, name := range knownProviders {
-		// ad-hoc instance: the per-instance dir won't have the provider
-		// config; the base configDir does. check both, instance first so
-		// a per-instance config can shadow the base.
-		candidates := []string{providerConfigFile(name)}
-		if resolvedInstanceName != "" {
-			candidates = append(candidates, filepath.Join(configDir(), name+".json"))
-		}
-		found := false
-		for _, p := range candidates {
-			if _, err := os.Stat(p); err == nil {
-				found = true
-				break
-			} else if !errors.Is(err, os.ErrNotExist) {
-				return nil, err
-			}
-		}
-		if found {
-			out = append(out, name)
-		}
-	}
-	return out, nil
-}
-
-// resolveProvider picks a provider name from the four precedence sources:
-// --provider flag > $CFGATE_CC_PROVIDER > single configured provider > error.
-// returns an error when none of the four yield a name.
-func resolveProvider(cmd *cobra.Command) (string, error) {
-	if cmd != nil {
-		if f := cmd.Flags().Lookup("provider"); f != nil {
-			if v := strings.TrimSpace(f.Value.String()); v != "" {
-				if !isKnownProvider(v) {
-					return "", fmt.Errorf("unknown --provider %q (known: %s)", v, strings.Join(knownProviders, ", "))
-				}
-				return v, nil
-			}
-		}
-	}
-	if v := strings.TrimSpace(os.Getenv("CFGATE_CC_PROVIDER")); v != "" {
-		if !isKnownProvider(v) {
-			return "", fmt.Errorf("unknown $CFGATE_CC_PROVIDER %q (known: %s)", v, strings.Join(knownProviders, ", "))
-		}
-		return v, nil
-	}
-	names, err := listConfiguredProviders()
-	if err != nil {
-		return "", err
-	}
-	switch len(names) {
-	case 0:
-		return "", errors.New("no provider configured; run `cfgate-cc setup opencode-go` or `cfgate-cc setup cloudflare`")
-	case 1:
-		return names[0], nil
-	default:
-		return "", fmt.Errorf("multiple providers configured (%s); pass --provider or set $CFGATE_CC_PROVIDER", strings.Join(names, ", "))
-	}
-}
-
-// loadActiveProvider returns the provider config for name, with
-// CFGATE_CC_UPSTREAM_* env vars applied on top so the fish-alias pattern
-// (env-overrides-file) still works for the active provider. sets Name
-// so downstream code (proxy handlers, list dispatch) can identify the
-// provider without re-resolving it.
-func loadActiveProvider(name string) (ProviderConfig, error) {
-	p, err := loadProviderConfig(name)
-	if err != nil {
-		return p, err
-	}
-	p.Name = name
-	if v := os.Getenv("CFGATE_CC_UPSTREAM_BASE_URL"); v != "" {
-		p.UpstreamBaseURL = v
-	}
-	if v := os.Getenv("CFGATE_CC_UPSTREAM_API_KEY"); v != "" {
-		p.UpstreamAPIKey = v
-	}
-	if v := os.Getenv("CFGATE_CC_UPSTREAM_AUTH"); v != "" {
-		p.UpstreamAuth = v
-	}
-	if v := os.Getenv("CFGATE_CC_UPSTREAM_AUTH_HDR"); v != "" {
-		p.UpstreamAuthHdr = v
-	}
-	if raw := os.Getenv("CFGATE_CC_UPSTREAM_EXTRA_HDR"); raw != "" {
-		var hdrs map[string]string
-		if err := json.Unmarshal([]byte(raw), &hdrs); err == nil {
-			p.UpstreamExtraHdr = hdrs
-		}
-	}
-	return p, nil
-}
-
-// migrateConfigIfNeeded is a one-shot upgrade helper. if config.json still
-// carries upstream_* fields from the pre-split era, move them into the
-// matching per-provider file and strip them from config.json. no-op when
-// config.json is already slim or when the target provider file already
-// exists (caller wins; no clobber).
-func migrateConfigIfNeeded() {
-	b, err := os.ReadFile(configFile())
-	if err != nil {
-		return
-	}
-	var raw map[string]json.RawMessage
-	if err := json.Unmarshal(b, &raw); err != nil {
-		return
-	}
-	// any upstream_* field counts as "old config". opencode-go users
-	// sometimes had upstream_api_key set with no upstream_base_url.
-	hasUpstream := false
-	for _, k := range []string{"upstream_base_url", "upstream_api_key", "upstream_auth", "upstream_auth_hdr", "upstream_extra_hdr", "endpoint_overrides"} {
-		if _, ok := raw[k]; ok {
-			hasUpstream = true
-			break
-		}
-	}
-	if !hasUpstream {
-		return
-	}
-	var url string
-	if v, ok := raw["upstream_base_url"]; ok {
-		_ = json.Unmarshal(v, &url)
-	}
-	name := providerForUpstreamURL(url)
-	if _, err := os.Stat(providerConfigFile(name)); err == nil {
-		// target file exists, leave config.json alone. the user has two
-		// configs to reconcile; we'd rather not silently overwrite.
-		return
-	}
-	p := ProviderConfig{}
-	if v, ok := raw["upstream_api_key"]; ok {
-		_ = json.Unmarshal(v, &p.UpstreamAPIKey)
-	}
-	if v, ok := raw["upstream_auth"]; ok {
-		_ = json.Unmarshal(v, &p.UpstreamAuth)
-	}
-	if v, ok := raw["upstream_auth_hdr"]; ok {
-		_ = json.Unmarshal(v, &p.UpstreamAuthHdr)
-	}
-	if v, ok := raw["upstream_extra_hdr"]; ok {
-		_ = json.Unmarshal(v, &p.UpstreamExtraHdr)
-	}
-	if v, ok := raw["endpoint_overrides"]; ok {
-		_ = json.Unmarshal(v, &p.EndpointOverrides)
-	}
-	p.UpstreamBaseURL = url
-	if err := os.MkdirAll(configDir(), 0755); err != nil {
-		fmt.Fprintln(os.Stderr, "config migration: mkdir:", err)
-		return
-	}
-	if err := saveProviderConfig(name, p); err != nil {
-		fmt.Fprintln(os.Stderr, "config migration: save provider:", err)
-		return
-	}
-	delete(raw, "upstream_base_url")
-	delete(raw, "upstream_api_key")
-	delete(raw, "upstream_auth")
-	delete(raw, "upstream_auth_hdr")
-	delete(raw, "upstream_extra_hdr")
-	delete(raw, "endpoint_overrides")
-	out, err := json.MarshalIndent(raw, "", "  ")
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "config migration: marshal config:", err)
-		return
-	}
-	if err := os.WriteFile(configFile(), append(out, '\n'), 0600); err != nil {
-		fmt.Fprintln(os.Stderr, "config migration: write config:", err)
-	}
-}
-
-// providerForUpstreamURL picks the provider name from a URL pattern.
-// cloudflare AI gateway urls are recognised by host prefix; anything else
-// (including empty) maps to opencode-go.
-func providerForUpstreamURL(url string) string {
-	if strings.HasPrefix(url, "https://api.cloudflare.com/client/v4/accounts/") {
-		return "cloudflare"
-	}
-	if strings.HasPrefix(url, "https://gateway.ai.cloudflare.com/v1/") {
-		return "cloudflare"
-	}
-	return "opencode-go"
-}
-
-// migrateCloudflareURLIfNeeded rewrites a cloudflare.json that still
-// points at the deprecated /compat/v1 URL into the new REST API URL,
-// pulling the gateway id out of the path and into ProviderConfig.Gateway
-// (the new shape uses a cf-aig-gateway-id header instead).
-// idempotent: a no-op once the URL is already on the REST API.
-//
-// also back-fills ProviderConfig.Account from the REST URL when the field
-// is missing — required by the /openai native endpoint which doesn't carry
-// the account id in the path.
-func migrateCloudflareURLIfNeeded() {
-	const oldPrefix = "https://gateway.ai.cloudflare.com/v1/"
-	path := providerConfigFile("cloudflare")
-	p, err := loadProviderConfig("cloudflare")
-	if err != nil || (!strings.HasPrefix(p.UpstreamBaseURL, oldPrefix) && !strings.HasPrefix(p.UpstreamBaseURL, cloudflareUpstreamPrefix)) {
-		return
-	}
-	dirty := false
-	if strings.HasPrefix(p.UpstreamBaseURL, oldPrefix) {
-		rest := strings.TrimPrefix(p.UpstreamBaseURL, oldPrefix)
-		parts := strings.SplitN(rest, "/", 3)
-		if len(parts) < 2 || parts[0] == "" || parts[1] == "" {
-			return
-		}
-		p.UpstreamBaseURL = buildCloudflareURL(parts[0])
-		p.Gateway = parts[1]
-		dirty = true
-	}
-	if p.Account == "" && strings.HasPrefix(p.UpstreamBaseURL, cloudflareUpstreamPrefix) {
-		rest := strings.TrimPrefix(p.UpstreamBaseURL, cloudflareUpstreamPrefix)
-		parts := strings.SplitN(rest, "/", 3)
-		if len(parts) > 0 && parts[0] != "" {
-			p.Account = parts[0]
-			dirty = true
-		}
-	}
-	if !dirty {
-		return
-	}
-	b, err := json.MarshalIndent(p, "", "  ")
-	if err != nil {
-		return
-	}
-	_ = os.WriteFile(path, append(b, '\n'), 0600)
-}
+// configDir, instanceDir, instanceConfigFile, instancePidFile,
 
 func readPID() (int, error) {
 	b, err := os.ReadFile(pidFile())
