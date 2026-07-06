@@ -62,9 +62,11 @@ func openAINativeURL(cfg ProviderConfig) string {
 // workers-ai @cf/... models always use the legacy /ai/v1 path (the compat
 // adapter speaks the same chat/completions shape and routes to workers-ai
 // via cf-aig-gateway-id header). other models on a native-enabled config
-// use the /openai provider endpoint.
+// use the /openai provider endpoint. falls back to the compat URL when
+// OpenAINative is on but Account/Gateway are empty so the user gets a
+// working but non-native request rather than a malformed URL.
 func openAIURLForModel(cfg ProviderConfig, model string) string {
-	if cfg.OpenAINative && !strings.HasPrefix(modelID(model), "@cf/") {
+	if cfg.OpenAINative && cfg.Account != "" && cfg.Gateway != "" && !strings.HasPrefix(modelID(model), "@cf/") {
 		return openAINativeURL(cfg)
 	}
 	return openAIURL(cfg)
@@ -1928,15 +1930,12 @@ func applyCloudflareGatewayHeader(req *http.Request, cfg ProviderConfig, wireMod
 // applyUpstreamAuthForModel picks the right auth-header strategy for the
 // given model in flight. opencode-go (or any non-cloudflare provider) keeps
 // the existing bearer/x-api-key behavior. cloudflare splits per model:
-// @cf/... workers-ai uses a bearer token; everything else on a native-
-// enabled config uses a blank Authorization + cf-aig-authorization
-// header so the gateway injects the stored BYOK OpenAI key.
+// @cf/... workers-ai uses a bearer token; non-@cf/ models on a native-
+// enabled config use a blank Authorization + cf-aig-authorization header
+// so the gateway injects the stored BYOK OpenAI key. non-native
+// cloudflare configs (legacy /ai/v1) keep the bearer path.
 func applyUpstreamAuthForModel(req *http.Request, cfg ProviderConfig, wireModel string) {
-	if cfg.Name != "cloudflare" {
-		applyUpstreamAuth(req, cfg)
-		return
-	}
-	if strings.HasPrefix(wireModel, "@cf/") {
+	if cfg.Name != "cloudflare" || strings.HasPrefix(wireModel, "@cf/") || !cfg.OpenAINative {
 		applyUpstreamAuth(req, cfg)
 		return
 	}

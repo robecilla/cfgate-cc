@@ -3108,6 +3108,12 @@ func TestOpenAIURLForModel(t *testing.T) {
 	if got := openAIURLForModel(cfg, "gpt-5.4"); got != cfg.UpstreamBaseURL+"/chat/completions" {
 		t.Errorf("gpt-5 non-native cfg: got %q, want compat URL", got)
 	}
+	// native on but Account/Gateway empty → compat URL, not the malformed
+	// native URL with empty path segments.
+	cfgNativeBroken := ProviderConfig{Name: "cloudflare", UpstreamBaseURL: cfg.UpstreamBaseURL, OpenAINative: true}
+	if got := openAIURLForModel(cfgNativeBroken, "gpt-5.4"); got != cfg.UpstreamBaseURL+"/chat/completions" {
+		t.Errorf("native cfg missing Account/Gateway: got %q, want compat URL fallback", got)
+	}
 }
 
 func TestApplyUpstreamAuthForModel(t *testing.T) {
@@ -3133,14 +3139,25 @@ func TestApplyUpstreamAuthForModel(t *testing.T) {
 		t.Fatalf("cloudflare workers-ai should not set cf-aig-authorization, got %q", got)
 	}
 
-	// cloudflare gpt-5: blank Authorization, cf-aig-authorization set.
+	// cloudflare gpt-5, native on: blank Authorization, cf-aig-authorization set.
+	cfNative := ProviderConfig{Name: "cloudflare", UpstreamAPIKey: "cf-key", UpstreamAuth: "bearer", OpenAINative: true}
 	req, _ = http.NewRequest(http.MethodPost, "http://example", nil)
-	applyUpstreamAuthForModel(req, cf, "gpt-5.4")
+	applyUpstreamAuthForModel(req, cfNative, "gpt-5.4")
 	if got := req.Header.Get("Authorization"); got != "" {
-		t.Fatalf("cloudflare gpt-5 Authorization = %q, want empty (BYOK bypass guard)", got)
+		t.Fatalf("cloudflare gpt-5 native Authorization = %q, want empty (BYOK bypass guard)", got)
 	}
 	if got := req.Header.Get("cf-aig-authorization"); got != "Bearer cf-key" {
-		t.Fatalf("cloudflare gpt-5 cf-aig-authorization = %q, want Bearer cf-key", got)
+		t.Fatalf("cloudflare gpt-5 native cf-aig-authorization = %q, want Bearer cf-key", got)
+	}
+
+	// cloudflare gpt-5, native off: bearer (legacy /ai/v1 path needs a real token).
+	req, _ = http.NewRequest(http.MethodPost, "http://example", nil)
+	applyUpstreamAuthForModel(req, cf, "gpt-5.4")
+	if got := req.Header.Get("Authorization"); got != "Bearer cf-key" {
+		t.Fatalf("cloudflare gpt-5 non-native Authorization = %q, want Bearer cf-key", got)
+	}
+	if got := req.Header.Get("cf-aig-authorization"); got != "" {
+		t.Fatalf("cloudflare gpt-5 non-native should not set cf-aig-authorization, got %q", got)
 	}
 }
 
