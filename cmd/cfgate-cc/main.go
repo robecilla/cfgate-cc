@@ -3669,6 +3669,7 @@ func streamAnthropic(w http.ResponseWriter, body io.Reader, model string) {
 	var reasoning strings.Builder
 	usage := tokenUsage{}
 	s := bufio.NewScanner(body)
+	s.Buffer(make([]byte, 0, 1<<20), 32<<20)
 	for s.Scan() {
 		line := strings.TrimSpace(s.Text())
 		if !strings.HasPrefix(line, "data:") {
@@ -4030,7 +4031,12 @@ func streamResponsesFromAnthropic(w http.ResponseWriter, body io.Reader, model s
 }
 
 func readSSE(body io.Reader, handle func(event string, data []byte) bool) {
+	// ponytail: default scanner caps tokens at 64KB; cloudflare's responses SSE
+	// inlines the full instructions field on response.created/in_progress, which
+	// blows past that for any non-trivial system prompt and silently drops the
+	// rest of the stream. 32MB is way more than any realistic event.
 	s := bufio.NewScanner(body)
+	s.Buffer(make([]byte, 0, 1<<20), 32<<20)
 	var event string
 	var data []string
 	flush := func() bool {
@@ -4082,6 +4088,7 @@ func streamResponses(w http.ResponseWriter, body io.Reader, model string) {
 	toolIndexes := map[int]int{}
 	var tools []streamedResponseToolCall
 	s := bufio.NewScanner(body)
+	s.Buffer(make([]byte, 0, 1<<20), 32<<20)
 	for s.Scan() {
 		line := strings.TrimSpace(s.Text())
 		if !strings.HasPrefix(line, "data:") {
