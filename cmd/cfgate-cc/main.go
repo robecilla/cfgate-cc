@@ -50,26 +50,71 @@ func openAIURL(cfg ProviderConfig) string {
 	return "https://opencode.ai/zen/go/v1/chat/completions"
 }
 
-// openAINativeURL builds the Cloudflare AI Gateway native /openai provider
-// URL — a transparent pass-through to OpenAI (the /ai/v1 compat adapter
-// sends max_tokens which gpt-5.x rejects). only valid when cfg.OpenAINative
-// is set and cfg.Account + cfg.Gateway are populated.
-func openAINativeURL(cfg ProviderConfig) string {
-	return fmt.Sprintf("https://gateway.ai.cloudflare.com/v1/%s/%s/openai/chat/completions", cfg.Account, cfg.Gateway)
+// openAINativeChatURLBuilder builds the Cloudflare AI Gateway native /openai
+// provider chat-completions URL — a transparent pass-through to OpenAI (the
+// /ai/v1 compat adapter sends max_tokens which gpt-5.x rejects). only valid
+// when cfg.OpenAINative is set and cfg.Account + cfg.Gateway are populated.
+// ponytail: package var so tests can swap in a localhost httptest upstream
+// while keeping the path scheme (openai/chat/completions) the proxy decides.
+var openAINativeChatURLBuilder = func(cfg ProviderConfig) string {
+	return defaultOpenAINativeURL(cfg, "openai/chat/completions")
+}
+
+// openAINativeResponsesURLBuilder builds the Cloudflare AI Gateway native
+// /openai provider responses URL. gpt-5.x on /openai/chat/completions
+// rejects (tools ∧ reasoning_effort) — openai wants /v1/responses for
+// that combo. the cloudflare /openai provider is a pass-through to the
+// same openai endpoint, so we just hit a different subpath. only valid
+// when cfg.OpenAINative is set and cfg.Account + cfg.Gateway are populated.
+// ponytail: package var for the same reason as openAINativeChatURLBuilder.
+var openAINativeResponsesURLBuilder = func(cfg ProviderConfig) string {
+	return defaultOpenAINativeURL(cfg, "openai/responses")
+}
+
+func openAINativeChatURL(cfg ProviderConfig) string {
+	return openAINativeChatURLBuilder(cfg)
+}
+
+func openAINativeResponsesURL(cfg ProviderConfig) string {
+	return openAINativeResponsesURLBuilder(cfg)
+}
+
+// defaultOpenAINativeURL is the production URL builder for the openai-
+// native path. uses Account+Gateway against the hardcoded cloudflare
+// gateway host. tests override openAINativeChatURLBuilder /
+// openAINativeResponsesURLBuilder to point at an httptest upstream.
+func defaultOpenAINativeURL(cfg ProviderConfig, subpath string) string {
+	return fmt.Sprintf("https://gateway.ai.cloudflare.com/v1/%s/%s/%s", cfg.Account, cfg.Gateway, subpath)
 }
 
 // openAIURLForModel picks the right upstream URL for a model in flight.
 // workers-ai @cf/... models always use the legacy /ai/v1 path (the compat
 // adapter speaks the same chat/completions shape and routes to workers-ai
-// via cf-aig-gateway-id header). other models on a native-enabled config
-// use the /openai provider endpoint. falls back to the compat URL when
-// OpenAINative is on but Account/Gateway are empty so the user gets a
-// working but non-native request rather than a malformed URL.
+// via cf-aig-gateway-id header). gpt-5.x on a native-enabled config uses
+// the /openai/responses endpoint — openai's /v1/chat/completions rejects
+// (tools ∧ reasoning_effort) for gpt-5.4-mini and asks for /v1/responses
+// instead. falls back to the compat URL when OpenAINative is on but
+// Account/Gateway are empty so the user gets a working but non-native
+// request rather than a malformed URL.
 func openAIURLForModel(cfg ProviderConfig, model string) string {
-	if cfg.OpenAINative && cfg.Account != "" && cfg.Gateway != "" && !strings.HasPrefix(modelID(model), "@cf/") {
-		return openAINativeURL(cfg)
+	if cfg.OpenAINative && cfg.Account != "" && cfg.Gateway != "" {
+		id := modelID(model)
+		if strings.HasPrefix(id, "@cf/") {
+			return openAIURL(cfg)
+		}
+		if isGpt5Family(id) {
+			return openAINativeResponsesURL(cfg)
+		}
 	}
 	return openAIURL(cfg)
+}
+
+// isGpt5Family reports whether the model id is part of openai's gpt-5.x
+// line. used to pick /v1/responses over /v1/chat/completions on the
+// cloudflare native path — see openAIURLForModel.
+func isGpt5Family(model string) bool {
+	id := modelID(model)
+	return id == "gpt-5" || strings.HasPrefix(id, "gpt-5.")
 }
 
 // anthropicURL is the upstream anthropic-compatible /messages URL, used
@@ -79,6 +124,431 @@ func anthropicURL(cfg ProviderConfig) string {
 		return strings.TrimRight(cfg.UpstreamBaseURL, "/") + "/messages"
 	}
 	return "https://opencode.ai/zen/go/v1/messages"
+}
+
+// isResponsesUpstreamURL reports whether the upstream URL is the openai
+// /v1/responses shape (used to decide whether proxyDo needs to translate
+// OAIRequest <-> ResponsesRequest wire format on the openai-native path).
+// ponytail: string check rather than a per-call flag — the URL is the
+// only signal the scaffold has after openAIURLForModel returns.
+func isResponsesUpstreamURL(u string) bool {
+	return strings.HasSuffix(u, "/openai/responses") || strings.HasSuffix(u, "/v1/responses")
+}
+
+// oaiBodyToResponsesBody converts a /v1/chat/completions wire body into a
+// /v1/responses wire body. used when forwarding to /v1/responses on the
+// cloudflare native path. returns the input unchanged on parse failure so
+// the upstream surfaces a clear 400 rather than the proxy swallowing it.
+func oaiBodyToResponsesBody(oaiBody []byte) []byte {
+	var or OAIRequest
+	if err := json.Unmarshal(oaiBody, &or); err != nil {
+		return oaiBody
+	}
+	rr := oaiToResponses(or)
+	out, err := json.Marshal(rr)
+	if err != nil {
+		return oaiBody
+	}
+	return out
+}
+
+// oaiToResponses projects an OAIRequest onto the ResponsesRequest shape.
+// the cloudflare /openai provider is a pass-through to openai, so the wire
+// format must match what openai's /v1/responses expects — not what we'd
+// have built if the same body were going to /v1/chat/completions.
+func oaiToResponses(or OAIRequest) ResponsesRequest {
+	maxTokens := or.MaxCompletionTokens
+	if maxTokens == 0 {
+		maxTokens = or.MaxTokens
+	}
+	rr := ResponsesRequest{
+		Model:       or.Model,
+		Stream:      or.Stream,
+		MaxTokens:   maxTokens,
+		Temperature: or.Temperature,
+		TopP:        or.TopP,
+	}
+	if or.ReasoningEffort != "" {
+		rr.Reasoning = marshalJSON(map[string]any{"effort": or.ReasoningEffort})
+	}
+	rr.Input = marshalJSON(messagesToResponsesInput(or.Messages))
+	for _, t := range or.Tools {
+		rr.Tools = append(rr.Tools, ResponseTool{
+			Type:        t.Type,
+			Name:        t.Function.Name,
+			Description: t.Function.Description,
+			Parameters:  t.Function.Parameters,
+		})
+	}
+	return rr
+}
+
+// messagesToResponsesInput converts a chat-completions messages array into
+// a /v1/responses input array. system/developer → message(role=system),
+// user → message(role=user), assistant → message(role=assistant) plus
+// function_call items for each tool call, tool → function_call_output.
+func messagesToResponsesInput(messages []OAIMessage) []map[string]any {
+	out := make([]map[string]any, 0, len(messages))
+	for _, m := range messages {
+		switch m.Role {
+		case "system", "developer":
+			out = append(out, map[string]any{
+				"type":    "message",
+				"role":    "system",
+				"content": []map[string]any{{"type": "input_text", "text": openAIContentText(m.Content)}},
+			})
+		case "user":
+			out = append(out, map[string]any{
+				"type":    "message",
+				"role":    "user",
+				"content": responsesInputContentParts(m.Content),
+			})
+		case "assistant":
+			if text := openAIContentText(m.Content); text != "" {
+				out = append(out, map[string]any{
+					"type":    "message",
+					"role":    "assistant",
+					"content": []map[string]any{{"type": "output_text", "text": text}},
+				})
+			}
+			for _, call := range m.ToolCalls {
+				out = append(out, map[string]any{
+					"type":      "function_call",
+					"call_id":   call.ID,
+					"name":      call.Function.Name,
+					"arguments": call.Function.Arguments,
+				})
+			}
+		case "tool":
+			out = append(out, map[string]any{
+				"type":    "function_call_output",
+				"call_id": m.ToolCallID,
+				"output":  openAIContentText(m.Content),
+			})
+		}
+	}
+	return out
+}
+
+// responsesInputContentParts maps an OAI message content into the
+// /v1/responses part-list shape. text parts → input_text, image parts →
+// input_image. preserves order so multi-part messages round-trip.
+func responsesInputContentParts(content any) []map[string]any {
+	switch v := content.(type) {
+	case nil:
+		return nil
+	case string:
+		return []map[string]any{{"type": "input_text", "text": v}}
+	case []OAIContentPart:
+		out := make([]map[string]any, 0, len(v))
+		for _, p := range v {
+			switch p.Type {
+			case "text":
+				out = append(out, map[string]any{"type": "input_text", "text": p.Text})
+			case "image_url":
+				if p.ImageURL != nil && p.ImageURL.URL != "" {
+					out = append(out, map[string]any{"type": "input_image", "image_url": p.ImageURL.URL})
+				}
+			}
+		}
+		return out
+	case []any:
+		out := make([]map[string]any, 0, len(v))
+		for _, item := range v {
+			m, ok := item.(map[string]any)
+			if !ok {
+				continue
+			}
+			typ, _ := m["type"].(string)
+			switch typ {
+			case "text", "input_text":
+				if text, _ := m["text"].(string); text != "" {
+					out = append(out, map[string]any{"type": "input_text", "text": text})
+				}
+			case "image_url", "input_image":
+				if u := imageURLFromAny(m["image_url"], m["url"]); u != nil {
+					out = append(out, map[string]any{"type": "input_image", "image_url": u.URL})
+				}
+			}
+		}
+		return out
+	}
+	return []map[string]any{{"type": "input_text", "text": fmt.Sprint(content)}}
+}
+
+// responsesBodyToOAIChat re-emits a /v1/responses non-streaming body as a
+// /v1/chat/completions body. the existing anthropic shapers consume
+// chat-completions shape, so this lets the openai-native gpt-5.x path feed
+// them without forking the response-rendering code.
+func responsesBodyToOAIChat(body []byte, model string) ([]byte, error) {
+	var v struct {
+		ID     string `json:"id"`
+		Output []struct {
+			Type    string `json:"type"`
+			Content []struct {
+				Type string `json:"type"`
+				Text string `json:"text"`
+			} `json:"content"`
+			CallID    string `json:"call_id"`
+			Name      string `json:"name"`
+			Arguments string `json:"arguments"`
+		} `json:"output"`
+		Usage struct {
+			InputTokens  int `json:"input_tokens"`
+			OutputTokens int `json:"output_tokens"`
+			TotalTokens  int `json:"total_tokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &v); err != nil {
+		return body, nil
+	}
+	var text string
+	var toolCalls []OAIToolCall
+	for _, item := range v.Output {
+		switch item.Type {
+		case "message":
+			for _, p := range item.Content {
+				if p.Type == "output_text" {
+					text += p.Text
+				}
+			}
+		case "function_call":
+			toolCalls = append(toolCalls, OAIToolCall{
+				ID:   item.CallID,
+				Type: "function",
+				Function: OAICallFunction{
+					Name:      item.Name,
+					Arguments: item.Arguments,
+				},
+			})
+		}
+	}
+	msg := map[string]any{"role": "assistant", "content": text}
+	finishReason := "stop"
+	if len(toolCalls) > 0 {
+		msg["tool_calls"] = toolCalls
+		finishReason = "tool_calls"
+	}
+	usage := map[string]any{
+		"prompt_tokens":     v.Usage.InputTokens,
+		"completion_tokens": v.Usage.OutputTokens,
+		"total_tokens":      v.Usage.TotalTokens,
+	}
+	return json.Marshal(map[string]any{
+		"id":      v.ID,
+		"object":  "chat.completion",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []map[string]any{{
+			"index":         0,
+			"message":       msg,
+			"finish_reason": finishReason,
+		}},
+		"usage": usage,
+	})
+}
+
+// responsesStreamTranslator wraps a /v1/responses SSE stream so it reads
+// like a /v1/chat-completions SSE stream. the /v1/responses wire uses
+// typed event blocks (event: <type> / data: <payload> / blank line) that
+// have no chat-completions equivalent — the translator drops the events
+// the chat-completions shaper doesn't need (response.created, item
+// bookend events) and re-emits the delta events as chat-completion
+// chunks. ponytail: per-event-block rewriter, no fanout — the shaper
+// sees a single linear SSE stream it already knows how to consume.
+type responsesStreamTranslator struct {
+	src       *bufio.Scanner
+	pending   string
+	toolIndex int
+	finished  bool
+}
+
+func newResponsesStreamTranslator(src io.Reader) *responsesStreamTranslator {
+	s := bufio.NewScanner(src)
+	s.Buffer(make([]byte, 0, 1<<20), 32<<20)
+	return &responsesStreamTranslator{src: s}
+}
+
+func (t *responsesStreamTranslator) Read(p []byte) (int, error) {
+	for t.pending == "" {
+		out, more, err := t.readBlock()
+		if err != nil {
+			return 0, err
+		}
+		if !more {
+			return 0, io.EOF
+		}
+		t.pending = out
+	}
+	n := copy(p, t.pending)
+	t.pending = t.pending[n:]
+	return n, nil
+}
+
+// readBlock consumes lines until the next blank-line event terminator
+// and returns the translator's output for that event block (or "" to
+// drop it). more=false on EOF.
+func (t *responsesStreamTranslator) readBlock() (string, bool, error) {
+	var eventType, dataPayload string
+	sawEvent := false
+	for t.src.Scan() {
+		line := strings.TrimRight(t.src.Text(), "\r")
+		if line == "" {
+			if !sawEvent && dataPayload == "" {
+				continue
+			}
+			return t.translateEvent(eventType, dataPayload), true, nil
+		}
+		switch {
+		case strings.HasPrefix(line, "event:"):
+			eventType = strings.TrimSpace(strings.TrimPrefix(line, "event:"))
+			sawEvent = true
+		case strings.HasPrefix(line, "data:"):
+			dataPayload = strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		}
+	}
+	if err := t.src.Err(); err != nil {
+		return "", false, err
+	}
+	if eventType != "" || dataPayload != "" {
+		return t.translateEvent(eventType, dataPayload), true, nil
+	}
+	return "", false, nil
+}
+
+// translateEvent returns the chat-completions SSE text for one
+// /v1/responses event block, or "" to drop the event entirely.
+func (t *responsesStreamTranslator) translateEvent(eventType, payload string) string {
+	if payload == "" {
+		return ""
+	}
+	var v map[string]any
+	if err := json.Unmarshal([]byte(payload), &v); err != nil {
+		// unknown / malformed — pass through verbatim so the shaper at
+		// least sees something rather than a silent drop.
+		return "data: " + payload + "\n\n"
+	}
+	typ, _ := v["type"].(string)
+	if typ == "" {
+		typ = eventType
+	}
+	switch typ {
+	case "response.created":
+		// openai emits this without a delta; the chat-completions shaper
+		// opens with its own role=assistant chunk. drop.
+		return ""
+	case "response.output_item.added":
+		// tool-call introduction. the first function_call_arguments.delta
+		// doesn't carry the name, so we use this event to inject the
+		// id+name into the chat-completions tool_calls index before any
+		// arguments arrive.
+		item, _ := v["item"].(map[string]any)
+		if item == nil {
+			return ""
+		}
+		if itemType, _ := item["type"].(string); itemType != "function_call" {
+			return ""
+		}
+		idx, _ := v["output_index"].(float64)
+		tci := int(idx)
+		if tci < 0 {
+			tci = t.toolIndex
+		}
+		if tci >= t.toolIndex {
+			t.toolIndex = tci + 1
+		}
+		itemID, _ := item["id"].(string)
+		callID, _ := item["call_id"].(string)
+		if callID == "" {
+			callID = itemID
+		}
+		if callID == "" {
+			callID = fmt.Sprintf("call_%d", tci)
+		}
+		name, _ := item["name"].(string)
+		return chatChunkJSON(map[string]any{
+			"tool_calls": []map[string]any{{
+				"index":    tci,
+				"id":       callID,
+				"type":     "function",
+				"function": map[string]any{"name": name, "arguments": ""},
+			}},
+		})
+	case "response.output_text.delta":
+		delta, _ := v["delta"].(string)
+		if delta == "" {
+			return ""
+		}
+		return chatChunkJSON(map[string]any{"content": delta})
+	case "response.function_call_arguments.delta":
+		delta, _ := v["delta"].(string)
+		if delta == "" {
+			return ""
+		}
+		idx, _ := v["output_index"].(float64)
+		tci := int(idx)
+		if tci < 0 {
+			tci = t.toolIndex
+		}
+		if tci >= t.toolIndex {
+			t.toolIndex = tci + 1
+		}
+		return chatChunkJSON(map[string]any{
+			"tool_calls": []map[string]any{{
+				"index":    tci,
+				"function": map[string]any{"arguments": delta},
+			}},
+		})
+	case "response.completed":
+		if t.finished {
+			return ""
+		}
+		t.finished = true
+		finish := "stop"
+		if t.toolIndex > 0 {
+			finish = "tool_calls"
+		}
+		lines := []string{chatChunkJSON(map[string]any{"finish_reason": finish})}
+		if response, ok := v["response"].(map[string]any); ok {
+			if u, ok := response["usage"].(map[string]any); ok {
+				lines = append(lines, chatUsageChunkJSON(map[string]any{
+					"prompt_tokens":     u["input_tokens"],
+					"completion_tokens": u["output_tokens"],
+					"total_tokens":      u["total_tokens"],
+				}))
+			}
+		}
+		lines = append(lines, "data: [DONE]\n\n")
+		return strings.Join(lines, "")
+	}
+	// unknown / pass-through event (e.g. response.in_progress,
+	// response.output_item.done, response.content_part.added, …). drop
+	// — the chat-completions shaper doesn't use them and emitting them
+	// would leak the wire format the client can't parse.
+	return ""
+}
+
+func chatChunkJSON(delta map[string]any) string {
+	b, _ := json.Marshal(map[string]any{
+		"id":      "chatcmpl_cfgate",
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   "cfgate-cc",
+		"choices": []map[string]any{{"index": 0, "delta": delta}},
+	})
+	return "data: " + string(b) + "\n\n"
+}
+
+func chatUsageChunkJSON(usage map[string]any) string {
+	b, _ := json.Marshal(map[string]any{
+		"id":      "chatcmpl_cfgate",
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   "cfgate-cc",
+		"choices": []any{},
+		"usage":   usage,
+	})
+	return "data: " + string(b) + "\n\n"
 }
 
 const (
@@ -281,17 +751,17 @@ type ATool struct {
 }
 
 type OAIRequest struct {
-	Model              string            `json:"model"`
-	Messages           []OAIMessage      `json:"messages"`
-	Stream             bool              `json:"stream,omitempty"`
-	StreamOptions      *OAIStreamOptions `json:"stream_options,omitempty"`
-	MaxTokens          int               `json:"max_tokens,omitempty"`
-	MaxCompletionTokens int              `json:"max_completion_tokens,omitempty"`
-	Temperature        *float64          `json:"temperature,omitempty"`
-	TopP               *float64          `json:"top_p,omitempty"`
-	Tools              []OAITool         `json:"tools,omitempty"`
-	ReasoningEffort    string            `json:"reasoning_effort,omitempty"`
-	AnthropicTools     []ATool           `json:"-"`
+	Model               string            `json:"model"`
+	Messages            []OAIMessage      `json:"messages"`
+	Stream              bool              `json:"stream,omitempty"`
+	StreamOptions       *OAIStreamOptions `json:"stream_options,omitempty"`
+	MaxTokens           int               `json:"max_tokens,omitempty"`
+	MaxCompletionTokens int               `json:"max_completion_tokens,omitempty"`
+	Temperature         *float64          `json:"temperature,omitempty"`
+	TopP                *float64          `json:"top_p,omitempty"`
+	Tools               []OAITool         `json:"tools,omitempty"`
+	ReasoningEffort     string            `json:"reasoning_effort,omitempty"`
+	AnthropicTools      []ATool           `json:"-"`
 }
 
 type OAIStreamOptions struct {
@@ -1833,6 +2303,13 @@ func parseBaseURL(base string) (string, int, error) {
 
 func copyHeaders(dst, src http.Header) {
 	for k, vals := range src {
+		// ponytail: drop Content-Length — we may rewrite the body (e.g.
+		// responses→chat on the gpt-5.x native path), and a stale
+		// content-length truncates the response. chunked transfer
+		// re-encodes whatever we actually write.
+		if strings.EqualFold(k, "Content-Length") {
+			continue
+		}
 		for _, v := range vals {
 			dst.Add(k, v)
 		}
@@ -2016,8 +2493,8 @@ func anthropicThinkingForRequest(ar *AnthropicRequest, p ProviderConfig) json.Ra
 	// struct not map: json.Marshal on map[string]any sorts keys alphabetically,
 	// which would reorder the upstream's expected {type, budget_tokens} shape.
 	out, err := json.Marshal(struct {
-		Type        string `json:"type"`
-		BudgetTokens int   `json:"budget_tokens"`
+		Type         string `json:"type"`
+		BudgetTokens int    `json:"budget_tokens"`
 	}{Type: "enabled", BudgetTokens: budget})
 	if err != nil {
 		return nil
@@ -2426,11 +2903,7 @@ func stripRawChatImageDetails(req map[string]any) bool {
 // max_completion_tokens field instead of max_tokens. applies to gpt-5.x
 // (any new-style openai model that dropped the older field).
 func usesMaxCompletionTokens(model string) bool {
-	id := modelID(model)
-	if id == "gpt-5" || strings.HasPrefix(id, "gpt-5.") {
-		return true
-	}
-	return false
+	return isGpt5Family(model)
 }
 
 func convertRequest(ar AnthropicRequest, p ProviderConfig) OAIRequest {
@@ -4149,6 +4622,7 @@ func configDir() string {
 	home, _ := os.UserHomeDir()
 	return filepath.Join(home, ".config", "cfgate-cc")
 }
+
 // writeClaudeSettings writes ANTHROPIC_BASE_URL and ANTHROPIC_AUTH_TOKEN into
 // the project's .claude/settings.json env block. the claude-code supervisor
 // (and thus agent-view background sessions) reads gateway endpoint vars from
@@ -4186,8 +4660,8 @@ func writeClaudeSettings(base, authToken string) error {
 	return os.WriteFile(path, raw, 0644)
 }
 
-func configFile() string       { return instanceConfigFile(resolvedInstanceName) }
-func pidFile() string          { return instancePidFile(resolvedInstanceName) }
+func configFile() string         { return instanceConfigFile(resolvedInstanceName) }
+func pidFile() string            { return instancePidFile(resolvedInstanceName) }
 func activeProviderFile() string { return instanceActiveProviderFile(resolvedInstanceName) }
 
 var modelMappingFile = func() string { return instanceModelMappingFile(resolvedInstanceName) }
