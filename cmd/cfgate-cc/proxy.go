@@ -227,13 +227,17 @@ func proxyDo(w http.ResponseWriter, r *http.Request, cfg ProviderConfig, ep Endp
 		return
 	}
 
-	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, openAIURL(cfg), bytes.NewReader(upstream))
+	upstreamURL := openAIURLForModel(cfg, model)
+	if isResponsesUpstreamURL(upstreamURL) {
+		upstream = oaiBodyToResponsesBody(upstream)
+	}
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodPost, upstreamURL, bytes.NewReader(upstream))
 	if err != nil {
 		dlogHandlerErr(ep.Label, err, http.StatusInternalServerError)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	applyUpstreamAuth(req, cfg)
+	applyUpstreamAuthForModel(req, cfg, wireModel)
 	applyCloudflareGatewayHeader(req, cfg, wireModel)
 	req.Header.Set("Content-Type", "application/json")
 	dlogUpstreamReq(req, upstream)
@@ -245,6 +249,11 @@ func proxyDo(w http.ResponseWriter, r *http.Request, cfg ProviderConfig, ep Endp
 	}
 	defer resp.Body.Close()
 	dlogUpstreamResp(resp)
+	// ponytail: on the 4xx path we copy the upstream body verbatim. an
+	// openai /v1/responses 400 has the same JSON error shape as
+	// /v1/chat/completions, so no translation is needed there. skip the
+	// responses→chat pass on errors and pass the bytes through.
+	responsesUpstream := isResponsesUpstreamURL(upstreamURL)
 	if resp.StatusCode >= 400 {
 		bodyBytes, _ := io.ReadAll(resp.Body)
 		dlogBody("upstream", bodyBytes)
@@ -255,7 +264,11 @@ func proxyDo(w http.ResponseWriter, r *http.Request, cfg ProviderConfig, ep Endp
 		return
 	}
 	if stream {
-		sr := &streamReader{r: resp.Body, label: ep.Label, start: time.Now()}
+		var r io.Reader = resp.Body
+		if responsesUpstream {
+			r = newResponsesStreamTranslator(r)
+		}
+		sr := &streamReader{r: r, label: ep.Label, start: time.Now()}
 		if ep.StreamOAI != nil {
 			ep.StreamOAI(w, sr, model)
 		} else {
@@ -268,6 +281,10 @@ func proxyDo(w http.ResponseWriter, r *http.Request, cfg ProviderConfig, ep Endp
 	}
 	bodyBytes, _ := io.ReadAll(resp.Body)
 	dlogBody("upstream", bodyBytes)
+	if responsesUpstream {
+		converted, _ := responsesBodyToOAIChat(bodyBytes, model)
+		bodyBytes = converted
+	}
 	if ep.StaticOAI != nil {
 		ep.StaticOAI(w, bytes.NewReader(bodyBytes), model)
 	} else {

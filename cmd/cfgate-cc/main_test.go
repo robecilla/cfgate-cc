@@ -942,9 +942,9 @@ func TestNormalizeQwenAnthropicRequestThinkingVariants(t *testing.T) {
 	zero := 0.0
 	topP := 0.8
 	for _, tc := range []struct {
-		name          string
-		req           AnthropicRequest
-		expectBudget  int // 0 = expect no thinking field
+		name         string
+		req          AnthropicRequest
+		expectBudget int // 0 = expect no thinking field
 	}{
 		{
 			name: "thinking enabled with budget",
@@ -1880,7 +1880,7 @@ func TestShouldRestartForLaunch(t *testing.T) {
 		active, requested string
 		want              bool
 	}{
-		{"", "opencode-go", false},         // unknown active → keep running
+		{"", "opencode-go", false},            // unknown active → keep running
 		{"opencode-go", "opencode-go", false}, // match → keep
 		{"opencode-go", "cloudflare", true},   // mismatch → restart
 	}
@@ -3039,6 +3039,345 @@ func mustPort(t *testing.T, url string) int {
 	return p
 }
 
+func TestSetupCloudflareNativeWritesOpenAINative(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
+	t.Setenv("CLOUDFLARE_API_TOKEN", "")
+	t.Setenv("CLOUDFLARE_ACCOUNT_ID", "")
+	t.Setenv("CLOUDFLARE_GATEWAY_ID", "")
+
+	// peers in the suite mutate resolvedInstanceName without restoring it.
+	// reset here so providerConfigFile resolves to our temp dir, not some
+	// leftover instance's dir.
+	old := resolvedInstanceName
+	resolvedInstanceName = ""
+	t.Cleanup(func() { resolvedInstanceName = old })
+
+	cmd := setupCloudflareCmd()
+	cmd.SetArgs([]string{"--token", "tok-xyz", "--account", "acct-123", "--gateway", "gw-456", "--openai-native"})
+	cmd.SetIn(strings.NewReader(""))
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := os.ReadFile(filepath.Join(dir, "cloudflare.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var p ProviderConfig
+	if err := json.Unmarshal(b, &p); err != nil {
+		t.Fatal(err)
+	}
+	if !p.OpenAINative {
+		t.Fatalf("openai_native should be true, got %+v", p)
+	}
+	if p.Account != "acct-123" {
+		t.Fatalf("account = %q, want acct-123", p.Account)
+	}
+	if p.Gateway != "gw-456" {
+		t.Fatalf("gateway = %q, want gw-456", p.Gateway)
+	}
+}
+
+func TestCloudflareNativeURLBuild(t *testing.T) {
+	cfg := ProviderConfig{Account: "acct-123", Gateway: "gw-456", OpenAINative: true}
+	if got := openAINativeChatURL(cfg); got != "https://gateway.ai.cloudflare.com/v1/acct-123/gw-456/openai/chat/completions" {
+		t.Fatalf("openAINativeChatURL = %q, want chat URL", got)
+	}
+	if got := openAINativeResponsesURL(cfg); got != "https://gateway.ai.cloudflare.com/v1/acct-123/gw-456/openai/responses" {
+		t.Fatalf("openAINativeResponsesURL = %q, want responses URL", got)
+	}
+}
+
+func TestOpenAIURLForModel(t *testing.T) {
+	// native on, workers-ai → legacy /ai/v1 (gateway header path).
+	// native on, gpt-5 → /openai/responses (chat/completions rejects
+	// tools+reasoning_effort for gpt-5.4-mini). native off, gpt-5 → /ai/v1.
+	cfg := ProviderConfig{
+		Name:            "cloudflare",
+		UpstreamBaseURL: "https://api.cloudflare.com/client/v4/accounts/acct-123/ai/v1",
+		Account:         "acct-123",
+		Gateway:         "gw-456",
+		OpenAINative:    true,
+	}
+	if got := openAIURLForModel(cfg, "@cf/zai-org/glm-5.2"); got != cfg.UpstreamBaseURL+"/chat/completions" {
+		t.Errorf("workers-ai native cfg: got %q, want compat URL", got)
+	}
+	if got := openAIURLForModel(cfg, "gpt-5.4"); got != "https://gateway.ai.cloudflare.com/v1/acct-123/gw-456/openai/responses" {
+		t.Errorf("gpt-5 native cfg: got %q, want native responses URL", got)
+	}
+	cfg.OpenAINative = false
+	if got := openAIURLForModel(cfg, "gpt-5.4"); got != cfg.UpstreamBaseURL+"/chat/completions" {
+		t.Errorf("gpt-5 non-native cfg: got %q, want compat URL", got)
+	}
+	// native on but Account/Gateway empty → compat URL, not the malformed
+	// native URL with empty path segments.
+	cfgNativeBroken := ProviderConfig{Name: "cloudflare", UpstreamBaseURL: cfg.UpstreamBaseURL, OpenAINative: true}
+	if got := openAIURLForModel(cfgNativeBroken, "gpt-5.4"); got != cfg.UpstreamBaseURL+"/chat/completions" {
+		t.Errorf("native cfg missing Account/Gateway: got %q, want compat URL fallback", got)
+	}
+}
+
+func TestApplyUpstreamAuthForModel(t *testing.T) {
+	// opencode-go: bearer token always sent.
+	oc := ProviderConfig{Name: "opencode-go", UpstreamAPIKey: "oc-key", UpstreamAuth: "bearer"}
+	req, _ := http.NewRequest(http.MethodPost, "http://example", nil)
+	applyUpstreamAuthForModel(req, oc, "gpt-5.4")
+	if got := req.Header.Get("Authorization"); got != "Bearer oc-key" {
+		t.Fatalf("opencode-go Authorization = %q, want Bearer oc-key", got)
+	}
+	if got := req.Header.Get("cf-aig-authorization"); got != "" {
+		t.Fatalf("opencode-go should not set cf-aig-authorization, got %q", got)
+	}
+
+	// cloudflare workers-ai: bearer token, gateway header set elsewhere.
+	cf := ProviderConfig{Name: "cloudflare", UpstreamAPIKey: "cf-key", UpstreamAuth: "bearer"}
+	req, _ = http.NewRequest(http.MethodPost, "http://example", nil)
+	applyUpstreamAuthForModel(req, cf, "@cf/zai-org/glm-5.2")
+	if got := req.Header.Get("Authorization"); got != "Bearer cf-key" {
+		t.Fatalf("cloudflare workers-ai Authorization = %q, want Bearer cf-key", got)
+	}
+	if got := req.Header.Get("cf-aig-authorization"); got != "" {
+		t.Fatalf("cloudflare workers-ai should not set cf-aig-authorization, got %q", got)
+	}
+
+	// cloudflare gpt-5, native on: blank Authorization, cf-aig-authorization set.
+	cfNative := ProviderConfig{Name: "cloudflare", UpstreamAPIKey: "cf-key", UpstreamAuth: "bearer", OpenAINative: true}
+	req, _ = http.NewRequest(http.MethodPost, "http://example", nil)
+	applyUpstreamAuthForModel(req, cfNative, "gpt-5.4")
+	if got := req.Header.Get("Authorization"); got != "" {
+		t.Fatalf("cloudflare gpt-5 native Authorization = %q, want empty (BYOK bypass guard)", got)
+	}
+	if got := req.Header.Get("cf-aig-authorization"); got != "Bearer cf-key" {
+		t.Fatalf("cloudflare gpt-5 native cf-aig-authorization = %q, want Bearer cf-key", got)
+	}
+
+	// cloudflare gpt-5, native off: bearer (legacy /ai/v1 path needs a real token).
+	req, _ = http.NewRequest(http.MethodPost, "http://example", nil)
+	applyUpstreamAuthForModel(req, cf, "gpt-5.4")
+	if got := req.Header.Get("Authorization"); got != "Bearer cf-key" {
+		t.Fatalf("cloudflare gpt-5 non-native Authorization = %q, want Bearer cf-key", got)
+	}
+	if got := req.Header.Get("cf-aig-authorization"); got != "" {
+		t.Fatalf("cloudflare gpt-5 non-native should not set cf-aig-authorization, got %q", got)
+	}
+}
+
+func TestUsesMaxCompletionTokens(t *testing.T) {
+	cases := []struct {
+		model string
+		want  bool
+	}{
+		{"gpt-5.5", true},
+		{"gpt-5.4", true},
+		{"gpt-5.4-mini", true},
+		{"gpt-5", true},
+		{"gpt-4o", false},
+		{"@cf/zai-org/glm-5.2", false},
+		{"kimi-k2.7-code", false},
+	}
+	for _, c := range cases {
+		if got := usesMaxCompletionTokens(c.model); got != c.want {
+			t.Errorf("usesMaxCompletionTokens(%q) = %v, want %v", c.model, got, c.want)
+		}
+	}
+}
+
+func TestConvertRequestEmitsMaxCompletionTokensForGPT5(t *testing.T) {
+	// Anthropic request for gpt-5.4 should emit max_completion_tokens, not
+	// max_tokens, and must not carry both.
+	ar := AnthropicRequest{Model: "gpt-5.4", MaxTokens: 4096, Messages: []AMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}}}
+	or := convertRequest(ar, ProviderConfig{Name: "cloudflare"})
+	if or.MaxCompletionTokens != 4096 {
+		t.Fatalf("MaxCompletionTokens = %d, want 4096", or.MaxCompletionTokens)
+	}
+	if or.MaxTokens != 0 {
+		t.Fatalf("MaxTokens = %d, want 0 (gpt-5.x rejects max_tokens)", or.MaxTokens)
+	}
+
+	// non-gpt-5 model: max_tokens kept.
+	ar2 := AnthropicRequest{Model: "kimi-k2.6", MaxTokens: 4096, Messages: []AMessage{{Role: "user", Content: json.RawMessage(`"hi"`)}}}
+	or2 := convertRequest(ar2, ProviderConfig{Name: "cloudflare"})
+	if or2.MaxTokens != 4096 {
+		t.Fatalf("non-gpt-5 MaxTokens = %d, want 4096", or2.MaxTokens)
+	}
+	if or2.MaxCompletionTokens != 0 {
+		t.Fatalf("non-gpt-5 MaxCompletionTokens = %d, want 0", or2.MaxCompletionTokens)
+	}
+}
+
+func TestResponsesToChatEmitsMaxCompletionTokensForGPT5(t *testing.T) {
+	rr := ResponsesRequest{Model: "gpt-5.5", MaxTokens: 8192, Input: json.RawMessage(`[{"role":"user","content":"hi"}]`)}
+	or := responsesToChat(rr, ProviderConfig{Name: "cloudflare"})
+	if or.MaxCompletionTokens != 8192 {
+		t.Fatalf("MaxCompletionTokens = %d, want 8192", or.MaxCompletionTokens)
+	}
+	if or.MaxTokens != 0 {
+		t.Fatalf("MaxTokens = %d, want 0 for gpt-5.x", or.MaxTokens)
+	}
+}
+
+func TestPrepareChatBodyEmitsMaxCompletionTokensForGPT5(t *testing.T) {
+	// raw chat-completions body for a gpt-5 model: max_tokens must be moved
+	// to max_completion_tokens. applies after the codex mapping resolves
+	// the model name.
+	mappings := defaultModelMappings()
+	mappings["codex"] = map[string]string{"gpt-5.4-target": "gpt-5.4"}
+	prev := modelMappingFile
+	modelMappingFile = func() string { return filepath.Join(t.TempDir(), "model-mapping.json") }
+	b, _ := json.MarshalIndent(map[string]map[string]map[string]string{"cloudflare": mappings}, "", "  ")
+	if err := os.WriteFile(modelMappingFile(), b, 0600); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { modelMappingFile = prev })
+
+	body := []byte(`{"model":"gpt-5.4-target","max_tokens":2048,"messages":[{"role":"user","content":"hi"}]}`)
+	out, err := prepareChatBody(body, ProviderConfig{Name: "cloudflare"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out), `"max_completion_tokens":2048`) {
+		t.Fatalf("max_completion_tokens missing in: %s", out)
+	}
+	if strings.Contains(string(out), `"max_tokens"`) {
+		t.Fatalf("max_tokens should be removed for gpt-5.x, got: %s", out)
+	}
+
+	// non-gpt-5: max_tokens preserved.
+	body2 := []byte(`{"model":"kimi-k2.6","max_tokens":2048,"messages":[{"role":"user","content":"hi"}]}`)
+	out2, err := prepareChatBody(body2, ProviderConfig{Name: "cloudflare"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(out2), `"max_tokens":2048`) {
+		t.Fatalf("non-gpt-5 max_tokens missing: %s", out2)
+	}
+	if strings.Contains(string(out2), `"max_completion_tokens"`) {
+		t.Fatalf("non-gpt-5 should not have max_completion_tokens: %s", out2)
+	}
+}
+
+func TestModelMetadataForGPT5(t *testing.T) {
+	cases := []struct {
+		model          string
+		wantCtx        int
+		wantImageInput bool
+	}{
+		{"gpt-5.5", 1000000, true},
+		{"gpt-5.4", 1000000, true},
+		{"gpt-5.4-mini", 400000, true},
+	}
+	for _, c := range cases {
+		m := modelMetadata(c.model)
+		if m.ContextWindow != c.wantCtx {
+			t.Errorf("modelMetadata(%q).ContextWindow = %d, want %d", c.model, m.ContextWindow, c.wantCtx)
+		}
+		if m.MaxContextWindow != c.wantCtx {
+			t.Errorf("modelMetadata(%q).MaxContextWindow = %d, want %d", c.model, m.MaxContextWindow, c.wantCtx)
+		}
+		hasImage := false
+		for _, mod := range m.InputModalities {
+			if mod == "image" {
+				hasImage = true
+				break
+			}
+		}
+		if hasImage != c.wantImageInput {
+			t.Errorf("modelMetadata(%q) image modality = %v, want %v (input: %v)", c.model, hasImage, c.wantImageInput, m.InputModalities)
+		}
+		if m.UsesAnthropicEndpoint {
+			t.Errorf("modelMetadata(%q) should not use anthropic endpoint", c.model)
+		}
+	}
+}
+
+func TestMigrateCloudflareURLBackfillsAccount(t *testing.T) {
+	// pre-migration config that already has the REST API URL but is
+	// missing the Account field needed for the /openai native path.
+	dir := t.TempDir()
+	t.Setenv("CFGATE_CC_CONFIG_DIR", dir)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		t.Fatal(err)
+	}
+	// reset instance name; peers in the suite leak it (TestListCmd sets
+	// "cf" and "lab" without restoring), so without this reset the
+	// providerConfigFile resolver lands in a non-existent instance dir.
+	oldInst := resolvedInstanceName
+	resolvedInstanceName = ""
+	t.Cleanup(func() { resolvedInstanceName = oldInst })
+
+	old := `{"upstream_base_url":"https://api.cloudflare.com/client/v4/accounts/acct-777/ai/v1","upstream_api_key":"tok","upstream_auth":"bearer","gateway":"gw-1"}`
+	if err := os.WriteFile(filepath.Join(dir, "cloudflare.json"), []byte(old), 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	migrateCloudflareURLIfNeeded()
+
+	p, err := loadProviderConfig("cloudflare")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p.Account != "acct-777" {
+		t.Fatalf("Account = %q, want acct-777 (back-filled from UpstreamBaseURL)", p.Account)
+	}
+	if p.Gateway != "gw-1" {
+		t.Fatalf("Gateway = %q, want gw-1", p.Gateway)
+	}
+
+	// idempotent: a second pass leaves Account alone.
+	migrateCloudflareURLIfNeeded()
+	p, _ = loadProviderConfig("cloudflare")
+	if p.Account != "acct-777" {
+		t.Fatalf("Account changed on second pass: %q", p.Account)
+	}
+}
+
+func TestCloudflareModelIDsMergesNativeWhenEnabled(t *testing.T) {
+	// stand up a fake cloudflare compat server at /accounts/acct/ai/models/search
+	// and verify cloudflareModelIDs appends the native ids when OpenAINative
+	// is on. with OpenAINative off, only the compat id is returned.
+	mux := http.NewServeMux()
+	mux.HandleFunc("/accounts/acct/ai/models/search", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"success":true,"result":[{"id":"@cf/zai-org/glm-5.2","name":"@cf/zai-org/glm-5.2"}]}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	cfg := ProviderConfig{
+		Name:            "cloudflare",
+		UpstreamBaseURL: srv.URL + "/accounts/acct/ai/v1",
+		Account:         "acct",
+		Gateway:         "gw",
+		OpenAINative:    true,
+	}
+	ids, err := cloudflareModelIDs(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]bool{}
+	for _, id := range ids {
+		seen[id] = true
+	}
+	for _, want := range []string{"gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "@cf/zai-org/glm-5.2"} {
+		if !seen[want] {
+			t.Errorf("missing %q in cloudflare list: %v", want, ids)
+		}
+	}
+
+	// native off → only the compat result.
+	cfg.OpenAINative = false
+	ids2, err := cloudflareModelIDs(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range ids2 {
+		if strings.HasPrefix(id, "gpt-") {
+			t.Errorf("native off should not include gpt- ids, got %q", id)
+		}
+	}
+}
+
 // regression: the original chat handler called copyHeaders on the
 // OAI-upstream 4xx path. the collapsed scaffold dropped that line, so
 // clients lost Content-Type, Retry-After, and provider request-id
@@ -3229,4 +3568,308 @@ func TestProxyMessagesConvertsToOAIOnNonAnthropicBranch(t *testing.T) {
 	if !strings.Contains(forwarded, `"max_tokens":1`) {
 		t.Errorf("upstream body missing max_tokens: %s", forwarded)
 	}
+}
+
+// regression: gpt-5.x on cloudflare native with --openai-native rejects
+// (tools ∧ reasoning_effort) on /openai/chat/completions — openai's
+// /v1/chat/completions asks for /v1/responses. the proxy now routes
+// gpt-5.x to /openai/responses, re-shapes the request body to the
+// responses wire format, and re-shapes the response back to chat-
+// completions so the existing anthropic shaper can render it.
+func TestProxyChatRoutesGPT5ToResponsesOnCloudflareNative(t *testing.T) {
+	var upstreamPath string
+	var upstreamBody []byte
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamPath = r.URL.Path
+		upstreamBody, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{
+			"id": "resp_abc",
+			"object": "response",
+			"output": [
+				{"id":"msg_x","type":"message","role":"assistant","content":[{"type":"output_text","text":"hello from responses"}]},
+				{"id":"fc_x","type":"function_call","call_id":"call_1","name":"do_thing","arguments":"{\"x\":1}"}
+			],
+			"usage": {"input_tokens": 7, "output_tokens": 11, "total_tokens": 18}
+		}`))
+	}))
+	defer upstream.Close()
+	withTestNativeURL(t, upstream.URL)
+
+	cfg := ProviderConfig{
+		Name:            "cloudflare",
+		UpstreamBaseURL: upstream.URL,
+		UpstreamAPIKey:  "cf-key",
+		UpstreamAuth:    "bearer",
+		Account:         "acct-123",
+		Gateway:         "gw-456",
+		OpenAINative:    true,
+	}
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { proxyDo(w, r, cfg, chatEndpoint) }))
+	defer proxy.Close()
+
+	resp, err := http.Post(proxy.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"gpt-5.4-mini","messages":[{"role":"user","content":"hi"}],"tools":[{"type":"function","function":{"name":"do_thing","parameters":{"type":"object"}}}],"reasoning_effort":"high"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body=%s", resp.StatusCode, body)
+	}
+	if !strings.HasSuffix(upstreamPath, "/openai/responses") {
+		t.Errorf("upstream path = %q, want /openai/responses", upstreamPath)
+	}
+	// request body must use the responses shape: input array, reasoning
+	// nested under "reasoning.effort", tools as a flat list.
+	if !strings.Contains(string(upstreamBody), `"input":[`) {
+		t.Errorf("upstream body missing responses-shape input: %s", upstreamBody)
+	}
+	if !strings.Contains(string(upstreamBody), `"reasoning":`) {
+		t.Errorf("upstream body missing reasoning object: %s", upstreamBody)
+	}
+	if !strings.Contains(string(upstreamBody), `"name":"do_thing"`) {
+		t.Errorf("upstream body missing tool name: %s", upstreamBody)
+	}
+
+	// response body should be reshaped to chat-completions and rendered
+	// as an anthropic message by the existing shaper chain.
+	if !strings.Contains(string(body), "hello from responses") {
+		t.Errorf("response body missing translated text: %s", body)
+	}
+	if !strings.Contains(string(body), `"do_thing"`) {
+		t.Errorf("response body missing tool name: %s", body)
+	}
+}
+
+// streaming version of the gpt-5.x regression. the upstream emits a
+// /v1/responses SSE stream; the translator must re-emit chat-completions
+// events so streamAnthropic can render the anthropic wire format.
+func TestProxyChatRoutesGPT5ToResponsesStreamingOnCloudflareNative(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, _ := w.(http.Flusher)
+		fmt.Fprint(w, "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_x\"}}\n\n")
+		fmt.Fprint(w, "event: response.output_item.added\ndata: {\"type\":\"response.output_item.added\",\"output_index\":0,\"item\":{\"id\":\"msg_x\",\"type\":\"message\",\"role\":\"assistant\",\"content\":[]}}\n\n")
+		fmt.Fprint(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_x\",\"output_index\":0,\"content_index\":0,\"delta\":\"hi \"}\n\n")
+		fmt.Fprint(w, "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_x\",\"output_index\":0,\"content_index\":0,\"delta\":\"there\"}\n\n")
+		fmt.Fprint(w, "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_x\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}))
+	defer upstream.Close()
+	withTestNativeURL(t, upstream.URL)
+
+	cfg := ProviderConfig{
+		Name:            "cloudflare",
+		UpstreamBaseURL: upstream.URL,
+		UpstreamAPIKey:  "cf-key",
+		UpstreamAuth:    "bearer",
+		Account:         "acct-123",
+		Gateway:         "gw-456",
+		OpenAINative:    true,
+	}
+	proxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { proxyDo(w, r, cfg, chatEndpoint) }))
+	defer proxy.Close()
+
+	resp, err := http.Post(proxy.URL+"/v1/chat/completions", "application/json",
+		strings.NewReader(`{"model":"gpt-5.4-mini","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	// chat-completions passthrough: the responses SSE is translated
+	// chunk-by-chunk, so the deltas arrive as separate `data:` lines
+	// rather than a single concatenated string. verify both deltas
+	// arrived, the terminal finish chunk is present, and the responses
+	// event vocabulary didn't leak.
+	if !strings.Contains(string(body), `"content":"hi "`) {
+		t.Errorf("stream body missing first text delta: %s", body)
+	}
+	if !strings.Contains(string(body), `"content":"there"`) {
+		t.Errorf("stream body missing second text delta: %s", body)
+	}
+	if !strings.Contains(string(body), `"finish_reason":"stop"`) {
+		t.Errorf("stream body missing terminal finish_reason: %s", body)
+	}
+	if !strings.Contains(string(body), "data: [DONE]") {
+		t.Errorf("stream body missing [DONE] terminator: %s", body)
+	}
+	if strings.Contains(string(body), "response.output_text.delta") {
+		t.Errorf("responses event vocabulary leaked through: %s", body)
+	}
+}
+
+// unit test for the request wire-format bridge. the openai-native
+// gpt-5.x path translates the chat-completions body the proxy already
+// builds into the responses wire format openai's /v1/responses expects.
+func TestOAIBodyToResponsesBody(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5.4-mini",
+		"messages":[
+			{"role":"system","content":"you are a bot"},
+			{"role":"user","content":"hi"},
+			{"role":"assistant","content":"","tool_calls":[{"id":"call_1","type":"function","function":{"name":"do_thing","arguments":"{\"x\":1}"}}]},
+			{"role":"tool","tool_call_id":"call_1","content":"ok"}
+		],
+		"tools":[{"type":"function","function":{"name":"do_thing","description":"do it","parameters":{"type":"object"}}}],
+		"reasoning_effort":"high",
+		"max_completion_tokens":2048,
+		"stream":true
+	}`)
+	out := oaiBodyToResponsesBody(body)
+	if !strings.Contains(string(out), `"input":[`) {
+		t.Errorf("missing responses-shape input: %s", out)
+	}
+	if !strings.Contains(string(out), `"role":"system"`) {
+		t.Errorf("missing system input item: %s", out)
+	}
+	if !strings.Contains(string(out), `"role":"user"`) {
+		t.Errorf("missing user input item: %s", out)
+	}
+	if !strings.Contains(string(out), `"call_id":"call_1"`) {
+		t.Errorf("missing function_call id: %s", out)
+	}
+	if !strings.Contains(string(out), `"type":"function_call_output"`) {
+		t.Errorf("missing function_call_output: %s", out)
+	}
+	if !strings.Contains(string(out), `"max_output_tokens":2048`) {
+		t.Errorf("max_tokens/max_completion_tokens not mapped to max_output_tokens: %s", out)
+	}
+	if !strings.Contains(string(out), `"reasoning":{"effort":"high"}`) {
+		t.Errorf("reasoning_effort not nested under reasoning: %s", out)
+	}
+	if !strings.Contains(string(out), `"name":"do_thing"`) {
+		t.Errorf("tool name missing in responses-shape tools: %s", out)
+	}
+}
+
+// unit test for the static response bridge. the openai-native gpt-5.x
+// path translates the responses-shape non-streaming body into a chat-
+// completions body so the existing writeChatCompletionsResponseFromAnthropic
+// shaper (fed via the upstream 4xx/2xx code path) renders correctly.
+func TestResponsesBodyToOAIChat(t *testing.T) {
+	body := []byte(`{
+		"id":"resp_abc",
+		"output":[
+			{"id":"msg_x","type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]},
+			{"id":"fc_x","type":"function_call","call_id":"call_9","name":"do_thing","arguments":"{\"y\":2}"}
+		],
+		"usage":{"input_tokens":3,"output_tokens":4,"total_tokens":7}
+	}`)
+	out, err := responsesBodyToOAIChat(body, "gpt-5.4-mini")
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := string(out)
+	if !strings.Contains(s, `"object":"chat.completion"`) {
+		t.Errorf("missing chat.completion object: %s", s)
+	}
+	if !strings.Contains(s, `"content":"hello"`) {
+		t.Errorf("text content not extracted: %s", s)
+	}
+	if !strings.Contains(s, `"name":"do_thing"`) {
+		t.Errorf("tool call not extracted: %s", s)
+	}
+	if !strings.Contains(s, `"call_9"`) {
+		t.Errorf("tool call id not preserved: %s", s)
+	}
+	if !strings.Contains(s, `"prompt_tokens":3`) {
+		t.Errorf("usage input_tokens not mapped: %s", s)
+	}
+	if !strings.Contains(s, `"finish_reason":"tool_calls"`) {
+		t.Errorf("finish_reason should be tool_calls when function_call present: %s", s)
+	}
+}
+
+// unit test for the SSE translator. the openai-native gpt-5.x streaming
+// path re-emits responses-shape SSE events as chat-completions events
+// so the existing streamAnthropic shaper (fed via streamAnthropic) can
+// render the anthropic wire format. verifies text deltas, function_call
+// introduction + argument deltas, and the terminal [DONE].
+func TestResponsesStreamTranslator(t *testing.T) {
+	src := strings.NewReader(
+		"event: response.created\n" +
+			"data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_x\"}}\n\n" +
+			"event: response.output_item.added\n" +
+			"data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"id\":\"fc_x\",\"type\":\"function_call\",\"call_id\":\"call_5\",\"name\":\"do_thing\",\"arguments\":\"\"}}\n\n" +
+			"event: response.output_text.delta\n" +
+			"data: {\"type\":\"response.output_text.delta\",\"item_id\":\"msg_x\",\"output_index\":0,\"content_index\":0,\"delta\":\"hello\"}\n\n" +
+			"event: response.function_call_arguments.delta\n" +
+			"data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_x\",\"output_index\":1,\"delta\":\"{\\\"y\\\":\"}\n\n" +
+			"event: response.function_call_arguments.delta\n" +
+			"data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"fc_x\",\"output_index\":1,\"delta\":\"2}\"}\n\n" +
+			"event: response.completed\n" +
+			"data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_x\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n")
+	tr := newResponsesStreamTranslator(src)
+	raw, err := io.ReadAll(tr)
+	if err != nil && err != io.EOF {
+		t.Fatal(err)
+	}
+	out := string(raw)
+	if !strings.Contains(out, `"content":"hello"`) {
+		t.Errorf("text delta not translated: %s", out)
+	}
+	if !strings.Contains(out, `"name":"do_thing"`) {
+		t.Errorf("function_call intro not translated: %s", out)
+	}
+	if !strings.Contains(out, `"call_5"`) {
+		t.Errorf("function_call id not preserved: %s", out)
+	}
+	if !strings.Contains(out, `"arguments":"{\\"y\\":"`) && !strings.Contains(out, `"arguments":"{\"y\":"`) {
+		t.Errorf("function_call args delta not translated: %s", out)
+	}
+	if !strings.Contains(out, `"finish_reason":"tool_calls"`) {
+		t.Errorf("terminal finish_reason should be tool_calls: %s", out)
+	}
+	if !strings.Contains(out, `"prompt_tokens":1`) {
+		t.Errorf("terminal usage chunk missing: %s", out)
+	}
+	if !strings.Contains(out, "data: [DONE]") {
+		t.Errorf("terminal [DONE] not emitted: %s", out)
+	}
+	if strings.Contains(out, "response.created") {
+		t.Errorf("raw responses event leaked through: %s", out)
+	}
+}
+
+// isResponsesUpstreamURL should match the cloudflare native /openai/responses
+// subpath (and the bare /v1/responses for the local mux's inbound case
+// — the local endpoint doesn't go through this check, but the helper is
+// permissive so future test fixtures can use either).
+func TestIsResponsesUpstreamURL(t *testing.T) {
+	cases := map[string]bool{
+		"https://gateway.ai.cloudflare.com/v1/acct/gw/openai/responses":        true,
+		"https://api.openai.com/v1/responses":                                  true,
+		"https://gateway.ai.cloudflare.com/v1/acct/gw/openai/chat/completions": false,
+		"https://api.openai.com/v1/chat/completions":                           false,
+	}
+	for u, want := range cases {
+		if got := isResponsesUpstreamURL(u); got != want {
+			t.Errorf("isResponsesUpstreamURL(%q) = %v, want %v", u, got, want)
+		}
+	}
+}
+
+// withTestNativeURL redirects the cloudflare native URL builders at
+// httptest-localhost for the duration of a test. the production
+// builders hardcode gateway.ai.cloudflare.com from Account+Gateway,
+// which can't be overridden by UpstreamBaseURL — this swap is the
+// cleanest way to exercise the full proxyDo flow with a fake upstream.
+func withTestNativeURL(t *testing.T, base string) {
+	t.Helper()
+	oldChat, oldResp := openAINativeChatURLBuilder, openAINativeResponsesURLBuilder
+	openAINativeChatURLBuilder = func(cfg ProviderConfig) string {
+		return strings.TrimRight(base, "/") + "/openai/chat/completions"
+	}
+	openAINativeResponsesURLBuilder = func(cfg ProviderConfig) string {
+		return strings.TrimRight(base, "/") + "/openai/responses"
+	}
+	t.Cleanup(func() {
+		openAINativeChatURLBuilder = oldChat
+		openAINativeResponsesURLBuilder = oldResp
+	})
 }
