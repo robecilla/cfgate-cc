@@ -185,12 +185,12 @@ the `/ai/v1` compat adapter sends `max_tokens`, which gpt-5.x rejects (it requir
 cfgate-cc setup cloudflare --token <token> --account <account> --gateway <gateway> --openai-native
 
 # route claude's three family slots to gpt-5.x
-cfgate-cc mapping --provider cloudflare claude set claude-opus   gpt-5.5
-cfgate-cc mapping --provider cloudflare claude set claude-sonnet gpt-5.4
+cfgate-cc mapping --provider cloudflare claude set claude-opus   gpt-5.6-terra
+cfgate-cc mapping --provider cloudflare claude set claude-sonnet gpt-5.6-luna
 cfgate-cc mapping --provider cloudflare claude set claude-haiku  gpt-5.4-mini
 
 # verify
-cfgate-cc list --provider cloudflare      # includes gpt-5.5, gpt-5.4, gpt-5.4-mini
+cfgate-cc list --provider cloudflare      # includes gpt-5.6-terra, gpt-5.6-luna, gpt-5.5, gpt-5.4, gpt-5.4-mini
 cfgate-cc launch claude --provider cloudflare --model claude-opus
 ```
 
@@ -207,7 +207,7 @@ the resulting `cloudflare.json` looks like:
 }
 ```
 
-on the wire, gpt-5.x requests hit `https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/openai/chat/completions` with `Authorization: ""` (blank) and `cf-aig-authorization: Bearer <token>` — blank is intentional, the gateway passes any non-empty Authorization through verbatim, which would bypass the stored BYOK openai key. workers-ai (`@cf/...`) requests still hit the legacy `/ai/v1/chat/completions` URL with a bearer token and the gateway header. the two paths coexist in the same `serve` process; the model in flight decides the route.
+on the wire, gpt-5.x requests hit `https://gateway.ai.cloudflare.com/v1/<account>/<gateway>/openai/responses` with `Authorization: ""` (blank) and `cf-aig-authorization: Bearer <token>` — blank is intentional, the gateway passes any non-empty Authorization through verbatim, which would bypass the stored BYOK openai key. workers-ai (`@cf/...`) requests still hit the legacy `/ai/v1/chat/completions` URL with a bearer token and the gateway header. the two paths coexist in the same `serve` process; the model in flight decides the route.
 
 ## opencode-go
 

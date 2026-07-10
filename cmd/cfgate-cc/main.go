@@ -1192,10 +1192,17 @@ func modelMetadata(model string) openCodeModelMetadata {
 		}
 	case "gpt-5.5", "gpt-5.4":
 		// OpenAI gpt-5.x via cloudflare's /openai native endpoint. multimodal,
-		// 1M context (200k output cap on the wire, surfaced as 128k here for
-		// the codex catalog). Values mirror the opencode config defaults.
+		// 1m context, values mirror the opencode config defaults.
 		meta.ContextWindow = 1000000
 		meta.MaxContextWindow = 1000000
+		meta.InputModalities = []string{"text", "image"}
+		meta.CodexInputModalities = []string{"text", "image"}
+		meta.SupportsImageOriginal = true
+	case "gpt-5.6-luna", "gpt-5.6-terra":
+		// OpenAI gpt-5.6 via cloudflare's /openai native endpoint. multimodal,
+		// 1.05m context, values mirror the current openai docs.
+		meta.ContextWindow = 1050000
+		meta.MaxContextWindow = 1050000
 		meta.InputModalities = []string{"text", "image"}
 		meta.CodexInputModalities = []string{"text", "image"}
 		meta.SupportsImageOriginal = true
@@ -1359,7 +1366,7 @@ func fetchCloudflareModels(cfg ProviderConfig) ([]string, error) {
 // modelMetadata() — adding a gpt-* model there but not here makes it
 // invisible to `cfgate-cc list` until a manual mapping is set.
 func cloudflareNativeModelIDs() []string {
-	return []string{"gpt-5.5", "gpt-5.4", "gpt-5.4-mini"}
+	return []string{"gpt-5.5", "gpt-5.4", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.4-mini"}
 }
 
 // cloudflareModelIDs returns the live cloudflare model list. unlike
