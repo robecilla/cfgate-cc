@@ -3106,6 +3106,12 @@ func TestOpenAIURLForModel(t *testing.T) {
 	if got := openAIURLForModel(cfg, "gpt-5.4"); got != "https://gateway.ai.cloudflare.com/v1/acct-123/gw-456/openai/responses" {
 		t.Errorf("gpt-5 native cfg: got %q, want native responses URL", got)
 	}
+	if got := openAIURLForModel(cfg, "gpt-5.6-luna"); got != "https://gateway.ai.cloudflare.com/v1/acct-123/gw-456/openai/responses" {
+		t.Errorf("gpt-5.6-luna native cfg: got %q, want native responses URL", got)
+	}
+	if got := openAIURLForModel(cfg, "gpt-5.6-terra"); got != "https://gateway.ai.cloudflare.com/v1/acct-123/gw-456/openai/responses" {
+		t.Errorf("gpt-5.6-terra native cfg: got %q, want native responses URL", got)
+	}
 	cfg.OpenAINative = false
 	if got := openAIURLForModel(cfg, "gpt-5.4"); got != cfg.UpstreamBaseURL+"/chat/completions" {
 		t.Errorf("gpt-5 non-native cfg: got %q, want compat URL", got)
@@ -3152,6 +3158,15 @@ func TestApplyUpstreamAuthForModel(t *testing.T) {
 		t.Fatalf("cloudflare gpt-5 native cf-aig-authorization = %q, want Bearer cf-key", got)
 	}
 
+	req, _ = http.NewRequest(http.MethodPost, "http://example", nil)
+	applyUpstreamAuthForModel(req, cfNative, "gpt-5.6-terra")
+	if got := req.Header.Get("Authorization"); got != "" {
+		t.Fatalf("cloudflare gpt-5 native Authorization = %q, want empty (BYOK bypass guard)", got)
+	}
+	if got := req.Header.Get("cf-aig-authorization"); got != "Bearer cf-key" {
+		t.Fatalf("cloudflare gpt-5 native cf-aig-authorization = %q, want Bearer cf-key", got)
+	}
+
 	// cloudflare gpt-5, native off: bearer (legacy /ai/v1 path needs a real token).
 	req, _ = http.NewRequest(http.MethodPost, "http://example", nil)
 	applyUpstreamAuthForModel(req, cf, "gpt-5.4")
@@ -3170,6 +3185,8 @@ func TestUsesMaxCompletionTokens(t *testing.T) {
 	}{
 		{"gpt-5.5", true},
 		{"gpt-5.4", true},
+		{"gpt-5.6-luna", true},
+		{"gpt-5.6-terra", true},
 		{"gpt-5.4-mini", true},
 		{"gpt-5", true},
 		{"gpt-4o", false},
@@ -3265,6 +3282,8 @@ func TestModelMetadataForGPT5(t *testing.T) {
 	}{
 		{"gpt-5.5", 1000000, true},
 		{"gpt-5.4", 1000000, true},
+		{"gpt-5.6-luna", 1050000, true},
+		{"gpt-5.6-terra", 1050000, true},
 		{"gpt-5.4-mini", 400000, true},
 	}
 	for _, c := range cases {
@@ -3359,7 +3378,7 @@ func TestCloudflareModelIDsMergesNativeWhenEnabled(t *testing.T) {
 	for _, id := range ids {
 		seen[id] = true
 	}
-	for _, want := range []string{"gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "@cf/zai-org/glm-5.2"} {
+	for _, want := range []string{"gpt-5.5", "gpt-5.4", "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.4-mini", "@cf/zai-org/glm-5.2"} {
 		if !seen[want] {
 			t.Errorf("missing %q in cloudflare list: %v", want, ids)
 		}
